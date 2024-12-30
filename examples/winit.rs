@@ -14,8 +14,7 @@ use forte::job::{HeapJob, JobRef};
 use forte::prelude::*;
 use forte::thread_pool::WorkerThread;
 
-static THREADPOOL: LazyLock<ThreadPool> =
-    LazyLock::new(|| ThreadPool::start(ThreadPoolConfig::default()));
+static COMPUTE: ThreadPool = ThreadPool::new();
 
 struct DemoApp;
 
@@ -44,6 +43,9 @@ impl ApplicationHandler<JobRef> for DemoApp {
 }
 
 fn main() {
+    // Resize the threadpool to the avalible number of threads.
+    COMPUTE.resize_to_avalible();
+
     // Setup winit event loop.
     let event_loop = EventLoop::<JobRef>::with_user_event().build().unwrap();
     event_loop.set_control_flow(ControlFlow::Poll);
@@ -51,7 +53,7 @@ fn main() {
     // Spawn a bunch of tasks onto the pool.
     for i in 1..1000 {
         let main_thread_proxy = event_loop.create_proxy();
-        THREADPOOL.spawn(move || {
+        COMPUTE.spawn(move || {
             // SAFTEY: This is executed on the thread pool so the worker thread must be non-null.
             let thread = unsafe { &*WorkerThread::current() };
 

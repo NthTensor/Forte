@@ -1,11 +1,11 @@
-use std::{future::Future, marker::PhantomData, ptr::NonNull, sync::Arc};
+use std::{future::Future, marker::PhantomData, ptr::NonNull};
 
 use async_task::{Runnable, Task};
 
 use crate::{
     job::{HeapJob, JobRef},
     latch::{CountLatch, Latch},
-    thread_pool::{Registry, WorkerThread},
+    thread_pool::{ThreadPool, WorkerThread},
     util::CallOnDrop,
 };
 
@@ -16,7 +16,7 @@ use crate::{
 /// [`Registry::scope`] for more information.
 pub struct Scope<'scope> {
     /// The registry the scope operates on.
-    registry: Arc<Registry>,
+    thread_pool: &'static ThreadPool,
     /// A counting latch that opens when all jobs spawned in this scope are complete.
     job_completed_latch: CountLatch,
     /// A marker that makes the scope behave as if it contained a vector of
@@ -46,7 +46,7 @@ impl<'scope> Scope<'scope> {
     /// the data they close over.
     pub unsafe fn new(owner: &WorkerThread) -> Scope<'scope> {
         Scope {
-            registry: Arc::clone(owner.registry()),
+            thread_pool: owner.thread_pool(),
             job_completed_latch: CountLatch::with_count(1, owner),
             marker: PhantomData,
         }
@@ -101,7 +101,7 @@ impl<'scope> Scope<'scope> {
         let job_ref = unsafe { job.into_job_ref() };
 
         // Send the job to a queue to be executed.
-        self.registry.inject_or_push(job_ref);
+        self.thread_pool.inject_or_push(job_ref);
     }
 
     /// Spawns a future onto the scope. This future will be asynchronously
@@ -194,7 +194,7 @@ impl<'scope> Scope<'scope> {
             // local queue, which will generally cause tasks to stick to the
             // same thread instead of jumping around randomly. This is also
             // faster than injecting into the global queue.
-            scope.registry.inject_or_push(job_ref)
+            scope.thread_pool.inject_or_push(job_ref)
         };
 
         // SAFETY: We must ensure that the runnable and the waker do not outlive

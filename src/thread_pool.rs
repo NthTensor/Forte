@@ -3,159 +3,49 @@ use std::{
     collections::VecDeque,
     future::Future,
     mem,
-    num::NonZero,
     ops::{Deref, DerefMut},
     pin::Pin,
     ptr::{self, NonNull},
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     sync::Arc,
     task::{Context, Poll},
-    thread::{self, JoinHandle},
+    thread,
     time::Duration,
 };
 
 use async_task::{Runnable, Task};
-use crossbeam_deque::{Injector, Steal};
+use concurrent_queue::ConcurrentQueue;
 use crossbeam_utils::CachePadded;
 use parking_lot::{Condvar, Mutex};
 
 use crate::{
     job::{HeapJob, JobRef, StackJob},
-    latch::{AtomicLatch, Latch, LockLatch, Probe, RegistryLatch, SetOnWake, WakeLatch, WakeProbe},
+    latch::{AtomicLatch, Latch, LockLatch, Probe, SetOnWake, WakeLatch},
     scope::*,
     util::CallOnDrop,
 };
 
 // -----------------------------------------------------------------------------
-// Thread pool
+// Thread pool types
 
-/// A handle for a user created thread pool. When dropped, the pool gracefully
-/// shuts down. You probably want to stick it in a `static` variable somewhere.
-///
-/// There's very little you can do with a `ThreadPool`. To actually do anything
-/// useful, you'll need to access it's [`Registry`] of tasks.
+/// TODO
 pub struct ThreadPool {
-    /// The shared portion of the thread pool. Really this is the important bit;
-    /// `ThreadPool` is just a special handle for a `Arc<Registry>` that also
-    /// own the thread handles.
-    registry: Arc<Registry>,
-    /// The thread handles for all the worker threads.
-    worker_handles: Vec<JoinHandle<()>>,
-    /// The thread handle for the heartbeat sender thread.
-    heartbeat_handle: Option<JoinHandle<()>>,
-}
-
-/// Configuration for starting a new [`ThreadPool`].
-pub struct ThreadPoolConfig {
-    /// The number of threads to use.
-    pub num_threads: Option<NonZero<usize>>,
-    /// The interval between heartbeats.
-    pub heartbeat_interval: Duration,
-}
-
-impl Default for ThreadPoolConfig {
-    fn default() -> ThreadPoolConfig {
-        ThreadPoolConfig {
-            num_threads: None,
-            heartbeat_interval: Duration::from_micros(100),
-        }
-    }
-}
-
-impl ThreadPool {
-    /// Starts a new threadpool with the user provided config.
-    pub fn start(config: ThreadPoolConfig) -> ThreadPool {
-        // Determine the number of worker threads to spawn.
-        let num_threads = config
-            .num_threads
-            .or_else(|| thread::available_parallelism().ok())
-            .map(|num_threads| num_threads.get() - 1)
-            .unwrap_or_default();
-
-        // Panic if there seem to be no worker threads to spawn.
-        if num_threads == 0 {
-            panic!("Number of worker threads turned out to be zero.");
-        }
-
-        // Create the registry.
-        let registry = Arc::new(Registry {
-            threads: (0..num_threads).map(ThreadInfo::new).collect(),
-            queue: Injector::new(),
-            hold_count: CachePadded::new(AtomicUsize::new(1)),
-            terminating: AtomicLatch::new(),
-        });
-
-        // Spawn worker threads.
-        let worker_handles = (0..num_threads)
-            .map(|index| {
-                let registry = registry.clone();
-                // SAFETY: Nothing is called before or after `main_loop`.
-                thread::spawn(move || unsafe { main_loop(registry, index) })
-            })
-            .collect();
-
-        // Spawn heartbeat thread, with a period of 100 μs.
-        let heatbeat_registry = registry.clone();
-        let heartbeat_handle =
-            thread::spawn(move || heartbeat_loop(heatbeat_registry, config.heartbeat_interval));
-
-        ThreadPool {
-            registry,
-            worker_handles,
-            heartbeat_handle: Some(heartbeat_handle),
-        }
-    }
-
-    pub fn registry(&self) -> &Arc<Registry> {
-        &self.registry
-    }
-}
-
-impl Deref for ThreadPool {
-    type Target = Arc<Registry>;
-    fn deref(&self) -> &Arc<Registry> {
-        &self.registry
-    }
-}
-
-// Make the pool shut down when dropped.
-impl Drop for ThreadPool {
-    fn drop(&mut self) {
-        // Allow the threadpool to terminate.
-        self.registry.remove_hold();
-
-        // Join all worker threads.
-        for handle in self.worker_handles.drain(..) {
-            handle.join().unwrap();
-        }
-
-        // Join the heartbeat thread.
-        if let Some(handle) = self.heartbeat_handle.take() {
-            handle.join().unwrap();
-        }
-    }
-}
-
-// -----------------------------------------------------------------------------
-// Registry types
-
-/// Each thread pool has a single shared registry which is accessed through
-/// various `Arc<Registry>` references. All the shared state of the thread pool
-/// is stored within the registry.
-pub struct Registry {
-    /// Immutable data about each worker thread.
-    threads: Vec<ThreadInfo>,
+    /// Immutable data about each worker thread. The number of threads in a
+    /// pool is hard-capped at 32.
+    threads: [ThreadInfo; 16],
+    /// The number of currently running worker threads.
+    running_threads: CachePadded<AtomicUsize>,
+    /// Set when the threadpool is running.
+    heartbeat_running: CachePadded<AtomicBool>,
     /// The global job injector queue. This is a queue of pending jobs that can
     /// be taken by any thread. It uses the lock-free injector queue
     /// implementation from crossbeam.
-    queue: Injector<JobRef>,
+    queue: ConcurrentQueue<JobRef>,
     /// Holds prevent the registry from terminating.
     hold_count: CachePadded<AtomicUsize>,
-    /// A latch that is set when the registry begins terminating.
-    terminating: AtomicLatch,
 }
 
-/// Registry information for a specific thread.
+/// Information for a specific worker thread.
 struct ThreadInfo {
     /// This is the thread's "heartbeat": an atomic bool which is set
     /// periodically by a coordination thread. The heartbeat is used to
@@ -170,8 +60,10 @@ struct ThreadInfo {
     shared_job: CachePadded<Mutex<Option<SharedJob>>>,
     /// Blocking synchronization data for the thread.
     sleep_state: CachePadded<SleepState>,
+    /// Set to true when the thread descriptor is occupied by a thread.
+    occupied: AtomicBool,
     /// A latch that terminates the worker thread when set.
-    terminate: WakeLatch,
+    terminate: AtomicLatch,
 }
 
 /// Allows a thread to send itself to sleep and be re-awoken with a notification.
@@ -194,29 +86,91 @@ struct SharedJob {
 }
 
 // -----------------------------------------------------------------------------
-// Registry implementation
+// ThreadPool implementation
 
-impl Registry { 
-    /// Returns an opaque identifier for this registry.
-    pub fn id(&self) -> usize {
-        // We can rely on `self` not to change since we only ever create
-        // registries that are boxed up in an `Arc`.
-        self as *const Self as usize
+const THREAD_INFO: ThreadInfo = ThreadInfo {
+    heartbeat: CachePadded::new(AtomicBool::new(false)),
+    shared_job: CachePadded::new(Mutex::new(None)),
+    sleep_state: CachePadded::new(SleepState {
+        is_blocked: Mutex::new(false),
+        should_wake: Condvar::new(),
+    }),
+    occupied: AtomicBool::new(false),
+    terminate: AtomicLatch::new(),
+};
+
+impl ThreadPool {
+    pub const fn new() -> ThreadPool {
+        ThreadPool {
+            threads: [THREAD_INFO; 16],
+            running_threads: CachePadded::new(AtomicUsize::new(0)),
+            heartbeat_running: CachePadded::new(AtomicBool::new(false)),
+            queue: ConcurrentQueue::unbounded(),
+            hold_count: CachePadded::new(AtomicUsize::new(1)),
+        }
     }
 
-    /// Returns the number of threads in the pool.
-    pub fn num_threads(&self) -> usize {
-        self.threads.len()
+    /// Starts the heartbeat thread.
+    pub fn start_heartbeat(&'static self) {
+        if self.heartbeat_running.compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+            // The thread pool is not running. Start the heartbeat thread.
+            thread::spawn(move || heartbeat_loop(self) );
+        }
+    }
+
+    /// Resizes the threadpool.
+    pub fn resize(&'static self, new_size: usize) {
+        // Swap out the size first, then do the work to move from the old size
+        // to the new size.
+        let old_size = self.running_threads.swap(new_size, Ordering::Relaxed);
+
+        if old_size < new_size {
+            // Increase the size of the pool.
+            for i in old_size..new_size {
+                if self.threads[i].occupied.load(Ordering::Relaxed) {
+                    // If this index is already occupied by a thread, it must be
+                    // in the process of terminating. We will end it's
+                    // termination and allow it to continue.
+                    self.threads[i].terminate.reset();
+                } else {
+                    // If the index is not occupied by a thread, 
+                    thread::spawn(move || unsafe { main_loop(self, i) });
+                }
+            }
+        } else if old_size > new_size {
+            // Decrease the size of the pool. Ask each thread to terminate.
+            for i in new_size..old_size {
+                // SAFETY: This latch has a static lifetime.
+                unsafe { Latch::set(&self.threads[i].terminate) };
+            }
+        }
+
+        // Start the thread pool if it's not already been started.
+        self.start_heartbeat();
+    }
+
+    /// Resizes the threadpool to fit the available parallelism.
+    pub fn resize_to_avalible(&'static self) {
+        let num_threads = thread::available_parallelism()
+            .map(|num_threads| num_threads.get())
+            .unwrap_or(1);
+        self.resize(num_threads);
+    }
+    
+    /// Returns an opaque identifier for this registry.
+    pub fn id(&'static self) -> usize {
+        // We can rely on `self` not to change since it's a static ref.
+        self as *const Self as usize
     }
 
     /// When called on a worker thread, this injects the job directly into the
     /// local queue. Otherwise it injects it into the thread pool queue.
-    pub fn inject_or_push(&self, job_ref: JobRef) {
+    pub fn inject_or_push(&'static self, job_ref: JobRef) {
         let worker_thread = WorkerThread::current();
         // SAFETY: We check if the worker thread is null and only dereference it
         // if we find that it is not.
         unsafe {
-            if !worker_thread.is_null() && (*worker_thread).registry().id() == self.id() {
+            if !worker_thread.is_null() && (*worker_thread).thread_pool().id() == self.id() {
                 (*worker_thread).push(job_ref);
             } else {
                 self.inject(job_ref);
@@ -225,12 +179,11 @@ impl Registry {
     }
 
     /// Injects a job into the thread pool.
-    pub fn inject(&self, job_ref: JobRef) {
+    pub fn inject(&'static self, job_ref: JobRef) {
         let num_jobs = self.queue.len();
-        self.queue.push(job_ref);
+        let _ = self.queue.push(job_ref);
         // If the queue is non-empty, then we always wake up a worker -- clearly
-        // the existing idle jobs aren't enough. Otherwise, check to see if we
-        // have enough idle workers.
+        // the existing idle jobs aren't enough.
         if num_jobs != 0 {
             self.wake_any(1);
         }
@@ -238,15 +191,8 @@ impl Registry {
 
     /// Pops a job from the thread pool. This will try three times to get a job,
     /// and return None if it still can't.
-    pub fn pop(&self) -> Option<JobRef> {
-        for _ in 0..3 {
-            match self.queue.steal() {
-                Steal::Empty => return None,
-                Steal::Success(job) => return Some(job),
-                Steal::Retry => { /* Let the loop continue. */ }
-            }
-        }
-        None
+    pub fn pop(&'static self) -> Option<JobRef> {
+        self.queue.pop().ok()
     }
 
     /// Runs the provided function in one of this thread pool's workers. If
@@ -257,7 +203,7 @@ impl Registry {
     ///
     /// This function blocks until the function is complete, possibly putting
     /// the current thread to sleep.
-    pub fn in_worker<F, T>(&self, f: F) -> T
+    pub fn in_worker<F, T>(&'static self, f: F) -> T
     where
         F: FnOnce(&WorkerThread, bool) -> T + Send,
         T: Send,
@@ -271,7 +217,7 @@ impl Registry {
 
         // SAFETY: We just checked that this pointer wasn't null.
         let worker_thread = unsafe { &*worker_thread };
-        if worker_thread.registry.id() != self.id() {
+        if worker_thread.thread_pool.id() != self.id() {
             // We are in a worker thread, but not in the same registry. Package
             // the job into a thread but then do idle work until it completes.
             self.in_worker_cross(worker_thread, f)
@@ -289,7 +235,7 @@ impl Registry {
     /// worker from a non-worker thread. It's used to implement the public
     /// `in_worker` function just above.
     #[cold]
-    fn in_worker_cold<F, T>(&self, f: F) -> T
+    fn in_worker_cold<F, T>(&'static self, f: F) -> T
     where
         F: FnOnce(&WorkerThread, bool) -> T + Send,
         T: Send,
@@ -333,13 +279,13 @@ impl Registry {
     ///
     /// The `current_thread` is a worker from a different pool, which is queuing
     /// work into this pool, across thread pool boundaries.
-    fn in_worker_cross<F, T>(&self, current_thread: &WorkerThread, f: F) -> T
+    fn in_worker_cross<F, T>(&'static self, current_thread: &WorkerThread, f: F) -> T
     where
         F: FnOnce(&WorkerThread, bool) -> T + Send,
         T: Send,
     {
         // Create a latch with a reference to the current thread.
-        let latch = RegistryLatch::new_static(current_thread);
+        let latch = WakeLatch::new(current_thread);
         let mut result = None;
         let job = StackJob::new(|| {
             // SAFETY: Jobs are only executed on worker threads, so this must be
@@ -353,7 +299,7 @@ impl Registry {
             unsafe { Latch::set(&latch) };
         });
 
-        // SAFETY: This job is valid until this entire scope. The scope does not
+        // SAFETY: This job is valid for this entire scope. The scope does not
         // exit until the function returns, the job does not return until the
         // latch is set, and the latch cannot be set until the job runs.
         let job_ref = unsafe { job.as_job_ref() };
@@ -369,12 +315,13 @@ impl Registry {
 
     /// Tries to wake a number of threads. Returns the number of threads
     /// actually woken.
-    pub fn wake_any(&self, num_to_wake: usize) -> usize {
+    pub fn wake_any(&'static self, num_to_wake: usize) -> usize {
         if num_to_wake > 0 {
             // Iterate through the threads, trying to wake each one until we run
             // out or have reached our target number.
             let mut num_woken = 0;
-            for index in 0..self.num_threads() {
+            let num_threads = self.running_threads.load(Ordering::Relaxed);
+            for index in 0..num_threads {
                 if self.wake_thread(index) {
                     num_woken += 1;
                     if num_to_wake == num_woken {
@@ -392,7 +339,7 @@ impl Registry {
     /// woken up, false if it was already awake.
     ///
     /// This sets a mutex, but it should basically never be contested.
-    pub fn wake_thread(&self, index: usize) -> bool {
+    pub fn wake_thread(&'static self, index: usize) -> bool {
         let thread = &self.threads[index];
         let mut is_blocked = thread.sleep_state.is_blocked.lock();
         if *is_blocked {
@@ -410,36 +357,23 @@ impl Registry {
 
     /// Adds a hold to the registry. It will not terminate until a after a
     /// corresponding `remove_hold` call.
-    pub fn add_hold(&self) {
+    pub fn add_hold(&'static self) {
         self.hold_count.fetch_add(1, Ordering::AcqRel);
     }
 
     /// Removes a hold on the registry. When there are zero holds on the
-    /// registry, it terminates.
-    pub fn remove_hold(&self) {
+    /// registry, it will shut itself down.
+    pub fn remove_hold(&'static self) {
         if self.hold_count.fetch_sub(1, Ordering::AcqRel) == 1 {
-            // If the previous value was 1 then no holds remain, and the
-            // registry should self-terminate.
-            for thread in self.threads.iter() {
+            // If the previous value was 1 then no holds remain. The registry
+            // can now ask the threads to terminate.
+            for (index, thread) in self.threads.iter().enumerate() {
                 // SAFETY: The latch is valid for the entire scope.
-                unsafe { WakeLatch::set_and_wake(&thread.terminate, self) };
+                unsafe { Latch::set(&thread.terminate) };
+                self.wake_thread(index);
             }
-            // SAFETY: The latch is valid for the entire scope.
-            unsafe { Latch::set(&self.terminating) };
-        }
-    }
-}
-
-impl ThreadInfo {
-    fn new(index: usize) -> ThreadInfo {
-        ThreadInfo {
-            heartbeat: CachePadded::new(AtomicBool::new(false)),
-            shared_job: CachePadded::new(Mutex::new(None)),
-            sleep_state: CachePadded::new(SleepState {
-                is_blocked: Mutex::new(false),
-                should_wake: Condvar::new(),
-            }),
-            terminate: WakeLatch::new(index),
+            // This tells the heartbeat thread to shut down.
+            self.heartbeat_running.store(false, Ordering::Relaxed);
         }
     }
 }
@@ -447,21 +381,21 @@ impl ThreadInfo {
 // -----------------------------------------------------------------------------
 // Core API
 
-impl Registry {
+impl ThreadPool {
     /// Spawns a new closure onto the thread pool. Just like a standard thread,
     /// this task is not tied to the current stack frame, and hence it cannot
     /// hold any references other than those with 'static lifetime. If you want
     /// to spawn a task that references stack data, use the
-    /// [`Registry::scope()`] function to create a scope.
+    /// [`ThreadPool::scope()`] function to create a scope.
     ///
     /// Since tasks spawned with this function cannot hold references into the
     /// enclosing stack frame, you almost certainly want to use a move closure
     /// as their argument (otherwise, the closure will typically hold references
     /// to any variables from the enclosing function that you happen to use).
     ///
-    /// To spawn an async task or future, use [`Registry::spawn_async`] or
-    /// [`Registry::spawn_scope`].
-    pub fn spawn<F>(self: &Arc<Registry>, f: F)
+    /// To spawn an async task or future, use [`ThreadPool::spawn_async`] or
+    /// [`ThreadPool::spawn_scope`].
+    pub fn spawn<F>(&'static self, f: F)
     where
         F: FnOnce() + Send + 'static,
     {
@@ -469,19 +403,18 @@ impl Registry {
         // executed. This ref is decremented at the (*) below.
         self.add_hold();
         let job = HeapJob::new({
-            let registry = Arc::clone(self);
             move || {
                 f();
-                registry.remove_hold(); // (*) Remove the hold on the registry.
+                self.remove_hold(); // (*) Remove the hold on the registry.
             }
         });
         let job_ref = job.into_static_job_ref();
         self.inject_or_push(job_ref);
     }
 
-    /// Spawns a future onto the scope. See [`Registry::spawn`] for more
+    /// Spawns a future onto the scope. See [`ThreadPool::spawn`] for more
     /// information about spawning jobs. Only static futures are supported
-    /// through this function, but you can use `Registry::scope` to get a scope
+    /// through this function, but you can use `ThreadPool::scope` to get a scope
     /// on which non-static futures and async tasks can be spawned.
     ///
     /// # Returns
@@ -501,7 +434,7 @@ impl Registry {
     /// 4. Detach the task. This will allow the future to continue executing
     ///    even after the task itself is dropped.
     ///
-    pub fn spawn_future<F, T>(self: &Arc<Registry>, future: F) -> Task<T>
+    pub fn spawn_future<F, T>(&'static self, future: F) -> Task<T>
     where
         F: Future<Output = T> + Send + 'static,
         T: Send + 'static,
@@ -509,16 +442,14 @@ impl Registry {
         // Ensure that registry cannot terminate until this job has
         // executed. This ref is decremented at the (*) below.
         self.add_hold();
-        let registry = Arc::clone(self);
         let future = async move {
             let _guard = CallOnDrop(move || {
-                registry.remove_hold(); // (*) Remove the hold on the registry.
+                self.remove_hold(); // (*) Remove the hold on the registry.
             });
             future.await
         };
 
         // The schedule function will turn the future into a job when woken.
-        let registry = Arc::clone(self);
         let schedule = move |runnable: Runnable| {
             // Now we turn the runnable into a job-ref that we can send to a
             // worker.
@@ -543,7 +474,7 @@ impl Registry {
             // local queue, which will generally cause tasks to stick to the
             // same thread instead of jumping around randomly. This is also
             // faster than injecting into the global queue.
-            registry.inject_or_push(job_ref);
+            self.inject_or_push(job_ref);
         };
 
         // Creates a task from the future and schedule.
@@ -553,13 +484,13 @@ impl Registry {
         task
     }
 
-    /// Like [`Registry::spawn_future`] but accepts an async closure instead of
+    /// Like [`ThreadPool::spawn_future`] but accepts an async closure instead of
     /// a future. Here again everything must be static (but there is a
     /// non-static equivalent on [`Scope`]).
     ///
     /// Internally this wraps the closure into a new future and passes it along
     /// over to `spawn_future`.
-    pub fn spawn_async<Fn, Fut, T>(self: &Arc<Registry>, f: Fn) -> Task<T>
+    pub fn spawn_async<Fn, Fut, T>(&'static self, f: Fn) -> Task<T>
     where
         Fn: FnOnce() -> Fut + Send + 'static,
         Fut: Future<Output = T> + Send + 'static,
@@ -578,7 +509,7 @@ impl Registry {
     /// while the future is not available it will try to do other meaningfully
     /// work (if executed on a thread pool) or block (if not executed on a thread
     /// pool).
-    pub fn block_on<F, T>(self: &Arc<Registry>, mut future: F) -> T
+    pub fn block_on<F, T>(&'static self, mut future: F) -> T
     where
         F: Future<Output = T> + Send,
         T: Send,
@@ -590,7 +521,7 @@ impl Registry {
         self.in_worker(|worker_thread, _| {
             // We create a async waker which will wake the thread when the
             // future is awoken. This latch will also keep the registry alive.
-            let wake = SetOnWake::new(RegistryLatch::new_static(worker_thread));
+            let wake = SetOnWake::new(WakeLatch::new(worker_thread));
             let ctx_waker = Arc::clone(&wake).into();
             let mut ctx = Context::from_waker(&ctx_waker);
             // Keep polling the future, running work until it is woken up again.
@@ -615,7 +546,7 @@ impl Registry {
     /// When called from outside the thread pool this will block until both
     /// closures are executed. When called within the thread pool, the worker
     /// thread will attempt to do other work while it's waiting.
-    pub fn join<A, B, RA, RB>(self: &Arc<Registry>, a: A, b: B) -> (RA, RB)
+    pub fn join<A, B, RA, RB>(&'static self, a: A, b: B) -> (RA, RB)
     where
         A: FnOnce() -> RA + Send,
         B: FnOnce() -> RB + Send,
@@ -626,7 +557,7 @@ impl Registry {
             // We will execute `a` and create a job to run `b` in parallel.
             let mut status_b = None;
             // Create a new latch that can wake this thread when it completes.
-            let latch_b = WakeLatch::new(worker_thread.index());
+            let latch_b = WakeLatch::new(worker_thread);
             // Create a job which runs b, returns the outcome back to the stack,
             // and trips the latch.
             let job_b = StackJob::new(|| {
@@ -634,7 +565,7 @@ impl Registry {
                 // SAFETY: This job is valid until the end of the scope and is
                 // not dropped until this function returns. The function does
                 // not return until after the latch is set.
-                unsafe { WakeLatch::set_and_wake(&latch_b, self) };
+                unsafe { Latch::set(&latch_b) };
             });
             // SAFETY: This job is valid until the end of this scope, and is not
             // dropped until this function returns. The function does not return
@@ -690,7 +621,7 @@ impl Registry {
     ///
     /// This function allows spawning closures, futures and async closures with
     /// non-static lifetimes.
-    pub fn scope<'scope, F, T>(self: &Arc<Registry>, f: F) -> T
+    pub fn scope<'scope, F, T>(&'static self, f: F) -> T
     where
         F: FnOnce(&Scope<'scope>) -> T + Send,
         T: Send,
@@ -713,7 +644,7 @@ impl Registry {
 /// Data for a local worker thread, typically stored in a thread-local static.
 pub struct WorkerThread {
     job_queue: UnsafeCell<VecDeque<JobRef>>,
-    registry: Arc<Registry>,
+    thread_pool: &'static ThreadPool,
     index: usize,
 }
 
@@ -725,7 +656,7 @@ impl WorkerThread {
     /// Returns access to the this thread's section of the registry.
     #[inline]
     fn thread_info(&self) -> &ThreadInfo {
-        &self.registry.threads[self.index]
+        &self.thread_pool.threads[self.index]
     }
 
     /// Returns a mutable reference to this worker's job queue.
@@ -763,10 +694,10 @@ impl WorkerThread {
         WORKER_THREAD_STATE.with(Cell::get)
     }
 
-    /// Returns the registry in which the worker is registered.
+    /// Returns the thread pool to which the worker belongs.
     #[inline]
-    pub fn registry(&self) -> &Arc<Registry> {
-        &self.registry
+    pub fn thread_pool(&self) -> &'static ThreadPool {
+        &self.thread_pool
     }
 
     /// Returns the unique index of the thread within the thread pool.
@@ -823,10 +754,10 @@ impl WorkerThread {
         // to reduce lock contention in the event that multiple threads wake
         // simultaneously.
         let current_thread = self.index();
-        let num_threads = self.registry.num_threads();
+        let num_threads = self.thread_pool.running_threads.load(Ordering::Relaxed);
         for i in 0..num_threads {
             let i = (current_thread + 1 + i) % num_threads;
-            let thread = &self.registry.threads[i];
+            let thread = &self.thread_pool.threads[i];
 
             // Now we will try to acquire a lock on the next shared job. At this
             // point, it's possible we already hold a lock on another shared job
@@ -879,7 +810,7 @@ impl WorkerThread {
             });
         }
         // Attempt to wake one other thread to claim this shared job.
-        self.registry.wake_any(1);
+        self.thread_pool.wake_any(1);
     }
 
     /// Promotes the oldest local job into a shared job which can be claimed and
@@ -914,12 +845,8 @@ impl WorkerThread {
 
     /// Runs until the provided latch is set. This will put the thread to sleep
     /// if no work can be found and the latch is still unset.
-    ///
-    /// This accepts as argument a `WakeProbe`: a latch that can be probed for
-    /// status actively and which can also wake the thread when it goes to
-    /// sleep.
     #[inline]
-    pub fn run_until<L: WakeProbe>(&self, latch: &L) {
+    pub fn run_until<L: Probe>(&self, latch: &L) {
         if !latch.probe() {
             self.run_until_cold(latch);
         }
@@ -929,7 +856,7 @@ impl WorkerThread {
     /// if no work can be found and the latch is still unset. Setting the latch
     /// will wake the thread.
     #[cold]
-    fn run_until_cold<L: WakeProbe>(&self, latch: &L) {
+    fn run_until_cold<L: Probe>(&self, latch: &L) {
         while !latch.probe() {
             
             // Try to find work, either on the local queue, the shared jobs
@@ -973,7 +900,7 @@ impl WorkerThread {
         // cause us to spin very briefly.
         self.pop()
             .or_else(|| self.claim_shared())
-            .or_else(|| self.registry().pop())
+            .or_else(|| self.thread_pool().pop())
     }
 }
 
@@ -989,11 +916,11 @@ impl WorkerThread {
 ///
 /// This must not be called after `set_current` has been called. As a
 /// consequence, this function cannot be called twice on the same thread.
-unsafe fn main_loop(registry: Arc<Registry>, index: usize) {
+unsafe fn main_loop(thread_pool: &'static ThreadPool, index: usize) {
     // Register the worker on the thread.
     let worker_thread = WorkerThread {
         index,
-        registry: registry.clone(),
+        thread_pool,
         job_queue: UnsafeCell::new(VecDeque::with_capacity(32)),
     };
 
@@ -1004,7 +931,7 @@ unsafe fn main_loop(registry: Arc<Registry>, index: usize) {
     }
 
     // Run the worker thread until the registry is terminated.
-    worker_thread.run_until(&registry.threads[index].terminate);
+    worker_thread.run_until(&thread_pool.threads[index].terminate);
 }
 
 // -----------------------------------------------------------------------------
@@ -1017,16 +944,39 @@ unsafe fn main_loop(registry: Arc<Registry>, index: usize) {
 /// Workers use the heartbeat signal to amortize the cost of promoting local
 /// jobs to shared jobs (which allows other works to claim them) and to reduce
 /// lock contention.
-fn heartbeat_loop(registry: Arc<Registry>, interval: Duration) {
-    // Divide up the heartbeat interval so that the threads are staggered.
-    let num_threads = registry.num_threads();
-    let interval = interval / num_threads as u32;
+fn heartbeat_loop(thread_pool: &'static ThreadPool) {
+    // Use a 100 microsecond heartbeat interval. Eventually this will be
+    // configurable.
+    let interval = Duration::from_micros(100);
+    
+    // Loop as long as the thread pool is running.
     let mut i = 0;
-    // Loop until the thread pool is terminated.
-    while !registry.terminating.probe() {
-        // Emit a heartbeat for each worker thread in sequence.
-        registry.threads[i].heartbeat.store(true, Ordering::Relaxed);
+    while thread_pool.heartbeat_running.load(Ordering::Relaxed) {
+        // Load the current number of running threads from the registry.
+        let num_threads = thread_pool.running_threads.load(Ordering::Relaxed);
+
+        // If there are no threads, shut down.
+        if num_threads == 0 {
+            break;
+        }
+        
+        // It's possible for the pool to be resized out from under us and end up
+        // already above the number of threads. When that happens, we jump back
+        // to zero.
+        if i >= num_threads {
+            i = 0;
+            continue;
+        }
+        
+        // Otherwise we will emit a heartbeat for the selected thread.
+        thread_pool.threads[i].heartbeat.store(true, Ordering::Relaxed);
         i = (i + 1) % num_threads;
+        
+        // We want to space out the heartbeat to each thread, so we divide the
+        // interval by the current number of threads. When the thread pool is
+        // not resized, this will mean we will stagger the heartbeats out evenly
+        // and each thread will get a heartbeat on the given frequency.
+        let interval = interval / num_threads as u32;
         thread::sleep(interval);
     }
 }

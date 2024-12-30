@@ -32,6 +32,6 @@ mod util;
 pub mod prelude {
     pub use crate::{
         scope::Scope,
-        thread_pool::{ThreadPool, ThreadPoolConfig},
+        thread_pool::{ThreadPool, WorkerThread},
     };
 }

@@ -25,7 +25,6 @@
 //! specific safety comments for more information.
 
 use std::{
-    borrow::Cow,
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     sync::Arc,
     task::Wake,
@@ -33,7 +32,7 @@ use std::{
 
 use parking_lot::{Condvar, Mutex};
 
-use crate::thread_pool::{Registry, WorkerThread};
+use crate::thread_pool::{ThreadPool, WorkerThread};
 
 // -----------------------------------------------------------------------------
 // Latches and probes
@@ -89,7 +88,7 @@ pub struct AtomicLatch {
 impl AtomicLatch {
     /// Creates a new closed latch.
     #[inline]
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             state: AtomicBool::new(false),
         }
@@ -138,6 +137,8 @@ impl Probe for AtomicLatch {
 pub struct WakeLatch {
     /// An internal atomic latch.
     atomic_latch: AtomicLatch,
+    /// The thread pool where the thread lives
+    thread_pool: &'static ThreadPool,
     /// The index of the worker thread to wake when `set()` is called.
     thread_index: usize,
 }
@@ -145,28 +146,11 @@ pub struct WakeLatch {
 impl WakeLatch {
     /// Creates a new closed latch.
     #[inline]
-    pub fn new(thread_index: usize) -> WakeLatch {
+    pub fn new(worker_thread: &WorkerThread) -> WakeLatch {
         WakeLatch {
             atomic_latch: AtomicLatch::new(),
-            thread_index,
-        }
-    }
-
-    /// Opens the latch and uses the provided registry to wake a specific worker.
-    ///
-    /// # Safety
-    ///
-    /// The safety requirements of `Latch::set` apply to this function as well.
-    /// The caller must ensure that the pointer is valid upon entry, and not
-    /// invalidated during the call by any actions other than `set_and_wake`.
-    #[inline]
-    pub unsafe fn set_and_wake(this: *const Self, registry: &Registry) {
-        // SAFETY: We assume the pointer is valid when passed in. We do not use
-        // it after `Latch::set` so it is fine if the pointer becomes dangling.
-        unsafe {
-            let thread_index = (*this).thread_index;
-            Latch::set(&(*this).atomic_latch);
-            registry.wake_thread(thread_index);
+            thread_pool: worker_thread.thread_pool(),
+            thread_index: worker_thread.index(),
         }
     }
 
@@ -177,100 +161,25 @@ impl WakeLatch {
     }
 }
 
+impl Latch for WakeLatch {
+    #[inline]
+    unsafe fn set(this: *const Self) {
+        // SAFETY: TODO
+        unsafe {
+            let thread_pool = (*this).thread_pool;
+            let thread_index = (*this).thread_index;
+            Latch::set(&(*this).atomic_latch);
+            thread_pool.wake_thread(thread_index);
+        }
+    }
+}
+
 impl Probe for WakeLatch {
     #[inline]
     fn probe(&self) -> bool {
         self.atomic_latch.probe()
     }
 }
-
-/// A trait for latches that implement probe and are also capable of waking a
-/// sleeping worker thread.
-///
-/// This trait exists to prevent a thread from going to sleep waiting on a latch
-/// that can't wake it back up again.
-pub trait WakeProbe: Probe {}
-
-impl WakeProbe for WakeLatch {}
-
-// -----------------------------------------------------------------------------
-// Registry latch
-
-/// A wrapper around a `WakeLatch` which embeds a reference to the registry.
-pub struct RegistryLatch<'r> {
-    /// The internal waker latch.
-    wake_latch: WakeLatch,
-    /// A reference to the registry, which can be either "strong" (an
-    /// `Arc<Registry>`) or "weak" (an `&'r Arc<Registry>`).
-    registry: Cow<'r, Arc<Registry>>,
-}
-
-impl<'r> RegistryLatch<'r> {
-    /// Creates a new registry latch with a weak reference to the registry. This
-    /// latch is only valid for the lifetime of the reference to the worker
-    /// thread. It relies on the worker thread to keep the registry alive.
-    #[inline]
-    pub fn new(thread: &'r WorkerThread) -> RegistryLatch<'r> {
-        RegistryLatch {
-            wake_latch: WakeLatch::new(thread.index()),
-            registry: Cow::Borrowed(thread.registry()),
-        }
-    }
-
-    /// Creates a new registry latch with a strong reference to the registry,
-    /// ensuring that the registry will remain alive so long as the latch is held.
-    ///
-    /// This is useful for latches that need to outlive the stack-frame in which
-    /// they were created.
-    #[inline]
-    pub fn new_static(thread: &'r WorkerThread) -> RegistryLatch<'static> {
-        RegistryLatch {
-            wake_latch: WakeLatch::new(thread.index()),
-            registry: Cow::Owned(Arc::clone(thread.registry())),
-        }
-    }
-
-    /// Resets the latch back to closed.
-    #[inline]
-    pub fn reset(&self) {
-        self.wake_latch.reset();
-    }
-}
-
-impl<'r> Latch for RegistryLatch<'r> {
-    #[inline]
-    unsafe fn set(this: *const Self) {
-        // SAFETY: We assume the pointer is valid when passed in.
-        //
-        // It's possible that the pointer will become dangling during the call
-        // to `set_and_wake`. If that happens, then our local `registry` field
-        // will also be dropped, and if this contains a `Cow::Owned` value and
-        // this is the last reference to the registry, the whole registry may be
-        // dropped as well. This would invalidate the reference to the registry.
-        //
-        // To prevent that from happening, we clone the `Cow` before using it.
-        // When owned, this has the effect of cloning the arc, ensuring that the
-        // registry will not be dropped. When borrowed, this is as cheap as an
-        // additional borrow, and we know the registry cannot be dropped because
-        // of the lifetime requirement.
-        //
-        // Therefore the reference `&registry` must be valid until the end of
-        // this block.
-        unsafe {
-            let registry = Cow::clone(&(*this).registry);
-            WakeLatch::set_and_wake(&(*this).wake_latch, &registry);
-        }
-    }
-}
-
-impl<'r> Probe for RegistryLatch<'r> {
-    #[inline]
-    fn probe(&self) -> bool {
-        self.wake_latch.probe()
-    }
-}
-
-impl<'r> WakeProbe for RegistryLatch<'r> {}
 
 // -----------------------------------------------------------------------------
 // Mutex-lock latch
@@ -340,18 +249,16 @@ impl Latch for LockLatch {
 /// be used to wake worker threads.
 pub struct CountLatch {
     counter: AtomicUsize,
-    latch: RegistryLatch<'static>,
+    latch: WakeLatch,
 }
 
 impl CountLatch {
     /// Creates a new closed latch with the specified count.
     #[inline]
     pub fn with_count(count: usize, owner: &WorkerThread) -> Self {
-        let latch = RegistryLatch::new_static(owner);
-
         Self {
             counter: AtomicUsize::new(count),
-            latch,
+            latch: WakeLatch::new(owner),
         }
     }
 
@@ -383,8 +290,6 @@ impl Probe for CountLatch {
         self.latch.probe()
     }
 }
-
-impl WakeProbe for CountLatch {}
 
 // -----------------------------------------------------------------------------
 // Async set-on-wake
