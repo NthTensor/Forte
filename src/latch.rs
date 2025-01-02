@@ -154,6 +154,15 @@ impl WakeLatch {
         }
     }
 
+    #[inline]
+    pub const fn new_raw(thread_index: usize, thread_pool: &'static ThreadPool) -> WakeLatch {
+        WakeLatch {
+            atomic_latch: AtomicLatch::new(),
+            thread_pool,
+            thread_index,
+        }
+    }
+
     /// Resets the latch back to closed.
     #[inline]
     pub fn reset(&self) {
@@ -193,7 +202,7 @@ pub struct LockLatch {
 impl LockLatch {
     /// Creates a new closed latch.
     #[inline]
-    pub fn new() -> LockLatch {
+    pub const fn new() -> LockLatch {
         LockLatch {
             mutex: Mutex::new(false),
             cond: Condvar::new(),

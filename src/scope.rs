@@ -40,7 +40,7 @@ impl<'scope> Scope<'scope> {
     ///
     /// The caller must ensure that the scope is completed with a call to
     /// [`Scope::complete`], passing in a reference the same owning worker
-    /// thread both times. 
+    /// thread both times.
     ///
     /// If the scope is not completed, jobs spawned onto this scope may outlive
     /// the data they close over.
@@ -173,22 +173,19 @@ impl<'scope> Scope<'scope> {
 
             // Now we turn the runnable into a job-ref that we can send to a
             // worker.
-            
+
             // SAFETY: We provide a pointer to a non-null runnable, and we turn
             // it back into a non-null runnable. The runnable will remain valid
             // until the task is run.
             let job_ref = unsafe {
-                JobRef::new_raw(
-                    runnable.into_raw().as_ptr(),
-                    |this| {
-                        let this = NonNull::new_unchecked(this as *mut ());
-                        let runnable = Runnable::<()>::from_raw(this);
-                        // Poll the task.
-                        runnable.run();
-                    }
-                )
+                JobRef::new_raw(runnable.into_raw().as_ptr(), |this| {
+                    let this = NonNull::new_unchecked(this as *mut ());
+                    let runnable = Runnable::<()>::from_raw(this);
+                    // Poll the task.
+                    runnable.run();
+                })
             };
-            
+
             // Send this job off to be executed. When this schedule function is
             // called on a worker thread this re-schedules it onto the worker's
             // local queue, which will generally cause tasks to stick to the
@@ -220,9 +217,10 @@ impl<'scope> Scope<'scope> {
     /// [`Scope::spawn_future`]. See the docs on that function for more
     /// information.
     pub fn spawn_async<Fn, Fut, T>(&self, f: Fn) -> Task<T>
-    where Fn: FnOnce(&Scope<'scope>) -> Fut + Send + 'static,
-          Fut: Future<Output = T> + Send + 'static,
-          T: Send + 'static
+    where
+        Fn: FnOnce(&Scope<'scope>) -> Fut + Send + 'static,
+        Fut: Future<Output = T> + Send + 'static,
+        T: Send + 'static,
     {
         // Wrap the function into a future using an async block.
         let scope_ptr = ScopePtr(self);
