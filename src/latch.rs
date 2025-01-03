@@ -129,15 +129,11 @@ impl Probe for AtomicLatch {
 // -----------------------------------------------------------------------------
 // Wake latch
 
-/// A simple wrapper around an `AtomicLatch` that can wake a worker when set, if
-/// provided with a reference to a registry.
-///
-/// This is preferred to `RegistryLatch` when stored alongside a reference to a
-/// registry, or within the registry itself.
+/// A simple wrapper around an `AtomicLatch` that can wake a worker when set.
 pub struct WakeLatch {
     /// An internal atomic latch.
     atomic_latch: AtomicLatch,
-    /// The thread pool where the thread lives
+    /// The thread pool where the thread lives.
     thread_pool: &'static ThreadPool,
     /// The index of the worker thread to wake when `set()` is called.
     thread_index: usize,
@@ -173,7 +169,10 @@ impl WakeLatch {
 impl Latch for WakeLatch {
     #[inline]
     unsafe fn set(this: *const Self) {
-        // SAFETY: TODO
+        // SAFETY: The thread pool itself is static, so we need only be
+        // concerned with the lifetime of the pointer. Since we assume it is
+        // valid when passed in and do not use it after the side effects, it is
+        // fine if it becomes dangling.
         unsafe {
             let thread_pool = (*this).thread_pool;
             let thread_index = (*this).thread_index;
@@ -253,9 +252,6 @@ impl Latch for LockLatch {
 /// A counting latch stores a decrementing counter and only opens when the
 /// counter reaches zero. This means that, unlike other latches, multiple calls
 /// to `Latch::set` may be required to open the latch.
-///
-/// Counting latches wrap a static registry latch, and like registry latches can
-/// be used to wake worker threads.
 pub struct CountLatch {
     counter: AtomicUsize,
     latch: WakeLatch,

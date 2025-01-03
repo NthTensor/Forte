@@ -26,37 +26,90 @@ use crate::{
 // -----------------------------------------------------------------------------
 // Thread pool types
 
-/// The maximum number of a threadpool.
-pub const MAX_THREADS: usize = 16;
+/// This crate puts a hard upper-bound on the maximum size of a threadpool and
+/// pre-allocates space for that number of threads.
+///
+/// I've chosen 32 as a reasonable default for development, as that's generally
+/// the maximum number of threads avalible on flagship consumer hardware.
+///
+/// Note that this is only the hard upper bound on thread pool size. Thread
+/// pools can be dynamically resized at runtime.
+pub const MAX_THREADS: usize = 32;
 
-/// TODO
+/// The `ThreadPool` object is used to orchistrate and distribute work to a pool
+/// of threads, and is generally the main entrypoint to using `Forte`.
+///
+/// # Creating Thread Pools
+/// 
+/// Thread pools should be static and const constructed. You don't have to worry
+/// about `LazyStatic` or anything else; to create a new thread pool, just call
+/// [`ThreadPool::new`].
+///
+/// ```
+/// # use forte::prelude::*;
+/// // Allocate a new thread pool.
+/// static COMPUTE: ThreadPool = ThreadPool::new();
+///
+/// fn main() {
+///     // Spawn a task onto the pool.
+///     COMPUTE.spawn(|| {
+///         println!("Do your work here");
+///     });
+/// }
+/// ```
+///
+/// This attaches a new thread pool to your program named `COMPUTE`, which you
+/// can begin to schedule work on immediately. The thread pool will exist for
+/// the entire duration of your program, and will shut down when your program
+/// completes.
+///
+/// # Resizing Thread Pools
+///
+/// Thread pools are dynamically sized; When your program starts they have size
+/// zero (meaning no threads are running), and you will have to add threads by
+/// resizing it. The simplest way to resize a pool is via
+/// [`ThreadPool::resize_to_avalible`] which will simply fill all the avalible
+/// space. More granular control is possible through other methods such as
+/// [`ThreadPool::grow`], [`ThreadPool::shink`], or [`ThreadPool::resize_to`].
+///
 pub struct ThreadPool {
-    /// Immutable data about each worker thread. The maximum number of threads in a
-    /// pool is controlled by a constant.
+    /// This contains the shared state for each worker thread.
     threads: [CachePadded<ThreadInfo>; MAX_THREADS],
-    /// The global job injector queue. This is a queue of pending jobs that can
-    /// be taken by any thread. It uses the lock-free injector queue
-    /// implementation from crossbeam.
+    /// A queue of pending jobs that can be taken by any thread. It uses the
+    /// lock-free queue from crossbeam.
     queue: SegQueue<JobRef>,
-    /// A cache line holding infrequently modified data.
+    /// The thread pool state is a collection of infrequently modified shared
+    /// data. It's bundled together into a cache line so that atomic writes
+    /// don't cause unrelated cache-misses.
     state: CachePadded<ThreadPoolState>,
-    /// A cache line which prevents the registry from terminating.
-    hold_count: CachePadded<AtomicUsize>,
+    /// The activity tally is used to determine if the thread pool is "active"
+    /// which means basically that not everything spawned on the thread pool has
+    /// run to completion.
+    ///
+    /// This is implemented as an atomic counter. The counter is incremented
+    /// when work is sent to the thread pool and decremented when the work is
+    /// completed.
+    ///
+    /// Closely related to `ThreadPoolState::is_active`.
+    active_tally: CachePadded<AtomicUsize>,
 }
 
-/// Core information about the thread pool. This data should be written to
-/// infrequently, so it can be packed together into a single cache line without
-/// the atomics causing constant cashe misses.
+/// Core information about the thread pool. This data may be read from
+/// frequently and should only be written to infrequently.
 struct ThreadPoolState {
-    /// Tracks the number of currently runn
+    /// Tracks the number of currently runing threads, included currently
+    /// sleeping threads. This should only be written to when the `is_resizing`
+    /// mutex is held. It is not placed within the mutex because it can be
+    /// safely read at any time.
     running_threads: AtomicUsize,
-    /// Lifecycle controlls for the heartbeat loop.
-    heartbeat_control: ThreadControl,
-    /// A mutex used to guard the resizing critical section.
+    /// A mutex used to guard the resizing critical section. 
     is_resizing: Mutex<bool>,
-    /// True when the thread pool has work to do
+    /// Controlls for the thread that sends out heartbeat notifications.
+    heartbeat_control: ThreadControl,
+    /// This is set to `true` when `active_tally > 0`, and is used to wait for
+    /// either activity or inactivity.
     is_active: Mutex<bool>,
-    /// Notified when the activity changed
+    /// Used to send notifications to sleeping threads when `is_active` changes.
     activity_changed: Condvar,
 }
 
@@ -73,31 +126,41 @@ struct ThreadInfo {
     control: ThreadControl,
 }
 
-/// This structure is used to control a thread's lifecycle.
+/// This is a generalized control mechanism for a thread, implementing sleeping,
+/// wakeups and a termination procedure. This is used by all the worker threads
+/// and also the heartbeat-sender thread.
 struct ThreadControl {
-    /// Set to true when the worker is sleeping.
+    /// Set to true when the worker is sleeping. Allows the thread to sleep
+    /// until awakened by another thread.
     is_sleeping: Mutex<bool>,
     /// Used to wake a sleeping thread.
     awakened: Condvar,
-    /// Set to true when the thread descriptor is running.
+    /// Set to true when the thread is running. Allows other threads to sleep
+    /// until this thread stops or starts.
     is_running: Mutex<bool>,
-    /// A latch that terminates the worker thread when set.
+    /// Used to wake other threads when the thread stops or starts.
+    synchronized: Condvar,
+    /// A latch that terminates the thread when set.
     should_terminate: AtomicLatch,
-    /// Used to wake a different thread when this thread terminates.
-    terminated: Condvar,
 }
 
 // -----------------------------------------------------------------------------
 // Thread pool creation and mantinence
 
+/// The inital value of `ThreadControl`. We have this instead of
+/// `ThreadControl::new()` so that it can be used with the const array
+/// initalization syntax.
 const THREAD_CONTROL: ThreadControl = ThreadControl {
     is_sleeping: Mutex::new(false),
     awakened: Condvar::new(),
     is_running: Mutex::new(false),
+    synchronized: Condvar::new(),
     should_terminate: AtomicLatch::new(),
-    terminated: Condvar::new(),
 };
 
+/// The inital value of `ThreadInfo`, padded to fill a cache line. Again, we
+/// have this instead of `ThreadInfo::new()` so that it can be used with the
+/// const array initialization syntax.
 const THREAD_INFO: CachePadded<ThreadInfo> = CachePadded::new(ThreadInfo {
     heartbeat: AtomicBool::new(false),
     shared_job: Slot::empty(),
@@ -105,6 +168,9 @@ const THREAD_INFO: CachePadded<ThreadInfo> = CachePadded::new(ThreadInfo {
 });
 
 impl ThreadPool {
+    /// Creates a new thread pool. This function should be used to define a
+    /// `static` variable rather than to allocate something on the stack during
+    /// runtime.
     pub const fn new() -> ThreadPool {
         ThreadPool {
             threads: [THREAD_INFO; MAX_THREADS],
@@ -116,35 +182,53 @@ impl ThreadPool {
                 is_active: Mutex::new(false),
                 activity_changed: Condvar::new(),
             }),
-            hold_count: CachePadded::new(AtomicUsize::new(0)),
+            active_tally: CachePadded::new(AtomicUsize::new(0)),
         }
     }
 
-    /// Resizes the threadpool to fit the available parallelism.
+    /// Resizes the thread pool to fill all avalible space. After this returns,
+    /// the pool will have at least one worker thread and at most `MAX_THREADS`.
+    /// Returns the new size of the pool.
+    ///
+    /// See [`ThreadPool::resize`] for more information about resizing.
     pub fn resize_to_avalible(&'static self) -> usize {
-        let num_threads = thread::available_parallelism()
+        let available = thread::available_parallelism()
             .map(|num_threads| num_threads.get())
             .unwrap_or(1);
-        self.resize_to(num_threads)
+        self.resize_to(available)
     }
 
-    /// Resizes the pool to the specified number of threads.
+    /// Resizes the pool to the specified number of threads. Returns the new
+    /// size of the thread pool, which may be smaller than requested.
+    ///
+    /// See [`ThreadPool::resize`] for more information about resizing.
     pub fn resize_to(&'static self, new_size: usize) -> usize {
-        let new_size = usize::min(new_size, MAX_THREADS);
         self.resize(|_| new_size)
     }
 
+    /// Adds the given number of threads to the thread pool. Returns the new
+    /// size of the pool, which may be smaller than requested.
+    ///
+    /// See [`ThreadPool::resize_to`] for more information about resizing.
     pub fn grow(&'static self, added_threads: usize) -> usize {
-        self.resize(|current_size| usize::min(current_size + added_threads, MAX_THREADS))
+        self.resize(|current_size| current_size + added_threads)
     }
 
+    /// Removes the given number of thread from the thread pool. Returns the new
+    /// size of the pool.
+    ///
+    /// See [`ThreadPool::resize_to`] for more information about resizing.
     pub fn shrink(&'static self, terminated_threads: usize) -> usize {
-        self.resize(|current_size| usize::min(current_size - terminated_threads, MAX_THREADS))
+        self.resize(|current_size| current_size - terminated_threads)
     }
 
     /// Ensures that there is at least one worker thread attached to the thread
-    /// pool. This is mostly used to avoid deadlocks that could result from
-    /// blocking on the pool
+    /// pool. This is mostly used to avoid deadlocks. This should be called
+    /// before blocking on a thread pool to ensure the block will eventually be
+    /// released. Returns the new size of the pool, which will be either the old
+    /// size or one.
+    ///
+    /// See [`ThreadPool::resize_to`] for more information about resizing.
     pub fn populate(&'static self) -> usize {
         self.resize(
             |current_size| {
@@ -157,57 +241,86 @@ impl ThreadPool {
         )
     }
 
+    /// Removes all worker threads from the thread pool. This should only be
+    /// done cairfully, as blocking on an empty pool can cause a deadlock.
+    ///
+    /// See [`ThreadPool::resize_to`] for more information about resizing.
     pub fn depopulate(&'static self) -> usize {
         self.resize_to(0)
     }
 
-    /// Resizes the pool. This will fail if called from within the pool, or if
-    /// the pool is already being resized.
+    /// Resizes the pool.
+    ///
+    /// When called from within the pool, this does nothing. Pools can only be
+    /// resized by other threads.
     pub fn resize<F>(&'static self, get_size: F) -> usize
     where
         F: Fn(usize) -> usize,
     {
-        // We cannot shrink the pool from within the pool.
+        // We cannot shrink the pool from within the pool, so we simply refuse
+        // the request and return the same size.
         if !WorkerThread::current().is_null() {
-            panic!("Cannot resize the pool from within the pool.");
+            return self.state.running_threads.load(Ordering::Acquire);
         }
 
+        // Resizing is a critical section; only one thread is allowed to resize
+        // the thread pool at a time. To ensure this exclusivity, we lock a
+        // boolean mutex.
         let mut is_resizing = self.state.is_resizing.lock();
         *is_resizing = true;
 
+        // Use the provided callback to determine the new size of the pool,
+        // clamping it to the max size. We don't have to worry about race
+        // conditions here because it's a critical section. The entire section
+        // is effectively atomic.
         let current_size = self.state.running_threads.load(Ordering::Acquire);
-        let new_size = get_size(current_size);
+        let new_size = usize::min(get_size(current_size), MAX_THREADS);
 
-        // Early return if the size is the same.
+        // If the size is unchanged we can return early.
         if new_size == current_size {
             *is_resizing = false;
             return current_size;
         }
 
+        // Otherwise we can store the new size. We still don't have to worry
+        // about data races between this and the atomic load above because is
+        // this the only place it's set, and we are in a critical section
+        // guarded by the `is_resizing` mutex.
+        //
+        // At this point, other threads will begin to thread the thread pool as
+        // having been resized, even though we have not actually created new or
+        // cleaned up old threads yet.
         self.state
             .running_threads
             .store(new_size, Ordering::Release);
 
-        // Spawn or terminate workers as required
+        // Now we spawn or terminate workers as required.
         if current_size < new_size {
-            // Increase the size of the pool.
+            // Spawn each new thread.
             for i in current_size..new_size {
-                // Start the thread.
+                // SAFETY: The main loop is the first thing called on the new
+                // thread.
                 self.threads[i]
                     .control
                     .run(move || unsafe { main_loop(self, i) });
             }
 
-            // Spawn the heartbeat thread
+            // Wait for each thread to become ready.
+            for i in new_size..current_size {
+                self.threads[i].control.await_ready();
+            }
+
+            // Spawn the heartbeat thread if it's not running.
             if current_size == 0 {
                 self.state
                     .heartbeat_control
                     .run(move || heartbeat_loop(self));
             }
+            
         } else if current_size > new_size {
             // Ask each thread to terminate.
             for i in new_size..current_size {
-                self.threads[i].control.request_termination();
+                self.threads[i].control.halt();
             }
 
             // Wait for each thread to terminate.
@@ -215,25 +328,25 @@ impl ThreadPool {
                 self.threads[i].control.await_termination();
             }
 
-            // Terminate the heartbeat thread.
+            // Terminate the heartbeat thread if the pool is empty.
             if new_size == 0 {
-                self.state.heartbeat_control.request_termination();
+                self.state.heartbeat_control.halt();
                 self.state.heartbeat_control.await_termination();
             }
         }
 
-        // Return the new size.
+        // Release the lock and return the new size.
         *is_resizing = false;
         new_size
     }
 
-    /// Returns an opaque identifier for this registry.
+    /// Returns an opaque identifier for this thread pool.
     pub fn id(&'static self) -> usize {
         // We can rely on `self` not to change since it's a static ref.
         self as *const Self as usize
     }
 
-    /// When called on a worker thread, this injects the job directly into the
+    /// When called on a worker thread, this pushes the job directly into the
     /// local queue. Otherwise it injects it into the thread pool queue.
     pub fn inject_or_push(&'static self, job_ref: JobRef) {
         let worker_thread = WorkerThread::current();
@@ -250,17 +363,15 @@ impl ThreadPool {
 
     /// Injects a job into the thread pool.
     pub fn inject(&'static self, job_ref: JobRef) {
-        let num_jobs = self.queue.len();
-        let _ = self.queue.push(job_ref);
-        // If the queue is non-empty, then we always wake up a worker -- clearly
-        // the existing idle jobs aren't enough.
-        if num_jobs != 0 {
+        self.queue.push(job_ref);
+
+        // If the pool is inactive, we have to wake a thread to work on this.
+        if self.active_tally.load(Ordering::Relaxed) == 0 {
             self.wake_any(1);
         }
     }
 
-    /// Pops a job from the thread pool. This will try three times to get a job,
-    /// and return None if it still can't.
+    /// Pops a job from the thread pool's injector queue.
     pub fn pop(&'static self) -> Option<JobRef> {
         self.queue.pop()
     }
@@ -288,8 +399,9 @@ impl ThreadPool {
         // SAFETY: We just checked that this pointer wasn't null.
         let worker_thread = unsafe { &*worker_thread };
         if worker_thread.thread_pool.id() != self.id() {
-            // We are in a worker thread, but not in the same registry. Package
-            // the job into a thread but then do idle work until it completes.
+            // We are in a worker thread, but not in the same thread pool.
+            // Package the job into a thread but then do idle work until it
+            // completes.
             self.in_worker_cross(worker_thread, f)
         } else {
             // We are in a worker thread for the correct thread pool, so we can
@@ -413,30 +525,36 @@ impl ThreadPool {
 
     /// Wakes a worker that has gone to sleep. Returns true if the worker was
     /// woken up, false if it was already awake.
-    ///
-    /// This sets a mutex, but it should basically never be contested.
     pub fn wake_thread(&'static self, index: usize) -> bool {
         self.threads[index].control.wake()
     }
 
+    /// Marks mew activity on the thread pool. This is what powers
+    /// `wait_until_inactive`. A call to this should always be paired with a
+    /// corresponding call to `mark_inactive` when the activity completes.
+    ///
+    /// What exactly counts as "activity" isn't strictly defined. It's anything
+    /// we would want to wait for completion of in `wait_until_inactive`. It's
+    /// mostly used for benchmarking purposes.
     pub fn mark_active(&'static self) {
-        if self.hold_count.fetch_add(1, Ordering::AcqRel) == 0 {
+        if self.active_tally.fetch_add(1, Ordering::AcqRel) == 0 {
             let mut is_active = self.state.is_active.lock();
             *is_active = true;
             self.state.activity_changed.notify_all();
         };
     }
 
+    /// Marks the end of some thread pool activity. See `mark_active` for more
+    /// information.
     pub fn mark_inactive(&'static self) {
-        if self.hold_count.fetch_sub(1, Ordering::AcqRel) == 1 {
+        if self.active_tally.fetch_sub(1, Ordering::AcqRel) == 1 {
             let mut is_active = self.state.is_active.lock();
             *is_active = false;
             self.state.activity_changed.notify_all();
         }
     }
 
-    /// Waits for the threadpool to go inactive (all threads are sleeping and
-    /// there is no pending work).
+    /// Waits for the threadpool is inactive. Mostly used for benchmarking.
     pub fn wait_until_inactive(&'static self) {
         let mut is_active = self.state.is_active.lock();
         while *is_active {
@@ -449,15 +567,41 @@ impl ThreadPool {
 // Thread control
 
 impl ThreadControl {
+    /// Spawns a thread with the provided closure. It's expected that this
+    /// thread is given a reference to this `ThreadControl`.
+    ///
+    /// The `ThreadControl` api is split into two halves: one half is tended to
+    /// be called by the "controller" (the thread that calls this) and the other
+    /// half is intended to be called by the "worker" (the thread this spawns).
     fn run<F>(&'static self, f: F)
     where
         F: FnOnce() + Send + 'static,
     {
-        let mut is_running = self.is_running.lock();
-        *is_running = true;
         thread::spawn(f);
     }
 
+    /// The controller may call this to wait until the client calls
+    /// `post_ready_status`.
+    fn await_ready(&'static self) {
+        let mut is_running = self.is_running.lock();
+        while !*is_running {
+            self.synchronized.wait(&mut is_running);
+        }
+    }
+
+    /// The worker should call this to indicate that it is now entering it's
+    /// main loop.
+    fn post_ready_status(&'static self) {
+        let mut is_running = self.is_running.lock();
+        *is_running = true;
+        self.synchronized.notify_all();
+    }
+
+    /// The controller should call this whenever it wishes to wake the worker.
+    ///
+    /// This assumes the worker has set `is_sleeping` to true and is waiting for
+    /// `awakened`. There is no `sleep` function because sleeping behavior tends
+    /// to be implementation specific.
     fn wake(&'static self) -> bool {
         let mut is_sleeping = self.is_sleeping.lock();
         if *is_sleeping {
@@ -469,21 +613,31 @@ impl ThreadControl {
         }
     }
 
-    fn request_termination(&'static self) {
+    /// The controller should call this to tell the worker to exit it's main
+    /// thread.
+    ///
+    /// This assumes the worker is looping waiting for `should_terminate` to be
+    /// set.
+    fn halt(&'static self) {
         unsafe { Latch::set(&self.should_terminate) }
         self.wake();
     }
 
+    /// The controller may call this to wait until the client calls
+    /// `post_termination_status`.
     fn await_termination(&'static self) {
         let mut is_running = self.is_running.lock();
-        self.terminated.wait(&mut is_running);
+        while *is_running {
+            self.synchronized.wait(&mut is_running);
+        }
     }
 
-    fn acknowledge_termination(&'static self) {
+    /// The worker should call this right before it terminates.
+    fn post_termination_status(&'static self) {
         self.should_terminate.reset();
         let mut is_running = self.is_running.lock();
         *is_running = false;
-        self.terminated.notify_all();
+        self.synchronized.notify_all();
     }
 }
 
@@ -508,7 +662,12 @@ impl ThreadPool {
     where
         F: FnOnce() + Send + 'static,
     {
-        let job = HeapJob::new(f);
+        // Marks some async thread pool activity. This is decremented at the (*).
+        self.mark_active();
+        let job = HeapJob::new(|| {
+            f();
+            self.mark_inactive(); // (*) Mark the activity complete.
+        });
         let job_ref = job.into_static_job_ref();
         self.inject_or_push(job_ref);
     }
@@ -540,13 +699,11 @@ impl ThreadPool {
         F: Future<Output = T> + Send + 'static,
         T: Send + 'static,
     {
-        // Ensure that registry cannot terminate until this job has
-        // executed. This ref is decremented at the (*) below.
+        // Marks some async thread pool activity. This is decremented at the (*).
         self.mark_active();
         let future = async move {
-            let _guard = CallOnDrop(move || {
-                self.mark_inactive(); // (*) Remove the hold on the registry.
-            });
+            // (*) Mark the activity complete when the future is dropped.
+            let _guard = CallOnDrop(|| self.mark_inactive());
             future.await
         };
 
@@ -562,7 +719,8 @@ impl ThreadPool {
                 JobRef::new_raw(runnable.into_raw().as_ptr(), |this| {
                     let this = NonNull::new_unchecked(this as *mut ());
                     let runnable = Runnable::<()>::from_raw(this);
-                    // Poll the task.
+                    // Poll the task. This will drop the future if the task is
+                    // canceled or the future completes.
                     runnable.run();
                 })
             };
@@ -615,8 +773,8 @@ impl ThreadPool {
         // moved before then, so it is effectively pinned.
         let mut future = unsafe { Pin::new_unchecked(&mut future) };
         self.in_worker(|worker_thread, _| {
-            // We create a async waker which will wake the thread when the
-            // future is awoken. This latch will also keep the registry alive.
+            // Create a callback that will wake this thread when the future is
+            // ready to be polled again.
             let wake = SetOnWake::new(WakeLatch::new(worker_thread));
             let ctx_waker = Arc::clone(&wake).into();
             let mut ctx = Context::from_waker(&ctx_waker);
@@ -749,7 +907,7 @@ thread_local! {
 }
 
 impl WorkerThread {
-    /// Returns access to the this thread's section of the registry.
+    /// Returns access to the shared portion of this thread's data.
     #[inline]
     fn thread_info(&self) -> &ThreadInfo {
         &self.thread_pool.threads[self.index]
@@ -825,17 +983,19 @@ impl WorkerThread {
         local_queue.pop_front()
     }
 
-    /// Claims a shared job. Will try to reclaim the worker's shared job first,
-    /// and then will try to claim the oldest job.
-    ///
-    /// Only the "owner" of the shared job is allowed to hard-lock on it. Other
-    /// threads always use `try_lock` and skip if not
+    /// Claims a shared job. Claiming jobs is lock free. This will do at most
+    /// `MAX_THREADS` atomic read-modify-write operations and at at most one
+    /// actual write. The worker will try to claim it's own shared job first.
+    /// Otherwise it will try to claim shared jobs in sequence starting from a
+    /// random other node.
     #[inline]
     pub fn claim_shared(&self) -> Option<JobRef> {
+        // Try to reclaim this worker's shared job first.
         if let Some(job) = self.thread_info().shared_job.take() {
             return Some(job);
         }
 
+        // Otherwise try to claim shared jobs from random other workers.
         let threads = self.thread_pool.threads.as_slice();
         let num_threads = self
             .thread_pool
@@ -844,14 +1004,15 @@ impl WorkerThread {
             .load(Ordering::Relaxed);
         let start = self.rng.next_usize(num_threads);
         (start..num_threads)
-            .chain(0..)
+            .chain(0..start)
             .filter(move |&i| i != self.index())
             .find_map(|i| threads[i].shared_job.take())
     }
 
-    /// Pops a job off the local queue and promotes it to a shared job. If the
-    /// local job queue is empty, this does nothing. If the worker has an
-    /// existing shared job, it increment that job's age.
+    /// Tries to poromote the oldest job in the local stack to a shared job. If
+    /// the local job queue is empty, this does nothing. If the worker thread
+    /// already has a shared job, this will instead try to wake one of the other
+    /// thread to claim it.
     #[cold]
     fn promote(&self) {
         // SAFETY: The job queue reference is not returned, and `job_queue` is
@@ -863,18 +1024,19 @@ impl WorkerThread {
                 // If the shared slot is already occupied, put the job back on
                 // the queue where it was.
                 local_queue.push_back(job);
+            } else {
+                // Attempt to wake one other thread to claim this shared job.
+                self.thread_pool.wake_any(1);
             }
-            // Attempt to wake one other thread to claim this shared job.
-            self.thread_pool.wake_any(1);
         }
     }
 
     /// Promotes the oldest local job into a shared job which can be claimed and
     /// executed by other workers in the thread pool.
     ///
-    /// This function is amortized. Promotion is expensive, so this function
-    /// will only perform a promotion once in a fixed interval of time (the
-    /// heartbeat interval).
+    /// This function is amortized. Promotion is somewhat expensive, so this
+    /// function will only perform a promotion once in a fixed interval of time
+    /// (the heartbeat interval).
     ///
     /// Many parts of the core thread pool api call this function automatically,
     /// but it can also be called manually by users.
@@ -936,14 +1098,10 @@ impl WorkerThread {
                 return;
             }
 
-            self.thread_pool.mark_inactive();
-
             *is_sleeping = true;
             while *is_sleeping {
                 control.awakened.wait(&mut is_sleeping);
             }
-
-            self.thread_pool.mark_active();
         }
     }
 
@@ -983,10 +1141,7 @@ impl WorkerThread {
 unsafe fn main_loop(thread_pool: &'static ThreadPool, index: usize) {
     // Store a reference to this thread's control data.
     let control = &thread_pool.threads[index].control;
-
-    // Add a hold to the thread pool.
-    thread_pool.mark_active();
-
+    
     // Register the worker on the thread.
     let worker_thread = WorkerThread {
         index,
@@ -1001,25 +1156,26 @@ unsafe fn main_loop(thread_pool: &'static ThreadPool, index: usize) {
         worker_thread.set_current();
     }
 
-    // Run the worker thread until the registry is terminated.
+    // Inform other threads that we are starting the main worker loop.
+    control.post_ready_status();
+
+    // Run the worker thread until the thread is asked to terminate.
     worker_thread.run_until(&control.should_terminate);
 
     // Offload any remaining local work into the global queue.
-    // SAFETY: TODO
+    // SAFETY: We don't call `get_queue` ever again on this thread.
     let local_queue = unsafe { worker_thread.get_queue() };
     for job in local_queue.drain(..) {
         thread_pool.inject(job);
     }
 
+    // If we had a shared job, push that to the global queue after all the local queue is pushed.
     if let Some(job) = worker_thread.thread_info().shared_job.take() {
         thread_pool.inject(job);
     }
 
-    // Remove the hold from the thread pool.
-    thread_pool.mark_inactive();
-
-    // Acknowlage the termination request.
-    control.acknowledge_termination();
+    // Inform other threads that we are terminating.
+    control.post_termination_status();
 }
 
 // -----------------------------------------------------------------------------
@@ -1035,14 +1191,16 @@ unsafe fn main_loop(thread_pool: &'static ThreadPool, index: usize) {
 fn heartbeat_loop(thread_pool: &'static ThreadPool) {
     // Use a 100 microsecond heartbeat interval. Eventually this will be
     // configurable.
-    let interval = Duration::from_micros(100);
+    let interval = Duration::from_micros(50);
 
     let control = &thread_pool.state.heartbeat_control;
+    
+    control.post_ready_status();
 
     // Loop as long as the thread pool is running.
     let mut i = 0;
     while !control.should_terminate.probe() {
-        // Load the current number of running threads from the registry.
+        // Load the current number of running threads.
         let num_threads = thread_pool.state.running_threads.load(Ordering::Relaxed);
 
         // If there are no threads, automatically shut down.
@@ -1077,5 +1235,5 @@ fn heartbeat_loop(thread_pool: &'static ThreadPool) {
         control.awakened.wait_for(&mut is_running, interval);
     }
 
-    control.acknowledge_termination();
+    control.post_termination_status();
 }

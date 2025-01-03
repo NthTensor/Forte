@@ -13,9 +13,9 @@ use crate::{
 // Scope
 
 /// A scope which can spawn a number of non-static jobs and async tasks. See
-/// [`Registry::scope`] for more information.
+/// [`ThreadPool::scope`] for more information.
 pub struct Scope<'scope> {
-    /// The registry the scope operates on.
+    /// The thread pool the scope is for.
     thread_pool: &'static ThreadPool,
     /// A counting latch that opens when all jobs spawned in this scope are complete.
     job_completed_latch: CountLatch,
@@ -30,7 +30,7 @@ pub struct Scope<'scope> {
 
 impl<'scope> Scope<'scope> {
     /// Creates a new scope owned by the given worker thread. For a safe
-    /// equivalent, use [`Registry::scope`].
+    /// equivalent, use [`ThreadPool::scope`].
     ///
     /// Two important lifetimes effect scope: the external lifetime of the scope
     /// object itself (which we will call `'ext`) and the internal lifetime
@@ -69,7 +69,7 @@ impl<'scope> Scope<'scope> {
     ///
     /// # See also
     ///
-    /// The [`Registry::scope`] function has more extensive documentation about
+    /// The [`ThreadPool::scope`] function has more extensive documentation about
     /// task spawning.
     pub fn spawn<F>(&self, f: F)
     where
