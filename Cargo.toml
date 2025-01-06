@@ -13,10 +13,11 @@ members = [
 ]
 
 [dependencies]
-parking_lot = "0.12.3"
 async-task = "4.7.1"
 crossbeam-utils = "0.8.21"
 crossbeam-queue = "0.3.12"
+tracing = "0.1.41"
+tracing-subscriber = "0.3.19"
 
 [lints.clippy]
 doc_markdown = "warn"
@@ -40,3 +41,13 @@ alloc_instead_of_core = "warn"
 missing_docs = "warn"
 unsafe_op_in_unsafe_fn = "warn"
 unused_qualifications = "warn"
+
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+
+# Add loom as a dependency for tests
+[target.'cfg(loom)'.dependencies]
+loom = "0.7"
+
+[[test]]
+name = "integration"
+path = "tests/tests.rs"

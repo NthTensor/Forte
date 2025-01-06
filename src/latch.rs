@@ -25,9 +25,8 @@
 //! specific safety comments for more information.
 
 use alloc::{sync::Arc, task::Wake};
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use parking_lot::{Condvar, Mutex};
+use crate::primitives::*;
 
 use crate::thread_pool::{ThreadPool, WorkerThread};
 
@@ -85,7 +84,17 @@ pub struct AtomicLatch {
 impl AtomicLatch {
     /// Creates a new closed latch.
     #[inline]
+    #[cfg(not(loom))]
     pub const fn new() -> Self {
+        Self {
+            state: AtomicBool::new(false),
+        }
+    }
+
+    /// Non-const constructor variant for loom.
+    #[inline]
+    #[cfg(loom)]
+    pub fn new() -> Self {
         Self {
             state: AtomicBool::new(false),
         }
@@ -150,6 +159,7 @@ impl WakeLatch {
     /// Creates a new latch from a thread pool and worker index, rather than
     /// from a reference to a worker thread.
     #[inline]
+    #[cfg(not(loom))]
     pub const fn new_raw(thread_index: usize, thread_pool: &'static ThreadPool) -> WakeLatch {
         WakeLatch {
             atomic_latch: AtomicLatch::new(),
@@ -200,7 +210,18 @@ pub struct LockLatch {
 impl LockLatch {
     /// Creates a new closed latch.
     #[inline]
+    #[cfg(not(loom))]
     pub const fn new() -> LockLatch {
+        LockLatch {
+            mutex: Mutex::new(false),
+            cond: Condvar::new(),
+        }
+    }
+
+    /// Non-const constructor variant for loom.
+    #[inline]
+    #[cfg(loom)]
+    pub fn new() -> LockLatch {
         LockLatch {
             mutex: Mutex::new(false),
             cond: Condvar::new(),
@@ -209,17 +230,17 @@ impl LockLatch {
 
     /// Waits for the latch to open by blocking the thread.
     pub fn wait(&self) {
-        let mut guard = self.mutex.lock();
+        let mut guard = self.mutex.lock().unwrap();
         while !*guard {
-            self.cond.wait(&mut guard);
+            guard = self.cond.wait(guard).unwrap();
         }
     }
 
     /// Waits for the latch to open by blocking the thread, then sets it back to closed.
     pub fn wait_and_reset(&self) {
-        let mut guard = self.mutex.lock();
+        let mut guard = self.mutex.lock().unwrap();
         while !*guard {
-            self.cond.wait(&mut guard);
+            guard = self.cond.wait(guard).unwrap();
         }
         *guard = false;
     }
@@ -238,7 +259,7 @@ impl Latch for LockLatch {
         // are not transmitted until the `notify_all` call at the very end, so
         // the pointer remains valid for the entire block.
         unsafe {
-            let mut guard = (*this).mutex.lock();
+            let mut guard = (*this).mutex.lock().unwrap();
             *guard = true;
             (*this).cond.notify_all();
         }
