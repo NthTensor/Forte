@@ -13,7 +13,8 @@
 //! (c) Each job reference is executed exactly once.
 
 use alloc::boxed::Box;
-use core::cell::UnsafeCell;
+
+use crate::primitives::*;
 
 // -----------------------------------------------------------------------------
 // Job
@@ -172,11 +173,11 @@ where
     unsafe fn execute(this: *const ()) {
         // SAFETY: The caller ensures this points to a valid `StackJob`.
         let this = unsafe { &*(this.cast::<Self>()) };
-        // SAFETY: This should be called exactly once for each stack-job, so
-        // there can be no other mutable references to the inner value of the
-        // unsafe cell.
-        let job = unsafe { (*this.job.get()).take().unwrap() };
-        job();
+        let job = this.job.get_mut();
+        // SAFETY: TODO
+        let job_func = unsafe { job.deref().take().unwrap() };
+        // Run the job.
+        job_func();
     }
 }
 
