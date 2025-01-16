@@ -29,6 +29,7 @@ pub mod thread_pool;
 
 mod util;
 
+/// Exports a few commonly used types to simplify working with Forte.
 pub mod prelude {
     pub use crate::{
         scope::Scope,

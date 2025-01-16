@@ -150,6 +150,8 @@ impl WakeLatch {
         }
     }
 
+    /// Creates a new latch from a thread pool and worker index, rather than
+    /// from a reference to a worker thread.
     #[inline]
     pub const fn new_raw(thread_index: usize, thread_pool: &'static ThreadPool) -> WakeLatch {
         WakeLatch {
@@ -299,7 +301,7 @@ impl Probe for CountLatch {
 // -----------------------------------------------------------------------------
 // Async set-on-wake
 
-// An async task waker that sets a latch on wake.
+/// An async task waker that sets a latch on wake.
 pub struct SetOnWake<L>
 where
     L: Latch,

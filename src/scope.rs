@@ -1,3 +1,5 @@
+//! This module defines an utility for spawning lifetime-scoped jobs.
+
 use std::{future::Future, marker::PhantomData, ptr::NonNull};
 
 use async_task::{Runnable, Task};
@@ -266,6 +268,10 @@ impl<T> ScopePtr<T> {
     //
     // Callers must ensure the scope pointer is still valid.
     unsafe fn as_ref(&self) -> &T {
-        &*self.0
+        // SAFETY: The caller is required to ensure that the scope pointer is
+        // still valid.
+        unsafe {
+            &*self.0
+        }
     }
 }
