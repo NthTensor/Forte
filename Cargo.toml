@@ -6,6 +6,12 @@ license = "MIT OR Apache-2.0"
 description = "A low-overhead thread-pool with support for non-static async closures"
 repository = "https://github.com/NthTensor/Forte"
 
+[workspace]
+resolver = "2"
+members = [
+  "ci"
+]
+
 [dependencies]
 parking_lot = "0.12.3"
 async-task = "4.7.1"
@@ -19,3 +25,26 @@ criterion = "0.5"
 [[bench]]
 name = "bevy"
 harness = false
+
+[lints.clippy]
+doc_markdown = "warn"
+manual_let_else = "warn"
+match_same_arms = "warn"
+redundant_closure_for_method_calls = "warn"
+redundant_else = "warn"
+semicolon_if_nothing_returned = "warn"
+undocumented_unsafe_blocks = "warn"
+unwrap_or_default = "warn"
+
+ptr_as_ptr = "warn"
+ptr_cast_constness = "warn"
+ref_as_ptr = "warn"
+
+std_instead_of_core = "warn"
+std_instead_of_alloc = "warn"
+alloc_instead_of_core = "warn"
+
+[lints.rust]
+missing_docs = "warn"
+unsafe_op_in_unsafe_fn = "warn"
+unused_qualifications = "warn"
