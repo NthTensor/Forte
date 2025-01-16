@@ -26,6 +26,10 @@ pub trait Job {
     /// This may be called from a different thread than the one which scheduled
     /// the job, so the implementer must ensure the appropriate traits are met,
     /// whether `Send`, `Sync`, or both.
+    ///
+    /// The caller must ensure that the pointer is valid and points to an
+    /// instance of the correct type. They must also ensure this is called
+    /// exactly once for each job.
     unsafe fn execute(this: *const ());
 }
 
@@ -85,17 +89,25 @@ impl JobRef {
     ///
     /// # Safety
     ///
-    /// Caller must ensure that `JobRef::pointer` is still valid.
+    /// Caller must ensure that `JobRef::pointer` is still valid and safe to
+    /// pass to `JobRef::execute_fn`.
+    ///
+    /// Each JobRef must be executed to completion exactly once. What exactly
+    /// "executed to completion" means depends on the underlying type, so is not
+    /// specified as a constraint on this function.
     #[inline]
     pub unsafe fn execute(self) {
-        (self.execute_fn)(self.pointer)
+        // SAFETY: Caller ensures `self.pointer` is valid and safe to pass to
+        // `JobRef::execute_fn`. The safety of this operation is largely
+        // dependent on the correct construction of the `JobRef`.
+        unsafe { (self.execute_fn)(self.pointer) }
     }
 }
 
-// SAFETY: !Send for raw pointers is not for safety, just as a lint
+// SAFETY: !Send for raw pointers is not for safety, just as a lint.
 unsafe impl Send for JobRef {}
 
-// SAFETY: !Sync for raw pointers is not for safety, just as a lint
+// SAFETY: !Sync for raw pointers is not for safety, just as a lint.
 unsafe impl Sync for JobRef {}
 
 // -----------------------------------------------------------------------------
@@ -142,9 +154,12 @@ where
     ///
     /// Caller must ensure the `StackJob` remains valid until the `JobRef` is
     /// executed. This amounts to ensuring the job is executed before the stack
-    /// frame is popped.
+    /// frame is popped. Caller must also ensure that `JobRef::execute` is
+    /// called exactly once.
     pub unsafe fn as_job_ref(&self) -> JobRef {
-        JobRef::new(self)
+        // SAFETY: The caller ensures this job ref lives for the required
+        // duration and is executed to completion exactly once.
+        unsafe { JobRef::new(self) }
     }
 }
 
@@ -158,10 +173,15 @@ where
     ///
     /// Caller must ensure that the pointer points to a valid `StackJob`; or,
     /// equivalently, that this is called before the stack frame in which the
-    /// job is allocated is popped.
+    /// job is allocated is popped. Calling this completes the job, so the
+    /// caller must ensure this is called exactly once.
     unsafe fn execute(this: *const ()) {
-        let this = &*(this as *const Self);
-        let job = (*this.job.get()).take().unwrap();
+        // SAFETY: The caller ensures this points to a valid `StackJob`.
+        let this = unsafe { &*(this as *const Self) };
+        // SAFETY: This should be called exactly once for each stack-job, so
+        // there can be no other mutable references to the inner value of the
+        // unsafe cell.
+        let job = unsafe { (*this.job.get()).take().unwrap() };
         job();
     }
 }
@@ -186,14 +206,20 @@ where
         Box::new(HeapJob { job })
     }
 
-    /// A version of `into_job_ref` that is safe because of the static lifetime.
-    pub fn into_static_job_ref(self: Box<Self>) -> JobRef
+    /// A version of `into_job_ref` for functions with a static lifetime.
+    ///
+    /// # Safety
+    ///
+    /// The caller must still ensure that `JobRef::execute` is called exactly
+    /// once.
+    pub unsafe fn into_static_job_ref(self: Box<Self>) -> JobRef
     where
         F: 'static,
     {
         // SAFETY: The closure this job points to has static lifetime, so it
         // will be valid until `JobRef` is executed, and it cannot close over
-        // any non-static data.
+        // any non-static data. The caller ensures it will be called exactly
+        // once.
         unsafe { self.into_job_ref() }
     }
 
@@ -203,9 +229,12 @@ where
     ///
     /// Caller must ensure the `Box<HeapJob>` remains valid until the `JobRef`
     /// is executed. This hides all lifetimes, so the caller must ensure that it
-    /// dosn't outlive any data it closes over.
+    /// dosn't outlive any data it closes over. Additionally, the caller must
+    /// ensure that `JobRef::execute` is called exactly once.
     pub unsafe fn into_job_ref(self: Box<Self>) -> JobRef {
-        JobRef::new(Box::into_raw(self))
+        // SAFETY: The caller ensures that the `JobRef` will remain valid until
+        // it is executed, and that it will be executed exactly once.
+        unsafe { JobRef::new(Box::into_raw(self)) }
     }
 }
 
@@ -217,9 +246,17 @@ where
     ///
     /// # Safety
     ///
-    /// Caller must ensure that the pointer points to a valid `HeapJob`.
+    /// Caller must ensure that the pointer points to a valid raw boxed
+    /// `HeapJob`. Calling this compltes the job, so the caller must ensure that
+    /// this is called exactly once.
     unsafe fn execute(this: *const ()) {
-        let this = Box::from_raw(this as *mut Self);
-        (this.job)();
+        // SAFETY: The caller ensures that the pointer is a valid raw boxed heap
+        // job. The compiler cannot verify that the inner `FnOnce` is actually
+        // called only once, so we require the caller to verify this as part of
+        // the safety comment for this function.
+        unsafe {
+            let this = Box::from_raw(this as *mut Self);
+            (this.job)();
+        };
     }
 }

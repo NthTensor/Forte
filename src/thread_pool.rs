@@ -1,3 +1,5 @@
+//! This module contains the api and worker logic for the Fotre thread pool.
+
 use std::{
     cell::{OnceCell, UnsafeCell},
     collections::VecDeque,
@@ -666,7 +668,10 @@ impl ThreadPool {
             f();
             self.mark_inactive(); // (*) Mark the activity complete.
         });
-        let job_ref = job.into_static_job_ref();
+        // SAFETY: The thread pool executes each `JobRef` exactly once each time
+        // it is queued. We queue this exactly once, so it is only executed
+        // exactly once.
+        let job_ref = unsafe { job.into_static_job_ref() };
         self.inject_or_push(job_ref);
     }
 
@@ -922,7 +927,13 @@ impl WorkerThread {
     #[inline]
     #[allow(clippy::mut_from_ref)]
     unsafe fn get_queue(&self) -> &mut VecDeque<JobRef> {
-        &mut *self.queue.get()
+        // SAFETY: The queue is static, so this cannot be dangling. The caller
+        // ensures thta no two mutable references can exist within a thread; and
+        // because the queue is thread local this ensure no other mutable
+        // references can exist at all.
+        unsafe {
+            &mut *self.queue.get()
+        }
     }
 
     /// Acquires a reference to the `WorkerThread` for the current thread.
