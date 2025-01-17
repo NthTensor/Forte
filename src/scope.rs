@@ -1,5 +1,6 @@
 //! This module defines an utility for spawning lifetime-scoped jobs.
 
+use alloc::boxed::Box;
 use core::{future::Future, marker::PhantomData, ptr::NonNull};
 
 use async_task::{Runnable, Task};

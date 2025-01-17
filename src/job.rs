@@ -12,6 +12,7 @@
 //! (b) The job remains valid until it is executed for the last time.
 //! (c) Each job reference is executed exactly once.
 
+use alloc::boxed::Box;
 use core::cell::UnsafeCell;
 
 // -----------------------------------------------------------------------------

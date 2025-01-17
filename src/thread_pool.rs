@@ -13,7 +13,7 @@ use core::{
     task::{Context, Poll},
     time::Duration,
 };
-use std::thread;
+use std::{thread, thread_local};
 
 use async_task::{Runnable, Task};
 use crossbeam_queue::SegQueue;

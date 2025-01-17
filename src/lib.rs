@@ -22,6 +22,10 @@
 //! scheduling. Support for futures is based on an approach sketched out by
 //! members of the `rayon` community to whom we are deeply indebted.
 
+#![no_std]
+
+extern crate std;
+
 extern crate alloc;
 
 pub mod job;
