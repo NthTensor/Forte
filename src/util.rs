@@ -1,4 +1,4 @@
-use std::{
+use core::{
     cell::{Cell, UnsafeCell},
     mem::{needs_drop, MaybeUninit},
     sync::atomic::{AtomicUsize, Ordering},
@@ -65,6 +65,9 @@ impl<T> Slot<T> {
         {
             Err(_) => Some(value),
             Ok(_) => {
+                // SAFETY: When the flag was `NONE` the value must be
+                // uninitialized. Since the slot is locked for the duration we
+                // know no other threads can access the cell.
                 unsafe {
                     let slot = &mut *(self.slot.get());
                     slot.write(value);
@@ -84,6 +87,9 @@ impl<T> Slot<T> {
             Err(_) => None,
             Ok(_) => {
                 let value;
+                // SAFETY: When the flag was `SOME` the value must be
+                // initalized. Since the slot is locked the duration, we know no
+                // other threads can access the cell.
                 unsafe {
                     let slot = &mut *(self.slot.get());
                     value = slot.assume_init_read();

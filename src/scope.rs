@@ -1,6 +1,6 @@
 //! This module defines an utility for spawning lifetime-scoped jobs.
 
-use std::{future::Future, marker::PhantomData, ptr::NonNull};
+use core::{future::Future, marker::PhantomData, ptr::NonNull};
 
 use async_task::{Runnable, Task};
 
@@ -181,7 +181,7 @@ impl<'scope> Scope<'scope> {
             // until the task is run.
             let job_ref = unsafe {
                 JobRef::new_raw(runnable.into_raw().as_ptr(), |this| {
-                    let this = NonNull::new_unchecked(this as *mut ());
+                    let this = NonNull::new_unchecked(this.cast_mut());
                     let runnable = Runnable::<()>::from_raw(this);
                     // Poll the task.
                     runnable.run();
@@ -193,7 +193,7 @@ impl<'scope> Scope<'scope> {
             // local queue, which will generally cause tasks to stick to the
             // same thread instead of jumping around randomly. This is also
             // faster than injecting into the global queue.
-            scope.thread_pool.inject_or_push(job_ref)
+            scope.thread_pool.inject_or_push(job_ref);
         };
 
         // SAFETY: We must ensure that the runnable and the waker do not outlive
@@ -270,8 +270,6 @@ impl<T> ScopePtr<T> {
     unsafe fn as_ref(&self) -> &T {
         // SAFETY: The caller is required to ensure that the scope pointer is
         // still valid.
-        unsafe {
-            &*self.0
-        }
+        unsafe { &*self.0 }
     }
 }

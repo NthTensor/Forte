@@ -12,7 +12,7 @@
 //! (b) The job remains valid until it is executed for the last time.
 //! (c) Each job reference is executed exactly once.
 
-use std::cell::UnsafeCell;
+use core::cell::UnsafeCell;
 
 // -----------------------------------------------------------------------------
 // Job
@@ -58,7 +58,7 @@ impl JobRef {
         J: Job,
     {
         JobRef {
-            pointer: job as *const (),
+            pointer: job.cast(),
             execute_fn: <J as Job>::execute,
         }
     }
@@ -86,20 +86,13 @@ impl JobRef {
     }
 
     /// Executes a `JobRef`.
-    ///
-    /// # Safety
-    ///
-    /// Caller must ensure that `JobRef::pointer` is still valid and safe to
-    /// pass to `JobRef::execute_fn`.
-    ///
-    /// Each JobRef must be executed to completion exactly once. What exactly
-    /// "executed to completion" means depends on the underlying type, so is not
-    /// specified as a constraint on this function.
     #[inline]
-    pub unsafe fn execute(self) {
-        // SAFETY: Caller ensures `self.pointer` is valid and safe to pass to
-        // `JobRef::execute_fn`. The safety of this operation is largely
-        // dependent on the correct construction of the `JobRef`.
+    pub fn execute(self) {
+        // SAFETY: The creator of the `JobRef` is reponsible for ensuring
+        // `self.pointer` is valid up until this call and safe to pass to
+        // `JobRef::execute_fn`. This consumes the `JobRef`, ensuring that if it
+        // points to a `Job` then it is executed exactly one (given that the
+        // only a single `JobRef` is created for each job).
         unsafe { (self.execute_fn)(self.pointer) }
     }
 }
@@ -177,7 +170,7 @@ where
     /// caller must ensure this is called exactly once.
     unsafe fn execute(this: *const ()) {
         // SAFETY: The caller ensures this points to a valid `StackJob`.
-        let this = unsafe { &*(this as *const Self) };
+        let this = unsafe { &*(this.cast::<Self>()) };
         // SAFETY: This should be called exactly once for each stack-job, so
         // there can be no other mutable references to the inner value of the
         // unsafe cell.

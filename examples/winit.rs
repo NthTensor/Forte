@@ -1,8 +1,6 @@
 //! This is an example of how to integreat a threadpool with an external event
 //! loop (winit in this case).
 
-use std::sync::LazyLock;
-
 use winit::{
     application::ApplicationHandler,
     event::WindowEvent,
@@ -19,26 +17,22 @@ static COMPUTE: ThreadPool = ThreadPool::new();
 struct DemoApp;
 
 impl ApplicationHandler<JobRef> for DemoApp {
-    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+    fn resumed(&mut self, _event_loop: &ActiveEventLoop) {
         // Do whatever we normally do
     }
 
     fn window_event(
         &mut self,
-        event_loop: &ActiveEventLoop,
-        window_id: WindowId,
-        event: WindowEvent,
+        _event_loop: &ActiveEventLoop,
+        _window_id: WindowId,
+        _event: WindowEvent,
     ) {
         // Do whatever we normally do
     }
 
-    fn user_event(&mut self, event_loop: &ActiveEventLoop, job: JobRef) {
-        // SAFTEY: Since (for now) we only pass static heap allocated job refs
-        // to the main thread, the job-ref pointer will remain valid until it is
-        // executed.
-        unsafe {
-            job.execute();
-        }
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, job: JobRef) {
+        // Execute a job-ref within the main loop.
+        job.execute();
     }
 }
 
@@ -60,14 +54,17 @@ fn main() {
 
                 println!("Thread {} says {}", thread.index(), i);
 
-                // Manually construct and send a job to the main thread
+                // Manually construct and send a job to the main thread.
                 let main_thread_job = HeapJob::new(move || println!("Main thread says {}", i));
-                let job_ref = main_thread_job.into_static_job_ref();
-                main_thread_proxy.send_event(job_ref);
+                // SAFETY: This job is executed once when it is sent to the executor.
+                let job_ref = unsafe { main_thread_job.into_static_job_ref() };
+                // Send the event to the main thread to be executed.
+                let _result = main_thread_proxy.send_event(job_ref);
             });
         });
     }
 
+    // Start the app.
     let mut app = DemoApp;
-    event_loop.run_app(&mut app);
+    let _result = event_loop.run_app(&mut app);
 }
