@@ -70,7 +70,12 @@ impl CI {
             None => {
                 // Note that we are running the subcommands directly rather than using any aliases
                 let mut cmds = vec![];
+                cmds.append(&mut commands::FormatCommand::default().prepare(sh, flags));
+                cmds.append(&mut commands::ClippyCommand::default().prepare(sh, flags));
+                cmds.append(&mut commands::LintsCommand::default().prepare(sh, flags));
                 cmds.append(&mut commands::CompileCheckCommand::default().prepare(sh, flags));
+                cmds.append(&mut commands::DocCheckCommand::default().prepare(sh, flags));
+                cmds.append(&mut commands::DocTestCommand::default().prepare(sh, flags));
                 cmds
             }
         }
