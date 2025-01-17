@@ -3,11 +3,11 @@
 //! (specifically a `JobRef`) is queued, passed to a thread, end executed.
 //!
 //! This module defines two core job types: `StackJob` and `HeapJob`. The former
-//! is more efficent, but can only be used when the work won't outlive the
+//! is more efficient, but can only be used when the work won't outlive the
 //! current stack. `HeapJob` requires an allocation, but can outlive the current
 //! stack.
 //!
-//! When using a job, one must be extreamly careful to ensure that:
+//! When using a job, one must be extremely careful to ensure that:
 //! (a) The job does not outlive anything it closes over.
 //! (b) The job remains valid until it is executed for the last time.
 //! (c) Each job reference is executed exactly once.
@@ -88,7 +88,7 @@ impl JobRef {
     /// Executes a `JobRef`.
     #[inline]
     pub fn execute(self) {
-        // SAFETY: The creator of the `JobRef` is reponsible for ensuring
+        // SAFETY: The creator of the `JobRef` is responsible for ensuring
         // `self.pointer` is valid up until this call and safe to pass to
         // `JobRef::execute_fn`. This consumes the `JobRef`, ensuring that if it
         // points to a `Job` then it is executed exactly one (given that the
@@ -131,10 +131,10 @@ where
     }
 
     /// Executes the job without having to go through the `JobRef`. This has the
-    /// benifit of saving some dynamic lookups, and allows the compiler to do
+    /// benefit of saving some dynamic lookup, and allows the compiler to do
     /// inline optimization (because the function type is known).
     ///
-    /// This is used in `join` to run the job syncrhonously after failing to
+    /// This is used in `join` to run the job synchronously after failing to
     /// share it.
     pub fn run_inline(self) {
         let job = self.job.into_inner().unwrap();
@@ -222,7 +222,7 @@ where
     ///
     /// Caller must ensure the `Box<HeapJob>` remains valid until the `JobRef`
     /// is executed. This hides all lifetimes, so the caller must ensure that it
-    /// dosn't outlive any data it closes over. Additionally, the caller must
+    /// doesn't outlive any data it closes over. Additionally, the caller must
     /// ensure that `JobRef::execute` is called exactly once.
     pub unsafe fn into_job_ref(self: Box<Self>) -> JobRef {
         // SAFETY: The caller ensures that the `JobRef` will remain valid until
@@ -240,7 +240,7 @@ where
     /// # Safety
     ///
     /// Caller must ensure that the pointer points to a valid raw boxed
-    /// `HeapJob`. Calling this compltes the job, so the caller must ensure that
+    /// `HeapJob`. Calling this completes the job, so the caller must ensure that
     /// this is called exactly once.
     unsafe fn execute(this: *const ()) {
         // SAFETY: The caller ensures that the pointer is a valid raw boxed heap
