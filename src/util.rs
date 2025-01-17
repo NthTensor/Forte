@@ -88,7 +88,7 @@ impl<T> Slot<T> {
             Ok(_) => {
                 let value;
                 // SAFETY: When the flag was `SOME` the value must be
-                // initalized. Since the slot is locked the duration, we know no
+                // initialized. Since the slot is locked the duration, we know no
                 // other threads can access the cell.
                 unsafe {
                     let slot = &mut *(self.slot.get());
