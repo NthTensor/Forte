@@ -22,10 +22,6 @@ crossbeam-queue = "0.3.12"
 winit = "0.30.7"
 criterion = "0.5"
 
-[[bench]]
-name = "bevy"
-harness = false
-
 [lints.clippy]
 doc_markdown = "warn"
 manual_let_else = "warn"
