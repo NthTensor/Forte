@@ -24,11 +24,8 @@
 //! becomes "open", the logic it unblocks often deallocates the lock. Refer to
 //! specific safety comments for more information.
 
-use std::{
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
-    sync::Arc,
-    task::Wake,
-};
+use alloc::{sync::Arc, task::Wake};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use parking_lot::{Condvar, Mutex};
 
@@ -285,7 +282,7 @@ impl Latch for CountLatch {
         // it is fine if the pointer becomes dangling.
         unsafe {
             if (*this).counter.fetch_sub(1, Ordering::SeqCst) == 1 {
-                Latch::set(&(*this).latch)
+                Latch::set(&(*this).latch);
             }
         }
     }
