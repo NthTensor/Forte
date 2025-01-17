@@ -1,4 +1,4 @@
-//! This is an example of how to integreat a threadpool with an external event
+//! This is an example of how to integrate a threadpool with an external event
 //! loop (winit in this case).
 
 use winit::{
@@ -37,8 +37,8 @@ impl ApplicationHandler<JobRef> for DemoApp {
 }
 
 fn main() {
-    // Resize the threadpool to the avalible number of threads.
-    COMPUTE.resize_to_avalible();
+    // Resize the threadpool to the available number of threads.
+    COMPUTE.resize_to_available();
 
     // Setup winit event loop.
     let event_loop = EventLoop::<JobRef>::with_user_event().build().unwrap();

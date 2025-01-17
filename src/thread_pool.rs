@@ -1,4 +1,4 @@
-//! This module contains the api and worker logic for the Fotre thread pool.
+//! This module contains the api and worker logic for the Forte thread pool.
 
 use alloc::{collections::VecDeque, sync::Arc};
 use core::{
@@ -34,14 +34,14 @@ use crate::{
 /// pre-allocates space for that number of threads.
 ///
 /// I've chosen 32 as a reasonable default for development, as that's generally
-/// the maximum number of threads avalible on flagship consumer hardware.
+/// the maximum number of threads available on flagship consumer hardware.
 ///
 /// Note that this is only the hard upper bound on thread pool size. Thread
 /// pools can be dynamically resized at runtime.
 pub const MAX_THREADS: usize = 32;
 
-/// The `ThreadPool` object is used to orchistrate and distribute work to a pool
-/// of threads, and is generally the main entrypoint to using `Forte`.
+/// The `ThreadPool` object is used to orchestrate and distribute work to a pool
+/// of threads, and is generally the main entry point to using `Forte`.
 ///
 /// # Creating Thread Pools
 ///
@@ -72,7 +72,7 @@ pub const MAX_THREADS: usize = 32;
 /// Thread pools are dynamically sized; When your program starts they have size
 /// zero (meaning no threads are running), and you will have to add threads by
 /// resizing it. The simplest way to resize a pool is via
-/// [`ThreadPool::resize_to_avalible`] which will simply fill all the avalible
+/// [`ThreadPool::resize_to_available`] which will simply fill all the available
 /// space. More granular control is possible through other methods such as
 /// [`ThreadPool::grow`], [`ThreadPool::shrink`], or [`ThreadPool::resize_to`].
 ///
@@ -101,14 +101,14 @@ pub struct ThreadPool {
 /// Core information about the thread pool. This data may be read from
 /// frequently and should only be written to infrequently.
 struct ThreadPoolState {
-    /// Tracks the number of currently runing threads, included currently
+    /// Tracks the number of currently ruining threads, included currently
     /// sleeping threads. This should only be written to when the `is_resizing`
     /// mutex is held. It is not placed within the mutex because it can be
     /// safely read at any time.
     running_threads: AtomicUsize,
     /// A mutex used to guard the resizing critical section.
     is_resizing: Mutex<bool>,
-    /// Controlls for the thread that sends out heartbeat notifications.
+    /// Controls for the thread that sends out heartbeat notifications.
     heartbeat_control: ThreadControl,
     /// This is set to `true` when `active_tally > 0`, and is used to wait for
     /// either activity or inactivity.
@@ -126,12 +126,12 @@ struct ThreadInfo {
     /// Each worker may "share" one job, allowing other workers to claim it if
     /// they are busy. This is typically the last (oldest) job on their queue.
     shared_job: Slot<JobRef>,
-    /// Information used to control the thread's lifecycle.
+    /// Information used to control the thread's life cycle.
     control: ThreadControl,
 }
 
 /// This is a generalized control mechanism for a thread, implementing sleeping,
-/// wakeups and a termination procedure. This is used by all the worker threads
+/// makeups and a termination procedure. This is used by all the worker threads
 /// and also the heartbeat-sender thread.
 struct ThreadControl {
     /// Set to true when the worker is sleeping. Allows the thread to sleep
@@ -149,11 +149,11 @@ struct ThreadControl {
 }
 
 // -----------------------------------------------------------------------------
-// Thread pool creation and mantinence
+// Thread pool creation and maintenance
 
-/// The inital value of `ThreadControl`. We have this instead of
+/// The initial value of `ThreadControl`. We have this instead of
 /// `ThreadControl::new()` so that it can be used with the const array
-/// initalization syntax.
+/// initialization syntax.
 #[allow(clippy::declare_interior_mutable_const)]
 const THREAD_CONTROL: ThreadControl = ThreadControl {
     is_sleeping: Mutex::new(false),
@@ -163,7 +163,7 @@ const THREAD_CONTROL: ThreadControl = ThreadControl {
     should_terminate: AtomicLatch::new(),
 };
 
-/// The inital value of `ThreadInfo`, padded to fill a cache line. Again, we
+/// The initial value of `ThreadInfo`, padded to fill a cache line. Again, we
 /// have this instead of `ThreadInfo::new()` so that it can be used with the
 /// const array initialization syntax.
 #[allow(clippy::declare_interior_mutable_const)]
@@ -193,12 +193,12 @@ impl ThreadPool {
         }
     }
 
-    /// Resizes the thread pool to fill all avalible space. After this returns,
+    /// Resizes the thread pool to fill all available space. After this returns,
     /// the pool will have at least one worker thread and at most `MAX_THREADS`.
     /// Returns the new size of the pool.
     ///
     /// See [`ThreadPool::resize`] for more information about resizing.
-    pub fn resize_to_avalible(&'static self) -> usize {
+    pub fn resize_to_available(&'static self) -> usize {
         let available = thread::available_parallelism()
             .map(NonZero::get)
             .unwrap_or(1);
@@ -249,7 +249,7 @@ impl ThreadPool {
     }
 
     /// Removes all worker threads from the thread pool. This should only be
-    /// done cairfully, as blocking on an empty pool can cause a deadlock.
+    /// done carefully, as blocking on an empty pool can cause a deadlock.
     ///
     /// See [`ThreadPool::resize_to`] for more information about resizing.
     pub fn depopulate(&'static self) -> usize {
@@ -542,7 +542,7 @@ impl ThreadPool {
     ///
     /// What exactly counts as "activity" isn't strictly defined. It's anything
     /// we would want to wait for completion of in `wait_until_inactive`. It's
-    /// mostly used for benchmarking purposes.
+    /// mostly used for bench marking purposes.
     pub fn mark_active(&'static self) {
         if self.active_tally.fetch_add(1, Ordering::AcqRel) == 0 {
             let mut is_active = self.state.is_active.lock();
@@ -561,7 +561,7 @@ impl ThreadPool {
         }
     }
 
-    /// Waits for the threadpool is inactive. Mostly used for benchmarking.
+    /// Waits for the thread pool is inactive. Mostly used for bench marking.
     pub fn wait_until_inactive(&'static self) {
         let mut is_active = self.state.is_active.lock();
         while *is_active {
@@ -937,7 +937,7 @@ impl WorkerThread {
     #[allow(clippy::mut_from_ref)]
     unsafe fn get_queue(&self) -> &mut VecDeque<JobRef> {
         // SAFETY: The queue is static, so this cannot be dangling. The caller
-        // ensures thta no two mutable references can exist within a thread; and
+        // ensures that no two mutable references can exist within a thread; and
         // because the queue is thread local this ensure no other mutable
         // references can exist at all.
         unsafe { &mut *self.queue.get() }
@@ -1010,7 +1010,7 @@ impl WorkerThread {
             .find_map(|i| threads[i].shared_job.take())
     }
 
-    /// Tries to poromote the oldest job in the local stack to a shared job. If
+    /// Tries to promote the oldest job in the local stack to a shared job. If
     /// the local job queue is empty, this does nothing. If the worker thread
     /// already has a shared job, this will instead try to wake one of the other
     /// thread to claim it.
@@ -1109,7 +1109,7 @@ impl WorkerThread {
     /// Looks for jobs for this worker to work on. It first pulls from the local
     /// queue, then the shared jobs, then the global injector queue.
     ///
-    /// It can be as fast as a local deque pop, or as slow as a contested lock.
+    /// It can be as fast as a local queue pop, or as slow as a contested lock.
     #[inline]
     pub fn find_work(&self) -> Option<JobRef> {
         // First we try to pop a job off the local stack. This is an entirely

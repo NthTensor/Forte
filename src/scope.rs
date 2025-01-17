@@ -264,7 +264,7 @@ unsafe impl<T: Sync> Sync for ScopePtr<T> {}
 impl<T> ScopePtr<T> {
     // Helper to avoid disjoint captures of `scope_ptr.0`
     //
-    // # Saftey
+    // # Safety
     //
     // Callers must ensure the scope pointer is still valid.
     unsafe fn as_ref(&self) -> &T {

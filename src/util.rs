@@ -103,13 +103,13 @@ impl<T> Slot<T> {
 
 impl<T> Drop for Slot<T> {
     fn drop(&mut self) {
-        // If `T` dosn't need to be dropped then neither does `Slot`.
+        // If `T` doesn't need to be dropped then neither does `Slot`.
         if needs_drop::<T>() {
             let Slot { flag, slot } = self;
             // SAFETY: The flag value is always set to either `NONE` or `SOME`.
             // Slots are never dropped when the flag is `LOCK`. If the flag is
             // `NONE` then the slot is empty and nothing needs to be dropped.
-            // If it is `SOME` then the value is initalized and we must
+            // If it is `SOME` then the value is initialized and we must
             // manually drop it.
             unsafe {
                 if *flag.get_mut() == SOME {
@@ -131,7 +131,7 @@ unsafe impl<T> Sync for Slot<T> where T: Send {}
 // -----------------------------------------------------------------------------
 // Xorshift fast prng (taken from rayon)
 
-/// [xorshift*] is a fast pseudorandom number generator which will
+/// [xorshift*] is a fast pseudo-random number generator which will
 /// even tolerate weak seeding, as long as it's not zero.
 ///
 /// [xorshift*]: https://en.wikipedia.org/wiki/Xorshift#xorshift*
