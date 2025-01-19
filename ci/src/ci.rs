@@ -76,6 +76,9 @@ impl CI {
                 cmds.append(&mut commands::CompileCheckCommand::default().prepare(sh, flags));
                 cmds.append(&mut commands::DocCheckCommand::default().prepare(sh, flags));
                 cmds.append(&mut commands::DocTestCommand::default().prepare(sh, flags));
+                cmds.append(&mut commands::LoomCheckCommand::default().prepare(sh, flags));
+                cmds.append(&mut commands::LoomClippyCommand::default().prepare(sh, flags));
+                cmds.append(&mut commands::LoomTestCommand::default().prepare(sh, flags));
                 cmds
             }
         }
@@ -97,6 +100,11 @@ enum Commands {
     Lints(commands::LintsCommand),
     Clippy(commands::ClippyCommand),
     Format(commands::FormatCommand),
+    // Loom commands
+    Loom(commands::LoomCommand),
+    LoomCheck(commands::LoomCheckCommand),
+    LoomClippy(commands::LoomClippyCommand),
+    LoomTest(commands::LoomTestCommand),
 }
 
 impl Prepare for Commands {
@@ -113,6 +121,11 @@ impl Prepare for Commands {
             Commands::Lints(subcommand) => subcommand.prepare(sh, flags),
             Commands::Clippy(subcommand) => subcommand.prepare(sh, flags),
             Commands::Format(subcommand) => subcommand.prepare(sh, flags),
+            // Loom commands
+            Commands::Loom(subcommand) => subcommand.prepare(sh, flags),
+            Commands::LoomCheck(subcommand) => subcommand.prepare(sh, flags),
+            Commands::LoomClippy(subcommand) => subcommand.prepare(sh, flags),
+            Commands::LoomTest(subcommand) => subcommand.prepare(sh, flags),
         }
     }
 }
