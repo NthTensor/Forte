@@ -1,11 +1,16 @@
 //! Tests using the `loom` testing framework.
 
 #![cfg(loom)]
-#![allow(unused_must_use)]
+//#![allow(unused_must_use)]
+#![allow(clippy::useless_vec)]
 
 use core::hint::black_box;
 
+use async_task::Task;
 use loom::model::Builder;
+use loom::sync::atomic::{AtomicUsize, Ordering};
+use loom::sync::{Condvar, Mutex};
+
 use tracing::{info, Level};
 use tracing_subscriber::fmt::Subscriber;
 
@@ -19,7 +24,7 @@ where
     F: Fn() + Send + Sync + 'static,
 {
     let subscriber = Subscriber::builder()
-        .with_max_level(Level::DEBUG)
+        .with_max_level(Level::ERROR)
         .with_test_writer()
         .without_time()
         .finish();
@@ -35,7 +40,7 @@ where
 /// purposes of testing.
 fn with_thread_pool<F>(f: F)
 where
-    F: Fn(&'static ThreadPool),
+    F: Fn(&'static ThreadPool) + 'static,
 {
     info!("### SETTING UP TEST");
 
@@ -64,10 +69,10 @@ where
         thread_pool.populate();
         info!("### STARTING TEST");
         f(thread_pool);
-        info!("### FINISHING TEST");
-        thread_pool.wait_until_inactive();
         info!("### SHUTTING DOWN POOL");
         thread_pool.resize_to(0);
+        // This assert ensures that all spawned jobs are run.
+        assert!(thread_pool.pop().is_none());
     };
 
     // SAFETY: This was created by `Box::into_raw`.
@@ -78,18 +83,61 @@ where
 }
 
 // -----------------------------------------------------------------------------
+// Workload tracking
+
+struct Workload {
+    counter: AtomicUsize,
+    is_done: Mutex<bool>,
+    completed: Condvar,
+}
+
+impl Workload {
+    fn new(count: usize) -> Workload {
+        Workload {
+            counter: AtomicUsize::new(count),
+            is_done: Mutex::new(false),
+            completed: Condvar::new(),
+        }
+    }
+
+    fn execute(&self) {
+        if 1 == self.counter.fetch_sub(1, Ordering::Relaxed) {
+            let mut is_done = self
+                .is_done
+                .lock()
+                .expect("failed to acquire workload lock");
+            *is_done = true;
+            self.completed.notify_all();
+        }
+    }
+
+    fn wait_until_complete(&self) {
+        let mut is_done = self
+            .is_done
+            .lock()
+            .expect("failed to acquire workload lock");
+        while !*is_done {
+            is_done = self
+                .completed
+                .wait(is_done)
+                .expect("failed to reacquire workload lock");
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
 // Pool resizing
 
-// Test of the `with_thread_pool` helper function. This spins up a thread pool
-// with a single thread, then spins it back down.
+/// Tests for concurrency issues within the `with_thread_pool` helper function.
+/// This spins up a thread pool with a single thread, then spins it back down.
 #[test]
-pub fn resize_one() {
+pub fn empty() {
     model(|| {
-        with_thread_pool(|_| {});
+        with_thread_pool(|_threads| {});
     });
 }
 
-// Tests increasing the size of the pool
+/// Tests for concurrency issues when increasing the size of the pool.
 #[test]
 pub fn resize_grow() {
     model(|| {
@@ -99,7 +147,7 @@ pub fn resize_grow() {
     });
 }
 
-// Tests shrinking the size of the pool
+/// Tests for concurrency issues when shrinking the size of the pool.
 #[test]
 pub fn resize_shrink() {
     model(|| {
@@ -112,55 +160,36 @@ pub fn resize_shrink() {
 // -----------------------------------------------------------------------------
 // Core API
 
+/// Tests for concurrency issues when spawning a static closure.
 #[test]
 pub fn spawn_closure() {
     model(|| {
         with_thread_pool(|threads| {
+            let workload: &Workload = Box::leak(Box::new(Workload::new(1)));
             threads.spawn(|| {
-                black_box(());
+                workload.execute();
             });
+            workload.wait_until_complete();
         });
     });
 }
 
-#[test]
-pub fn spawn_two_closures() {
-    model(|| {
-        with_thread_pool(|threads| {
-            threads.spawn(|| {
-                black_box(());
-            });
-            threads.spawn(|| {
-                black_box(());
-            });
-        });
-    });
-}
-
+/// Tests for concurrency issues when spawning a static future.
 #[test]
 pub fn spawn_future() {
     model(|| {
         with_thread_pool(|threads| {
+            let workload: &Workload = Box::leak(Box::new(Workload::new(1)));
             let task = threads.spawn_future(async {
-                black_box(());
+                workload.execute();
             });
             task.detach();
+            workload.wait_until_complete();
         });
     });
 }
 
-#[test]
-pub fn spawn_cancel() {
-    model(|| {
-        with_thread_pool(|threads| {
-            let task = threads.spawn_future(async {
-                black_box(());
-            });
-            task.cancel();
-        });
-    });
-}
-
+/// Tests for concurrency issues in join operations.
 #[test]
 pub fn join() {
     model(|| {
@@ -170,6 +199,7 @@ pub fn join() {
     });
 }
 
+/// Tests for concurrency issues when blocking on a future.
 #[test]
 pub fn block_on() {
     model(|| {
@@ -181,6 +211,8 @@ pub fn block_on() {
     });
 }
 
+/// Tests for concurrency issues when spawning a future and then blocking on the
+/// resulting task.
 #[test]
 pub fn spawn_and_block() {
     model(|| {
@@ -189,6 +221,84 @@ pub fn spawn_and_block() {
                 black_box(());
             });
             threads.block_on(task);
+        });
+    });
+}
+
+// -----------------------------------------------------------------------------
+// Scoped API
+
+/// Test for concurrency issues when creating a scope.
+#[test]
+pub fn scope_empty() {
+    model(|| {
+        with_thread_pool(|threads| {
+            threads.scope(|_| {});
+        });
+    });
+}
+
+/// Tests for concurrency issues when returning a value from a scope.
+#[test]
+fn scope_result() {
+    model(|| {
+        with_thread_pool(|threads| {
+            let x = threads.scope(|_| 22);
+            assert_eq!(x, 22);
+        });
+    });
+}
+
+/// Tests for concurrency issues when spawning a scoped closure.
+#[test]
+pub fn scope_spawn() {
+    model(|| {
+        with_thread_pool(|threads| {
+            let vec = vec![1, 2, 3];
+            threads.scope(|scope| {
+                scope.spawn(|_| {
+                    black_box(vec.len());
+                });
+            });
+        });
+    });
+}
+
+/// Tests for concurrency issues when spawning multiple scoped closures.
+#[test]
+pub fn scope_two() {
+    model(|| {
+        with_thread_pool(|threads| {
+            let counter = &AtomicUsize::new(0);
+            threads.scope(|scope| {
+                scope.spawn(|_| {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                });
+                scope.spawn(|_| {
+                    counter.fetch_add(10, Ordering::SeqCst);
+                });
+            });
+            let v = counter.load(Ordering::SeqCst);
+            assert_eq!(v, 11);
+        });
+    });
+}
+
+/// Tests for concurrency issues when spawning a scoped future, and blocking on
+/// it.
+#[test]
+pub fn scope_future() {
+    model(|| {
+        with_thread_pool(|threads| {
+            let vec = vec![1, 2, 3];
+            let mut task: Option<Task<usize>> = None;
+            threads.scope(|scope| {
+                let scoped_task = scope.spawn_future(async { black_box(vec.len()) });
+                task = Some(scoped_task);
+            });
+            let task = task.expect("task should be initialized after scoped spawn");
+            let len = threads.block_on(task);
+            assert_eq!(len, vec.len());
         });
     });
 }

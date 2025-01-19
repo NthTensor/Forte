@@ -23,7 +23,7 @@ use crate::{
     job::{HeapJob, JobRef, StackJob},
     latch::{AtomicLatch, Latch, LockLatch, Probe, SetOnWake, WakeLatch},
     scope::*,
-    util::{CallOnDrop, Slot, XorShift64Star},
+    util::{Slot, XorShift64Star},
 };
 
 // -----------------------------------------------------------------------------
@@ -49,6 +49,7 @@ pub const MAX_THREADS: usize = 32;
 /// [`ThreadPool::new`].
 ///
 /// ```
+/// # #![cfg(not(loom))]
 /// # use forte::prelude::*;
 /// // Allocate a new thread pool.
 /// static COMPUTE: ThreadPool = ThreadPool::new();
@@ -85,16 +86,6 @@ pub struct ThreadPool {
     /// data. It's bundled together into a cache line so that atomic writes
     /// don't cause unrelated cache-misses.
     state: CachePadded<ThreadPoolState>,
-    /// The activity tally is used to determine if the thread pool is "active"
-    /// which means basically that not everything spawned on the thread pool has
-    /// run to completion.
-    ///
-    /// This is implemented as an atomic counter. The counter is incremented
-    /// when work is sent to the thread pool and decremented when the work is
-    /// completed.
-    ///
-    /// Closely related to `ThreadPoolState::is_active`.
-    active_tally: CachePadded<AtomicUsize>,
 }
 
 /// Core information about the thread pool. This data may be read from
@@ -109,11 +100,6 @@ struct ThreadPoolState {
     is_resizing: Mutex<()>,
     /// Controls for the thread that sends out heartbeat notifications.
     heartbeat_control: ThreadControl,
-    /// This is set to `true` when `active_tally > 0`, and is used to wait for
-    /// either activity or inactivity.
-    is_active: Mutex<bool>,
-    /// Used to send notifications to sleeping threads when `is_active` changes.
-    activity_changed: Condvar,
 }
 
 /// Information for a specific worker thread.
@@ -180,10 +166,7 @@ impl ThreadPool {
                 running_threads: AtomicUsize::new(0),
                 heartbeat_control: THREAD_CONTROL,
                 is_resizing: Mutex::new(()),
-                is_active: Mutex::new(false),
-                activity_changed: Condvar::new(),
             }),
-            active_tally: CachePadded::new(AtomicUsize::new(0)),
         }
     }
 
@@ -213,10 +196,7 @@ impl ThreadPool {
                     should_terminate: AtomicLatch::new(),
                 },
                 is_resizing: Mutex::new(()),
-                is_active: Mutex::new(false),
-                activity_changed: Condvar::new(),
             }),
-            active_tally: CachePadded::new(AtomicUsize::new(0)),
         }
     }
 
@@ -581,39 +561,6 @@ impl ThreadPool {
     pub fn wake_thread(&'static self, index: usize) -> bool {
         self.threads[index].control.wake()
     }
-
-    /// Marks mew activity on the thread pool. This is what powers
-    /// `wait_until_inactive`. A call to this should always be paired with a
-    /// corresponding call to `mark_inactive` when the activity completes.
-    ///
-    /// What exactly counts as "activity" isn't strictly defined. It's anything
-    /// we would want to wait for completion of in `wait_until_inactive`. It's
-    /// mostly used for bench marking purposes.
-    pub fn mark_active(&'static self) {
-        if self.active_tally.fetch_add(1, Ordering::AcqRel) == 0 {
-            let mut is_active = self.state.is_active.lock().unwrap();
-            *is_active = true;
-            self.state.activity_changed.notify_all();
-        };
-    }
-
-    /// Marks the end of some thread pool activity. See `mark_active` for more
-    /// information.
-    pub fn mark_inactive(&'static self) {
-        if self.active_tally.fetch_sub(1, Ordering::AcqRel) == 1 {
-            let mut is_active = self.state.is_active.lock().unwrap();
-            *is_active = false;
-            self.state.activity_changed.notify_all();
-        }
-    }
-
-    /// Waits for the thread pool is inactive. Mostly used for bench marking.
-    pub fn wait_until_inactive(&'static self) {
-        let mut is_active = self.state.is_active.lock().unwrap();
-        while *is_active {
-            is_active = self.state.activity_changed.wait(is_active).unwrap();
-        }
-    }
 }
 
 // -----------------------------------------------------------------------------
@@ -712,12 +659,7 @@ impl ThreadPool {
     where
         F: FnOnce() + Send + 'static,
     {
-        // Marks some async thread pool activity. This is decremented at the (*).
-        self.mark_active();
-        let job = HeapJob::new(|| {
-            f();
-            self.mark_inactive(); // (*) Mark the activity complete.
-        });
+        let job = HeapJob::new(f);
         // SAFETY: The thread pool executes each `JobRef` exactly once each time
         // it is queued. We queue this exactly once, so it is only executed
         // exactly once.
@@ -752,14 +694,6 @@ impl ThreadPool {
         F: Future<Output = T> + Send + 'static,
         T: Send + 'static,
     {
-        // Marks some async thread pool activity. This is decremented at the (*).
-        self.mark_active();
-        let future = async move {
-            // (*) Mark the activity complete when the future is dropped.
-            let _guard = CallOnDrop(|| self.mark_inactive());
-            future.await
-        };
-
         // The schedule function will turn the future into a job when woken.
         let schedule = move |runnable: Runnable| {
             // Now we turn the runnable into a job-ref that we can send to a
