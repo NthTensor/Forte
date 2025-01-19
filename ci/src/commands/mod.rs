@@ -22,3 +22,14 @@ mod lints;
 pub use clippy::*;
 pub use format::*;
 pub use lints::*;
+
+// Loom test suite commands
+mod loom;
+mod loom_check;
+mod loom_clippy;
+mod loom_test;
+
+pub use loom::*;
+pub use loom_check::*;
+pub use loom_clippy::*;
+pub use loom_test::*;

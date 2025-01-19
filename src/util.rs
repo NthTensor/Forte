@@ -1,8 +1,6 @@
-use core::{
-    cell::{Cell, UnsafeCell},
-    mem::{needs_drop, MaybeUninit},
-    sync::atomic::{AtomicUsize, Ordering},
-};
+use core::mem::{needs_drop, replace, MaybeUninit};
+
+use crate::primitives::*;
 
 // -----------------------------------------------------------------------------
 // Call on drop guard
@@ -49,7 +47,17 @@ const SOME: usize = 2;
 
 impl<T> Slot<T> {
     /// Creates an empty slot.
+    #[cfg(not(loom))]
     pub const fn empty() -> Slot<T> {
+        Slot {
+            slot: UnsafeCell::new(MaybeUninit::uninit()),
+            flag: AtomicUsize::new(NONE),
+        }
+    }
+
+    /// Non-const constructor variant for loom.
+    #[cfg(loom)]
+    pub fn empty() -> Slot<T> {
         Slot {
             slot: UnsafeCell::new(MaybeUninit::uninit()),
             flag: AtomicUsize::new(NONE),
@@ -65,13 +73,11 @@ impl<T> Slot<T> {
         {
             Err(_) => Some(value),
             Ok(_) => {
+                let slot = self.slot.get_mut();
                 // SAFETY: When the flag was `NONE` the value must be
                 // uninitialized. Since the slot is locked for the duration we
                 // know no other threads can access the cell.
-                unsafe {
-                    let slot = &mut *(self.slot.get());
-                    slot.write(value);
-                };
+                unsafe { slot.deref().write(value) };
                 self.flag.store(SOME, Ordering::Release);
                 None
             }
@@ -86,14 +92,11 @@ impl<T> Slot<T> {
         {
             Err(_) => None,
             Ok(_) => {
-                let value;
+                let slot = self.slot.get_mut();
                 // SAFETY: When the flag was `SOME` the value must be
                 // initialized. Since the slot is locked the duration, we know no
                 // other threads can access the cell.
-                unsafe {
-                    let slot = &mut *(self.slot.get());
-                    value = slot.assume_init_read();
-                };
+                let value = unsafe { replace(slot.deref(), MaybeUninit::uninit()).assume_init() };
                 self.flag.store(NONE, Ordering::Release);
                 Some(value)
             }
@@ -106,16 +109,14 @@ impl<T> Drop for Slot<T> {
         // If `T` doesn't need to be dropped then neither does `Slot`.
         if needs_drop::<T>() {
             let Slot { flag, slot } = self;
-            // SAFETY: The flag value is always set to either `NONE` or `SOME`.
-            // Slots are never dropped when the flag is `LOCK`. If the flag is
-            // `NONE` then the slot is empty and nothing needs to be dropped.
-            // If it is `SOME` then the value is initialized and we must
-            // manually drop it.
-            unsafe {
-                if *flag.get_mut() == SOME {
-                    slot.get_mut().as_mut_ptr().drop_in_place();
+            flag.with_mut(|flag| {
+                if *flag == SOME {
+                    let slot = slot.get_mut();
+                    // SAFETY: Since the flag was `SOME` we know the slot is
+                    // occupied and should be dropped.
+                    unsafe { slot.deref().as_mut_ptr().drop_in_place() };
                 }
-            }
+            });
         }
     }
 }
