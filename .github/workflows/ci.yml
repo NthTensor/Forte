@@ -67,7 +67,7 @@ jobs:
         run: cargo run -p ci -- doc
         env:
           CARGO_INCREMENTAL: 0
-          RUSTFLAGS: "--cfg loom -C debuginfo=0"
+          RUSTFLAGS: "-C debuginfo=0"
 
   test-loom:
     runs-on: ubuntu-latest
