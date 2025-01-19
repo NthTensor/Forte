@@ -174,7 +174,8 @@ where
         // SAFETY: The caller ensures this points to a valid `StackJob`.
         let this = unsafe { &*(this.cast::<Self>()) };
         let job = this.job.get_mut();
-        // SAFETY: TODO
+        // SAFETY: This is called at most once and the job is otherwise never
+        // dereferenced so there can be no other mutable references.
         let job_func = unsafe { job.deref().take().unwrap() };
         // Run the job.
         job_func();
