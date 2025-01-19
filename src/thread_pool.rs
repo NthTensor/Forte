@@ -1281,27 +1281,18 @@ fn heartbeat_loop(thread_pool: &'static ThreadPool) {
 
         // When not running on loom, we put the thread to sleep until we are
         // woken or need to send another heartbeat signal.
-        #[cfg(not(loom))]
-        {
-            let mut status = control.status.lock().unwrap();
-            while *status != AWOKEN {
-                let timeout;
-                (status, timeout) = control
-                    .status_changed
-                    .wait_timeout(status, _interval)
-                    .unwrap();
-                if timeout.timed_out() {
-                    break;
-                }
+        let mut status = control.status.lock().unwrap();
+        while *status & AWOKEN == 0 {
+            let timeout;
+            (status, timeout) = control
+                .status_changed
+                .wait_timeout(status, _interval)
+                .unwrap();
+            if timeout.timed_out() {
+                break;
             }
-            *status &= !(AWOKEN | SLEEPING);
         }
-
-        // Loom dosn't really support `wait_timeout` so we just spin instead of
-        // sleeping. This call lets loom know we should switch to a different
-        // thread.
-        #[cfg(loom)]
-        loom::lazy_static::yield_now();
+        *status &= !(AWOKEN | SLEEPING);
     }
 
     control.post_termination_status();
