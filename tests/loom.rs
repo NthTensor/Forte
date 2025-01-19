@@ -1,6 +1,7 @@
 //! Tests using the `loom` testing framework.
 
 #![cfg(loom)]
+#![allow(unused_must_use)]
 
 use core::hint::black_box;
 
@@ -9,6 +10,9 @@ use tracing::{info, Level};
 use tracing_subscriber::fmt::Subscriber;
 
 use forte::prelude::*;
+
+// -----------------------------------------------------------------------------
+// Infrastructure
 
 fn model<F>(f: F)
 where
@@ -73,6 +77,9 @@ where
     info!("### TEST COMPLETE");
 }
 
+// -----------------------------------------------------------------------------
+// Pool resizing
+
 // Test of the `with_thread_pool` helper function. This spins up a thread pool
 // with a single thread, then spins it back down.
 #[test]
@@ -102,32 +109,29 @@ pub fn resize_shrink() {
     });
 }
 
-#[test]
-pub fn join() {
-    model(|| {
-        with_thread_pool(|threads| {
-            threads.join(|| black_box(threads), || black_box(threads));
-        });
-    });
-}
+// -----------------------------------------------------------------------------
+// Core API
 
 #[test]
-pub fn block_on() {
+pub fn spawn_closure() {
     model(|| {
         with_thread_pool(|threads| {
-            threads.block_on(async {
-                black_box(threads);
+            threads.spawn(|| {
+                black_box(());
             });
         });
     });
 }
 
 #[test]
-pub fn spawn_closure() {
+pub fn spawn_two_closures() {
     model(|| {
         with_thread_pool(|threads| {
-            threads.spawn(move || {
-                black_box(threads);
+            threads.spawn(|| {
+                black_box(());
+            });
+            threads.spawn(|| {
+                black_box(());
             });
         });
     });
@@ -137,10 +141,42 @@ pub fn spawn_closure() {
 pub fn spawn_future() {
     model(|| {
         with_thread_pool(|threads| {
-            let task = threads.spawn_future(async move {
-                black_box(threads);
+            let task = threads.spawn_future(async {
+                black_box(());
             });
             task.detach();
+        });
+    });
+}
+
+#[test]
+pub fn spawn_cancel() {
+    model(|| {
+        with_thread_pool(|threads| {
+            let task = threads.spawn_future(async {
+                black_box(());
+            });
+            task.cancel();
+        });
+    });
+}
+
+#[test]
+pub fn join() {
+    model(|| {
+        with_thread_pool(|threads| {
+            threads.join(|| black_box(()), || black_box(()));
+        });
+    });
+}
+
+#[test]
+pub fn block_on() {
+    model(|| {
+        with_thread_pool(|threads| {
+            threads.block_on(async {
+                black_box(());
+            });
         });
     });
 }
@@ -149,8 +185,8 @@ pub fn spawn_future() {
 pub fn spawn_and_block() {
     model(|| {
         with_thread_pool(|threads| {
-            let task = threads.spawn_future(async move {
-                black_box(threads);
+            let task = threads.spawn_future(async {
+                black_box(());
             });
             threads.block_on(task);
         });

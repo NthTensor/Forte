@@ -75,6 +75,8 @@ mod primitives {
     pub use std::thread::available_parallelism;
     pub use std::thread::spawn as spawn_thread;
 
+    pub use crossbeam_queue::SegQueue as Queue;
+
     pub struct UnsafeCell<T> {
         data: core::cell::UnsafeCell<T>,
     }
@@ -148,4 +150,28 @@ mod primitives {
     pub use loom::thread::spawn as spawn_thread;
 
     pub use std::thread::available_parallelism;
+
+    use alloc::vec::Vec;
+
+    pub struct Queue<T> {
+        inner: Mutex<Vec<T>>,
+    }
+
+    impl<T> Queue<T> {
+        pub fn new() -> Queue<T> {
+            Queue {
+                inner: Mutex::new(Vec::new()),
+            }
+        }
+
+        pub fn push(&self, val: T) {
+            let mut vec = self.inner.lock().unwrap();
+            vec.push(val);
+        }
+
+        pub fn pop(&self) -> Option<T> {
+            let mut vec = self.inner.lock().unwrap();
+            vec.pop()
+        }
+    }
 }
