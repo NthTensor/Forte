@@ -933,7 +933,8 @@ impl WorkerThread {
     #[inline]
     pub fn push(&self, job: JobRef) {
         let queue = self.queue.get_mut();
-        // SAFETY: TODO
+        // SAFETY: The queue is thread local. Only methods of `WorkerThread`
+        // dereference the queue and none of them can call eachother.
         unsafe { queue.deref().push_front(job) };
     }
 
@@ -942,8 +943,19 @@ impl WorkerThread {
     #[inline]
     pub fn pop(&self) -> Option<JobRef> {
         let queue = self.queue.get_mut();
-        // SAFETY: TODO
+        // SAFETY: The queue is thread local. Only methods of `WorkerThread`
+        // dereference the queue and none of them can call eachother.
         unsafe { queue.deref().pop_front() }
+    }
+
+    /// Removes all jobs from the local queue.
+    #[inline]
+    pub fn drain(&self) -> impl Iterator<Item = JobRef> {
+        let queue = self.queue.get_mut();
+        // SAFETY: The queue is thread local. Only methods of `WorkerThread`
+        // dereference the queue and none of them can call eachother.
+        let queue = unsafe { core::mem::take(queue.deref()) };
+        queue.into_iter()
     }
 
     /// Claims a shared job. Claiming jobs is lock free. This will do at most
@@ -988,11 +1000,14 @@ impl WorkerThread {
     fn promote(&self) {
         debug!("attempting promotion");
         let queue = self.queue.get_mut();
-        // SAFETY: TODO
+        // SAFETY: The queue is thread local. Only methods of `WorkerThread`
+        // dereference the queue and none of them can call eachother.
         if let Some(job) = unsafe { queue.deref().pop_back() } {
             // If there's work in the queue, pop it and try to share it
             if let Some(job) = self.thread_info().shared_job.put(job) {
-                // SAFETY: TODO
+                // SAFETY: Again, the queue is thread local, only methods of
+                // `WorkerThread` dereference the queue, and none of them can
+                // call eachother.
                 unsafe { queue.deref().push_back(job) };
             } else {
                 // Attempt to wake one other thread to claim this shared job.
@@ -1141,9 +1156,7 @@ unsafe fn main_loop(thread_pool: &'static ThreadPool, index: usize) {
         debug!("worker thread halting");
 
         // Offload any remaining local work into the global queue.
-        let queue = worker_thread.queue.get_mut();
-        // SAFETY: We don't call `get_queue` ever again on this thread.
-        for job in unsafe { queue.deref().drain(..) } {
+        for job in worker_thread.drain() {
             thread_pool.inject(job);
         }
 
