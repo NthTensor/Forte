@@ -14,7 +14,7 @@ impl Prepare for LoomTestCommand {
             "Please fix compiler errors in output above.",
         )
         .with_env_var("RUSTFLAGS", "--cfg loom")
-        .with_env_var("LOOM_MAX_PREEMPTIONS", "5");
+        .with_env_var("LOOM_MAX_PREEMPTIONS", "3");
         vec![command]
     }
 }

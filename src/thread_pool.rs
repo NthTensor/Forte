@@ -13,7 +13,6 @@ use core::{
 };
 
 use async_task::{Runnable, Task};
-use crossbeam_queue::SegQueue;
 use crossbeam_utils::CachePadded;
 
 use tracing::{debug, info};
@@ -81,7 +80,7 @@ pub struct ThreadPool {
     threads: [CachePadded<ThreadInfo>; MAX_THREADS],
     /// A queue of pending jobs that can be taken by any thread. It uses the
     /// lock-free queue from crossbeam.
-    queue: SegQueue<JobRef>,
+    queue: Queue<JobRef>,
     /// The thread pool state is a collection of infrequently modified shared
     /// data. It's bundled together into a cache line so that atomic writes
     /// don't cause unrelated cache-misses.
@@ -176,7 +175,7 @@ impl ThreadPool {
 
         ThreadPool {
             threads: [THREAD_INFO; MAX_THREADS],
-            queue: SegQueue::new(),
+            queue: Queue::new(),
             state: CachePadded::new(ThreadPoolState {
                 running_threads: AtomicUsize::new(0),
                 heartbeat_control: THREAD_CONTROL,
@@ -205,7 +204,7 @@ impl ThreadPool {
 
         ThreadPool {
             threads,
-            queue: SegQueue::new(),
+            queue: Queue::new(),
             state: CachePadded::new(ThreadPoolState {
                 running_threads: AtomicUsize::new(0),
                 heartbeat_control: ThreadControl {
@@ -301,7 +300,7 @@ impl ThreadPool {
         // Resizing is a critical section; only one thread is allowed to resize
         // the thread pool at a time. To ensure this exclusivity, we lock a
         // boolean mutex.
-        let _is_resizing = self.state.is_resizing.lock().unwrap();
+        let _resizing_guard = self.state.is_resizing.lock().unwrap();
 
         debug!("starting thread pool resize");
 
@@ -406,6 +405,7 @@ impl ThreadPool {
     pub fn inject_or_push(&'static self, job_ref: JobRef) {
         WorkerThread::with(|worker_thread| match worker_thread {
             Some(worker_thread) if worker_thread.thread_pool().id() == self.id() => {
+                debug!("pushing job to local queue");
                 worker_thread.push(job_ref);
             }
             _ => self.inject(job_ref),
@@ -417,10 +417,8 @@ impl ThreadPool {
         debug!("injecting job into thread pool");
         self.queue.push(job_ref);
 
-        // If the was is inactive, we have to wake a thread to work on this.
-        if self.active_tally.load(Ordering::Relaxed) <= 1 {
-            self.wake_any(1);
-        }
+        // Wake a thread to work on the task.
+        self.wake_any(1);
     }
 
     /// Pops a job from the thread pool's injector queue.
@@ -829,6 +827,7 @@ impl ThreadPool {
         // moved before then, so it is effectively pinned.
         let mut future = unsafe { Pin::new_unchecked(&mut future) };
         self.in_worker(|worker_thread, _| {
+            debug!("running job created by block_on");
             // Create a callback that will wake this thread when the future is
             // ready to be polled again.
             let wake = SetOnWake::new(WakeLatch::new(worker_thread));
@@ -1136,11 +1135,11 @@ impl WorkerThread {
                 debug!("sleeping");
                 *status |= SLEEPING;
                 status = control.status_changed.wait(status).unwrap();
-                debug!("notified");
+                debug!("awoken");
             }
-            *status &= !(AWOKEN | SLEEPING);
 
             debug!("woke up");
+            *status &= !(AWOKEN | SLEEPING);
         }
     }
 
@@ -1278,7 +1277,7 @@ fn heartbeat_loop(thread_pool: &'static ThreadPool) {
         // interval by the current number of threads. When the thread pool is
         // not resized, this will mean we will stagger the heartbeats out evenly
         // and each thread will get a heartbeat on the given frequency.
-        let interval = interval / num_threads as u32;
+        let _interval = interval / num_threads as u32;
 
         // When not running on loom, we put the thread to sleep until we are
         // woken or need to send another heartbeat signal.
@@ -1286,16 +1285,14 @@ fn heartbeat_loop(thread_pool: &'static ThreadPool) {
         {
             let mut status = control.status.lock().unwrap();
             while *status != AWOKEN {
-                let (guard, timeout) = control
+                let timeout;
+                (status, timeout) = control
                     .status_changed
-                    .wait_timeout(status, interval)
+                    .wait_timeout(status, _interval)
                     .unwrap();
-
                 if timeout.timed_out() {
                     break;
                 }
-
-                status = guard;
             }
             *status &= !(AWOKEN | SLEEPING);
         }
