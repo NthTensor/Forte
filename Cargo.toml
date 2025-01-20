@@ -18,6 +18,12 @@ crossbeam-utils = "0.8.21"
 crossbeam-queue = "0.3.12"
 tracing = "0.1.41"
 tracing-subscriber = "0.3.19"
+log = { version = "0.4", features = ["release_max_level_off"] }
+
+[dev-dependencies]
+divan = "0.1.17"
+rayon = "1.10.0"
+chili = "0.2"
 
 [lints.clippy]
 doc_markdown = "warn"
@@ -51,3 +57,7 @@ loom = "0.7"
 [[test]]
 name = "integration"
 path = "tests/tests.rs"
+
+[[bench]]
+name = "fork_join"
+harness = false
