@@ -1,5 +1,9 @@
-use crate::{commands::CompileCheckCommand, Flag, Prepare, PreparedCommand};
 use argh::FromArgs;
+
+use crate::commands::CompileCheckCommand;
+use crate::Flag;
+use crate::Prepare;
+use crate::PreparedCommand;
 
 /// Alias for running the `compile-fail`, `bench-check`, `example-check`, `compile-check`, and `test-check` subcommands.
 #[derive(FromArgs, Default)]

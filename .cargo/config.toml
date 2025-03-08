@@ -1,0 +1,3 @@
+
+[build]
+rustflags = ["-C", "symbol-mangling-version=v0"]

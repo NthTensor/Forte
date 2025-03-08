@@ -1,6 +1,9 @@
-use crate::{Flag, Prepare, PreparedCommand};
 use argh::FromArgs;
 use xshell::cmd;
+
+use crate::Flag;
+use crate::Prepare;
+use crate::PreparedCommand;
 
 /// Checks that all docs compile.
 #[derive(FromArgs, Default)]

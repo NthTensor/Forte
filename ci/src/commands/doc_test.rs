@@ -1,6 +1,9 @@
-use crate::{Flag, Prepare, PreparedCommand};
 use argh::FromArgs;
 use xshell::cmd;
+
+use crate::Flag;
+use crate::Prepare;
+use crate::PreparedCommand;
 
 /// Runs all doc tests.
 #[derive(FromArgs, Default)]

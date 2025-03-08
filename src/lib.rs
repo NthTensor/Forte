@@ -33,27 +33,26 @@ extern crate std;
 // -----------------------------------------------------------------------------
 // Modules
 
-pub mod job;
-pub mod latch;
-pub mod scope;
-pub mod thread_pool;
-
-mod util;
-
-// -----------------------------------------------------------------------------
-// Prelude
-
-pub mod prelude {
-    //! Reexports some types commonly needed for using Forte.
-
-    pub use crate::{
-        scope::Scope,
-        thread_pool::{ThreadPool, WorkerThread},
-    };
-}
+mod blocker;
+mod job;
+mod scope;
+mod signal;
+mod thread_pool;
 
 // -----------------------------------------------------------------------------
-// Mocked APIs
+// Top-level exports
+
+pub use thread_pool::ThreadPool;
+pub use thread_pool::Worker;
+pub use thread_pool::block_on;
+pub use thread_pool::join;
+pub use thread_pool::scope;
+pub use thread_pool::spawn;
+pub use thread_pool::spawn_async;
+pub use thread_pool::spawn_future;
+
+// -----------------------------------------------------------------------------
+// Platform Support
 
 // This crate uses `loom` for testing, which requires mocking all of the core
 // threading primitives (`Mutex` and the like). Unfortunately there are some
@@ -64,18 +63,25 @@ pub mod prelude {
 // it match up with `loom`.
 
 #[cfg(not(loom))]
-mod primitives {
+mod platform {
+
+    // Core exports
+
+    pub use alloc::sync::Arc;
+    pub use alloc::sync::Weak;
     pub use core::cell::Cell;
     pub use core::sync::atomic::AtomicBool;
-    pub use core::sync::atomic::AtomicUsize;
+    pub use core::sync::atomic::AtomicU32;
     pub use core::sync::atomic::Ordering;
-
+    pub use std::sync::Barrier;
     pub use std::sync::Condvar;
     pub use std::sync::Mutex;
+    pub use std::thread::Builder as ThreadBuilder;
+    pub use std::thread::JoinHandle;
     pub use std::thread::available_parallelism;
-    pub use std::thread::spawn as spawn_thread;
+    pub use std::thread_local;
 
-    pub use crossbeam_queue::SegQueue as Queue;
+    // Unsafe Cell
 
     pub struct UnsafeCell<T> {
         data: core::cell::UnsafeCell<T>,
@@ -87,11 +93,6 @@ mod primitives {
             UnsafeCell {
                 data: core::cell::UnsafeCell::new(data),
             }
-        }
-
-        #[inline(always)]
-        pub fn into_inner(self) -> T {
-            self.data.into_inner()
         }
 
         #[inline(always)]
@@ -125,53 +126,36 @@ mod primitives {
             unsafe { &mut *self.ptr }
         }
     }
-
-    pub trait WithMut {
-        fn with_mut<R>(&mut self, f: impl FnOnce(&mut usize) -> R) -> R;
-    }
-
-    impl WithMut for AtomicUsize {
-        #[inline(always)]
-        fn with_mut<R>(&mut self, f: impl FnOnce(&mut usize) -> R) -> R {
-            f(self.get_mut())
-        }
-    }
 }
 
 #[cfg(loom)]
-mod primitives {
+mod platform {
+
+    // Core exports
+
+    use core::ops::Deref;
+
     pub use loom::cell::Cell;
     pub use loom::cell::UnsafeCell;
-    pub use loom::sync::atomic::AtomicBool;
-    pub use loom::sync::atomic::AtomicUsize;
-    pub use loom::sync::atomic::Ordering;
+    pub use loom::sync::Arc;
     pub use loom::sync::Condvar;
     pub use loom::sync::Mutex;
-    pub use loom::thread::spawn as spawn_thread;
+    pub use loom::sync::atomic::AtomicBool;
+    pub use loom::sync::atomic::AtomicU32;
+    pub use loom::sync::atomic::Ordering;
+    pub use loom::sync::atomic::fence;
+    pub use loom::thread::Builder as ThreadBuilder;
+    pub use loom::thread::JoinHandle;
+    pub use loom::thread_local;
 
-    pub use std::thread::available_parallelism;
+    // Queue
 
-    use alloc::vec::Vec;
+    pub type UnboundedQueue<T> = crossbeam_queue::SegQueue<T>;
+    pub type Queue<T, R> = thingbuf::ThingBuf<T, R>;
 
-    pub struct Queue<T> {
-        inner: Mutex<Vec<T>>,
-    }
+    // Available parallelism
 
-    impl<T> Queue<T> {
-        pub fn new() -> Queue<T> {
-            Queue {
-                inner: Mutex::new(Vec::new()),
-            }
-        }
-
-        pub fn push(&self, val: T) {
-            let mut vec = self.inner.lock().unwrap();
-            vec.push(val);
-        }
-
-        pub fn pop(&self) -> Option<T> {
-            let mut vec = self.inner.lock().unwrap();
-            vec.pop()
-        }
+    pub fn available_parallelism() -> std::io::Result<std::num::NonZero<usize>> {
+        panic!("available_parallelism does not work on loom");
     }
 }

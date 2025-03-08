@@ -1,8 +1,11 @@
-use crate::{
-    commands::{LoomCheckCommand, LoomClippyCommand, LoomTestCommand},
-    Flag, Prepare, PreparedCommand,
-};
 use argh::FromArgs;
+
+use crate::commands::LoomCheckCommand;
+use crate::commands::LoomClippyCommand;
+use crate::commands::LoomTestCommand;
+use crate::Flag;
+use crate::Prepare;
+use crate::PreparedCommand;
 
 /// Alias for running the `loom-check`, `loom-clippy` and `loom-test` subcommands.
 #[derive(FromArgs, Default)]

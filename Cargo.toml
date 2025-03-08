@@ -1,29 +1,35 @@
 [package]
 name = "forte"
-version = "1.0.0-alpha.1"
-edition = "2021"
+version = "1.0.0-alpha.2"
+edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "A low-overhead thread-pool with support for non-static async closures"
 repository = "https://github.com/NthTensor/Forte"
 
 [workspace]
 resolver = "2"
-members = [
-  "ci"
-]
+members = ["ci"]
+exclude = ["coz"]
 
 [dependencies]
 async-task = "4.7.1"
-crossbeam-utils = "0.8.21"
-crossbeam-queue = "0.3.12"
-tracing = "0.1.41"
+atomic-wait = "1.1.0"
+tracing = { version = "0.1.41", features = ["release_max_level_off"] }
 tracing-subscriber = "0.3.19"
-log = { version = "0.4", features = ["release_max_level_off"] }
 
 [dev-dependencies]
+# Required for comparison testing
 divan = "0.1.17"
 rayon = "1.10.0"
 chili = "0.2"
+# Used for A/B perf testing
+criterion = { version = "0.5" }
+
+[profile.release]
+debug = true
+
+[profile.bench]
+debug = true
 
 [lints.clippy]
 doc_markdown = "warn"
@@ -52,7 +58,14 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
 
 # Add loom as a dependency for tests
 [target.'cfg(loom)'.dependencies]
-loom = "0.7"
+loom = { version = "0.7", features = [ "checkpoint" ] }
+
+# Custom profile for Loom tests: enable release optimizations so that the loom
+# tests are less slow, but don't disable debug assertions.
+[profile.loom]
+inherits = "test"
+lto = true
+opt-level = 3
 
 [[test]]
 name = "integration"

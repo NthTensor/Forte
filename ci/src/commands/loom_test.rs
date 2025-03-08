@@ -1,6 +1,9 @@
-use crate::{Flag, Prepare, PreparedCommand};
 use argh::FromArgs;
 use xshell::cmd;
+
+use crate::Flag;
+use crate::Prepare;
+use crate::PreparedCommand;
 
 /// Runs the loom concurrency test suite.
 #[derive(FromArgs, Default)]
@@ -14,7 +17,7 @@ impl Prepare for LoomTestCommand {
             "Please fix compiler errors in output above.",
         )
         .with_env_var("RUSTFLAGS", "--cfg loom")
-        .with_env_var("LOOM_MAX_PREEMPTIONS", "3");
+        .with_env_var("LOOM_MAX_PREEMPTIONS", "5");
         vec![command]
     }
 }

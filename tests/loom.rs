@@ -7,14 +7,15 @@
 use core::hint::black_box;
 
 use async_task::Task;
-use loom::model::Builder;
-use loom::sync::atomic::{AtomicUsize, Ordering};
-use loom::sync::{Condvar, Mutex};
-
-use tracing::{info, Level};
-use tracing_subscriber::fmt::Subscriber;
-
+use forte::latch::Latch;
 use forte::prelude::*;
+use loom::model::Builder;
+use loom::sync::atomic::AtomicBool;
+use loom::sync::atomic::AtomicUsize;
+use loom::sync::atomic::Ordering;
+use tracing::Level;
+use tracing::info;
+use tracing_subscriber::fmt::Subscriber;
 
 // -----------------------------------------------------------------------------
 // Infrastructure
@@ -24,9 +25,10 @@ where
     F: Fn() + Send + Sync + 'static,
 {
     let subscriber = Subscriber::builder()
-        .with_max_level(Level::ERROR)
-        .with_test_writer()
+        .compact()
+        .with_max_level(Level::TRACE)
         .without_time()
+        .with_thread_names(false)
         .finish();
 
     tracing::subscriber::with_default(subscriber, || {
@@ -40,7 +42,7 @@ where
 /// purposes of testing.
 fn with_thread_pool<F>(f: F)
 where
-    F: Fn(&'static ThreadPool) + 'static,
+    F: Fn(&'static ThreadPool, &Worker) + 'static,
 {
     info!("### SETTING UP TEST");
 
@@ -66,9 +68,12 @@ where
     unsafe {
         let thread_pool = &*ptr;
         info!("### POPULATING POOL");
-        thread_pool.populate();
+        thread_pool.resize_to(2);
         info!("### STARTING TEST");
-        f(thread_pool);
+        thread_pool.as_worker(|worker| {
+            let worker = worker.unwrap();
+            f(thread_pool, worker);
+        });
         info!("### SHUTTING DOWN POOL");
         thread_pool.resize_to(0);
         // This assert ensures that all spawned jobs are run.
@@ -83,46 +88,36 @@ where
 }
 
 // -----------------------------------------------------------------------------
-// Workload tracking
+// Latches
 
-struct Workload {
-    counter: AtomicUsize,
-    is_done: Mutex<bool>,
-    completed: Condvar,
+#[test]
+pub fn latch() {
+    model(|| {
+        let flag = Box::leak(Box::new(AtomicBool::new(false)));
+        let latch = Box::leak(Box::new(Latch::new()));
+        loom::thread::spawn(|| {
+            flag.store(true, Ordering::Release);
+            latch.set();
+        });
+        latch.wait();
+        assert!(flag.load(Ordering::Acquire));
+    });
 }
 
-impl Workload {
-    fn new(count: usize) -> Workload {
-        Workload {
-            counter: AtomicUsize::new(count),
-            is_done: Mutex::new(false),
-            completed: Condvar::new(),
-        }
-    }
-
-    fn execute(&self) {
-        if 1 == self.counter.fetch_sub(1, Ordering::Relaxed) {
-            let mut is_done = self
-                .is_done
-                .lock()
-                .expect("failed to acquire workload lock");
-            *is_done = true;
-            self.completed.notify_all();
-        }
-    }
-
-    fn wait_until_complete(&self) {
-        let mut is_done = self
-            .is_done
-            .lock()
-            .expect("failed to acquire workload lock");
-        while !*is_done {
-            is_done = self
-                .completed
-                .wait(is_done)
-                .expect("failed to reacquire workload lock");
-        }
-    }
+#[test]
+pub fn multi_latch() {
+    model(|| {
+        let a = Box::leak(Box::new(Latch::new()));
+        let b = Box::leak(Box::new(Latch::new()));
+        loom::thread::spawn(|| {
+            a.set();
+            b.wait();
+            a.set();
+        });
+        a.wait();
+        b.set();
+        a.wait();
+    });
 }
 
 // -----------------------------------------------------------------------------
@@ -131,29 +126,9 @@ impl Workload {
 /// Tests for concurrency issues within the `with_thread_pool` helper function.
 /// This spins up a thread pool with a single thread, then spins it back down.
 #[test]
-pub fn empty() {
+pub fn thread_pool() {
     model(|| {
-        with_thread_pool(|_threads| {});
-    });
-}
-
-/// Tests for concurrency issues when increasing the size of the pool.
-#[test]
-pub fn resize_grow() {
-    model(|| {
-        with_thread_pool(|threads| {
-            threads.grow(1);
-        });
-    });
-}
-
-/// Tests for concurrency issues when shrinking the size of the pool.
-#[test]
-pub fn resize_shrink() {
-    model(|| {
-        with_thread_pool(|threads| {
-            threads.shrink(1);
-        });
+        with_thread_pool(|_, _| black_box(()));
     });
 }
 
@@ -164,12 +139,12 @@ pub fn resize_shrink() {
 #[test]
 pub fn spawn_closure() {
     model(|| {
-        with_thread_pool(|threads| {
-            let workload: &Workload = Box::leak(Box::new(Workload::new(1)));
-            threads.spawn(|| {
-                workload.execute();
+        with_thread_pool(|_, worker| {
+            let complete = Box::leak(Box::new(AtomicBool::new(false)));
+            worker.spawn(|_| {
+                complete.store(true, Ordering::Release);
             });
-            workload.wait_until_complete();
+            worker.run_until(&complete);
         });
     });
 }
@@ -178,13 +153,13 @@ pub fn spawn_closure() {
 #[test]
 pub fn spawn_future() {
     model(|| {
-        with_thread_pool(|threads| {
-            let workload: &Workload = Box::leak(Box::new(Workload::new(1)));
-            let task = threads.spawn_future(async {
-                workload.execute();
+        with_thread_pool(|_, worker| {
+            let complete = Box::leak(Box::new(AtomicBool::new(false)));
+            let task = worker.spawn_future(async {
+                complete.store(true, Ordering::Release);
             });
             task.detach();
-            workload.wait_until_complete();
+            worker.run_until(&complete);
         });
     });
 }
@@ -193,8 +168,8 @@ pub fn spawn_future() {
 #[test]
 pub fn join() {
     model(|| {
-        with_thread_pool(|threads| {
-            threads.join(|| black_box(()), || black_box(()));
+        with_thread_pool(|_, worker| {
+            worker.join(|_| black_box(()), |_| black_box(()));
         });
     });
 }
@@ -203,8 +178,8 @@ pub fn join() {
 #[test]
 pub fn block_on() {
     model(|| {
-        with_thread_pool(|threads| {
-            threads.block_on(async {
+        with_thread_pool(|_, worker| {
+            worker.block_on(async {
                 black_box(());
             });
         });
@@ -216,11 +191,11 @@ pub fn block_on() {
 #[test]
 pub fn spawn_and_block() {
     model(|| {
-        with_thread_pool(|threads| {
-            let task = threads.spawn_future(async {
+        with_thread_pool(|_, worker| {
+            let task = worker.spawn_future(async {
                 black_box(());
             });
-            threads.block_on(task);
+            worker.block_on(task);
         });
     });
 }
@@ -232,8 +207,8 @@ pub fn spawn_and_block() {
 #[test]
 pub fn scope_empty() {
     model(|| {
-        with_thread_pool(|threads| {
-            threads.scope(|_| {});
+        with_thread_pool(|_, worker| {
+            worker.scope(|_| {});
         });
     });
 }
@@ -242,9 +217,9 @@ pub fn scope_empty() {
 #[test]
 fn scope_result() {
     model(|| {
-        with_thread_pool(|threads| {
-            let x = threads.scope(|_| 22);
-            assert_eq!(x, 22);
+        with_thread_pool(|_, worker| {
+            let result = worker.scope(|_| 22);
+            assert_eq!(result, 22);
         });
     });
 }
@@ -253,13 +228,14 @@ fn scope_result() {
 #[test]
 pub fn scope_spawn() {
     model(|| {
-        with_thread_pool(|threads| {
-            let vec = vec![1, 2, 3];
-            threads.scope(|scope| {
+        with_thread_pool(|_, worker| {
+            let complete = AtomicBool::new(false);
+            worker.scope(|scope| {
                 scope.spawn(|_| {
-                    black_box(vec.len());
+                    complete.store(true, Ordering::Release);
                 });
             });
+            worker.run_until(&complete);
         });
     });
 }
@@ -268,9 +244,9 @@ pub fn scope_spawn() {
 #[test]
 pub fn scope_two() {
     model(|| {
-        with_thread_pool(|threads| {
+        with_thread_pool(|_, worker| {
             let counter = &AtomicUsize::new(0);
-            threads.scope(|scope| {
+            worker.scope(|scope| {
                 scope.spawn(|_| {
                     counter.fetch_add(1, Ordering::SeqCst);
                 });
@@ -289,15 +265,10 @@ pub fn scope_two() {
 #[test]
 pub fn scope_future() {
     model(|| {
-        with_thread_pool(|threads| {
+        with_thread_pool(|_, worker| {
             let vec = vec![1, 2, 3];
-            let mut task: Option<Task<usize>> = None;
-            threads.scope(|scope| {
-                let scoped_task = scope.spawn_future(async { black_box(vec.len()) });
-                task = Some(scoped_task);
-            });
-            let task = task.expect("task should be initialized after scoped spawn");
-            let len = threads.block_on(task);
+            let task = worker.scope(|scope| scope.spawn_future(async { black_box(vec.len()) }));
+            let len = worker.block_on(task);
             assert_eq!(len, vec.len());
         });
     });

@@ -2,7 +2,12 @@
 
 use chili::Scope;
 use divan::Bencher;
-use forte::prelude::*;
+use forte::Worker;
+use tracing::debug;
+use tracing::info;
+use tracing_subscriber::fmt;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 
 // -----------------------------------------------------------------------------
 // Workload
@@ -27,7 +32,10 @@ impl Node {
 
 // Returns an iterator over the number of layers. Also returns the total number
 // of nodes.
-const LAYERS: &[usize] = &[10, 15, 20, 25];
+const LAYERS: &[usize] = &[
+    5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
+];
+
 fn nodes() -> impl Iterator<Item = (usize, usize)> {
     LAYERS.iter().map(|&l| (l, (1 << l) - 1))
 }
@@ -64,14 +72,22 @@ fn baseline(bencher: Bencher, nodes: (usize, usize)) {
     });
 }
 
+static COMPUTE: forte::ThreadPool = forte::ThreadPool::new();
+
 #[divan::bench(args = nodes())]
 fn forte(bencher: Bencher, nodes: (usize, usize)) {
-    static COMPUTE: ThreadPool = ThreadPool::new();
-
-    fn sum(node: &Node) -> u64 {
-        let (left, right) = COMPUTE.join(
-            || node.left.as_deref().map(|n| sum(n)).unwrap_or_default(),
-            || node.right.as_deref().map(|n| sum(n)).unwrap_or_default(),
+    fn sum(node: &Node, worker: &Worker) -> u64 {
+        let (left, right) = worker.join(
+            |w| {
+                let sum = node.left.as_deref().map(|n| sum(n, w)).unwrap_or_default();
+                debug!("sum: {}", sum);
+                sum
+            },
+            |w| {
+                let sum = node.right.as_deref().map(|n| sum(n, w)).unwrap_or_default();
+                debug!("sum: {}", sum);
+                sum
+            },
         );
 
         node.val + left + right
@@ -79,10 +95,11 @@ fn forte(bencher: Bencher, nodes: (usize, usize)) {
 
     let tree = Node::tree(nodes.0);
 
-    COMPUTE.resize_to_available();
-
-    bencher.bench_local(move || {
-        assert_eq!(sum(&tree), nodes.1 as u64);
+    COMPUTE.as_worker(|worker| {
+        info!("Staring Benchmark");
+        bencher.bench_local(move || {
+            assert_eq!(sum(&tree, worker), nodes.1 as u64);
+        });
     });
 }
 
@@ -124,5 +141,15 @@ fn rayon(bencher: Bencher, nodes: (usize, usize)) {
 }
 
 fn main() {
+    let fmt_layer = fmt::layer()
+        .without_time()
+        .with_target(false)
+        .with_thread_names(true)
+        .compact();
+
+    tracing_subscriber::registry().with(fmt_layer).init();
+
+    COMPUTE.resize_to_available();
+
     divan::main();
 }

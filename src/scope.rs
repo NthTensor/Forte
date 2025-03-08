@@ -1,16 +1,21 @@
-//! This module defines an utility for spawning lifetime-scoped jobs.
+//! This module defines an utility for spawning non-static jobs. For more
+//! information see [`crate::scope`] or the [`Scope`] type.
 
 use alloc::boxed::Box;
-use core::{future::Future, marker::PhantomData, ptr::NonNull};
+use core::future::Future;
+use core::marker::PhantomData;
+use core::marker::PhantomPinned;
+use core::pin::Pin;
 
-use async_task::{Runnable, Task};
+use async_task::Runnable;
+use async_task::Task;
+use scope_ptr::ScopePtr;
 
-use crate::{
-    job::{HeapJob, JobRef},
-    latch::{CountLatch, Latch},
-    thread_pool::{ThreadPool, WorkerThread},
-    util::CallOnDrop,
-};
+use crate::job::HeapJob;
+use crate::job::JobRef;
+use crate::platform::*;
+use crate::signal::Signal;
+use crate::thread_pool::Worker;
 
 // -----------------------------------------------------------------------------
 // Scope
@@ -18,10 +23,12 @@ use crate::{
 /// A scope which can spawn a number of non-static jobs and async tasks. See
 /// [`ThreadPool::scope`] for more information.
 pub struct Scope<'scope> {
-    /// The thread pool the scope is for.
-    thread_pool: &'static ThreadPool,
-    /// A counting latch that opens when all jobs spawned in this scope are complete.
-    job_completed_latch: CountLatch,
+    /// Number of active references to the scope (including the owning
+    /// allocation). This is incremented each time a new `ScopePtr` is created,
+    /// and decremented when a `ScopePtr` or the `Scope` itself is dropped.
+    count: AtomicU32,
+    /// A signal used to communicate when the scope has been completed.
+    signal: Signal,
     /// A marker that makes the scope behave as if it contained a vector of
     /// closures to execute, all of which outlive `'scope`. We pretend they are
     /// `Send + Sync` even though they're not actually required to be `Sync`.
@@ -29,6 +36,8 @@ pub struct Scope<'scope> {
     /// are only *moved* across threads to be executed.
     #[allow(clippy::type_complexity)]
     marker: PhantomData<Box<dyn FnOnce(&Scope<'scope>) + Send + Sync + 'scope>>,
+    /// Opt out of Unpin behavior; this type requires strong pinning guaranties.
+    _phantom: PhantomPinned,
 }
 
 impl<'scope> Scope<'scope> {
@@ -39,20 +48,22 @@ impl<'scope> Scope<'scope> {
     /// object itself (which we will call `'ext`) and the internal lifetime
     /// `'scope`.
     ///
-    /// # Safety
-    ///
-    /// The caller must ensure that the scope is completed with a call to
-    /// [`Scope::complete`], passing in a reference the same owning worker
-    /// thread both times.
-    ///
-    /// If the scope is not completed, jobs spawned onto this scope may outlive
-    /// the data they close over.
-    pub unsafe fn new(owner: &WorkerThread) -> Scope<'scope> {
+    /// Before a scope can be used, it must be pinned. The recommended approach
+    /// is to use the `pin!` macro to get a `Pin<&mut Scope<'scope>>` which you
+    /// then convert into a `Pin<&Scope<'scope>>` via `into_ref`.
+    pub(crate) fn new() -> Scope<'scope> {
         Scope {
-            thread_pool: owner.thread_pool(),
-            job_completed_latch: CountLatch::with_count(1, owner),
+            count: AtomicU32::new(1),
+            signal: Signal::new(),
             marker: PhantomData,
+            _phantom: PhantomPinned,
         }
+    }
+
+    /// Consumes the scope and blocks until all jobs spawned on it are complete.
+    /// This is equivalent to dropping the scope.
+    pub fn complete(self) {
+        drop(self);
     }
 
     /// Spawns a job into the scope. This job will execute sometime before the
@@ -74,37 +85,30 @@ impl<'scope> Scope<'scope> {
     ///
     /// The [`ThreadPool::scope`] function has more extensive documentation about
     /// task spawning.
-    pub fn spawn<F>(&self, f: F)
+    pub fn spawn<F>(self: Pin<&Self>, f: F)
     where
-        F: FnOnce(&Scope<'scope>) + Send + 'scope,
+        F: FnOnce(Pin<&Scope<'scope>>) + Send + 'scope,
     {
-        // We increment the scope counter; this will prevent the scope from
-        // ending until after a corresponding `Latch::set` call.
-        self.job_completed_latch.increment();
-
         // Create a job to execute the spawned function in the scope.
-        let scope_ptr = ScopePtr(self);
-        let job = HeapJob::new(move || {
-            // SAFETY: Because we called `increment` and the owner is required
-            // to call `complete`, this scope will remain valid at-least until
-            // `Latch::set` is called.
-            unsafe {
-                let scope = scope_ptr.as_ref();
-                f(scope);
-                Latch::set(&self.job_completed_latch);
-            }
+        let scope_ptr = ScopePtr::new(self);
+        let job = HeapJob::new(move |_| {
+            scope_ptr.run(f);
         });
 
-        // SAFETY: The heap job does not outlive `'scope`. This is ensured
-        // because the owner of this scope is required to call
-        // `Scope::complete`, and that function keeps the scope alive until the
-        // latch is opened. The latch will not open until after this job is
-        // executed, because the call to `increment` above is matched by the
-        // call to `Latch::set` after execution.
+        // SAFETY: We must ensure that the heap job does not outlive the data is
+        // closes over. In effect, this means it must not outlive `'scope`.
+        //
+        // The `'scope` will last until the scope is deallocated, which (due to
+        // reference counting) will not be until after `scope_ptr` within the
+        // heap job is dropped. So `'scope` should last at least until the heap
+        // job is dropped.
         let job_ref = unsafe { job.into_job_ref() };
 
         // Send the job to a queue to be executed.
-        self.thread_pool.inject_or_push(job_ref);
+        Worker::with_current(|worker| {
+            let worker = worker.unwrap();
+            worker.queue.push_back(job_ref);
+        });
     }
 
     /// Spawns a future onto the scope. This future will be asynchronously
@@ -133,56 +137,40 @@ impl<'scope> Scope<'scope> {
     ///    infinite loop will prevent the scope from completing, and is not
     ///    recommended.
     ///
-    pub fn spawn_future<F, T>(&self, future: F) -> Task<T>
+    pub fn spawn_future<F, T>(self: Pin<&Self>, future: F) -> Task<T>
     where
         F: Future<Output = T> + Send + 'scope,
         T: Send + 'scope,
     {
-        // We increment the scope counter; this will prevent the scope from
-        // ending until after a corresponding `Latch::set` call.
-        self.job_completed_latch.increment();
+        self.spawn_async(|_| future)
+    }
 
-        // The future is dropped when the task is completed or canceled. In
-        // either case we have to decrement the scope job count. We inject this
-        // logic into the future itself at the onset.
-        //
-        // A useful consequence of this approach is that the scope (and
-        // therefore the latch) will remain valid at least until the last future
-        // is dropped.
-        let scope_ptr = ScopePtr(self);
-        let future = async move {
-            let _guard = CallOnDrop(move || {
-                // SAFETY: Because we called `increment` and the owner is required
-                // to call `complete`, this scope will remain valid at-least until
-                // `Latch::set` is called.
-                unsafe {
-                    let scope = scope_ptr.as_ref();
-                    Latch::set(&scope.job_completed_latch);
-                }
-            });
-            future.await
-        };
+    /// Spawns an async closure onto the scope. This future will be
+    /// asynchronously polled to completion some time before the scope
+    /// completes.
+    ///
+    /// Internally the closure is wrapped into a future and passed along to
+    /// [`Scope::spawn_future`]. See the docs on that function for more
+    /// information.
+    pub fn spawn_async<Fn, Fut, T>(self: Pin<&Self>, f: Fn) -> Task<T>
+    where
+        Fn: FnOnce(Pin<&Scope<'scope>>) -> Fut + Send + 'scope,
+        Fut: Future<Output = T> + Send + 'scope,
+        T: Send + 'scope,
+    {
+        // Wrap the function into a future using an async block.
+        let scope_ptr = ScopePtr::new(self);
+        let future = async move { scope_ptr.run(f).await };
 
         // The schedule function will turn the future into a job when woken.
-        let scope_ptr = ScopePtr(self);
         let schedule = move |runnable: Runnable| {
-            // SAFETY: Because we called `increment` and the owner is required
-            // to call `complete`, this scope will remain valid at-least until
-            // `Latch::set` is called when the future is dropped.
-            //
-            // The future will not be dropped until after the runnable is
-            // dropped, so the scope pointer must still be valid.
-            let scope = unsafe { scope_ptr.as_ref() };
-
-            // Now we turn the runnable into a job-ref that we can send to a
-            // worker.
+            // Turn the runnable into a job-ref that we can send to a worker.
 
             // SAFETY: We provide a pointer to a non-null runnable, and we turn
             // it back into a non-null runnable. The runnable will remain valid
             // until the task is run.
             let job_ref = unsafe {
-                JobRef::new_raw(runnable.into_raw().as_ptr(), |this| {
-                    let this = NonNull::new_unchecked(this.cast_mut());
+                JobRef::new_raw(runnable.into_raw(), |this, _| {
                     let runnable = Runnable::<()>::from_raw(this);
                     // Poll the task.
                     runnable.run();
@@ -194,83 +182,147 @@ impl<'scope> Scope<'scope> {
             // local queue, which will generally cause tasks to stick to the
             // same thread instead of jumping around randomly. This is also
             // faster than injecting into the global queue.
-            scope.thread_pool.inject_or_push(job_ref);
+            Worker::with_current(|worker| {
+                let worker = worker.unwrap();
+                worker.queue.push_back(job_ref);
+            });
         };
 
-        // SAFETY: We must ensure that the runnable and the waker do not outlive
-        // `'scope`. This is ensured because the owner of this scope is
-        // required to call `Scope::complete`. That function keeps the scope
-        // alive until the latch is opened, and the latch will not open until
-        // after the future is dropped, which can happen only after the runnable
-        // and waker are dropped.
+        // SAFETY: We must ensure that the runnable does not outlive the data is
+        // closes over. In effect, this means it must not outlive `'scope`.
+        //
+        // The `'scope` will last until the scope is deallocated, which (due to
+        // reference counting) will not be until after `scope_ptr` within the
+        // future is dropped. The future will not be dropped until after the
+        // runnable is dropped, so `'scope` should last at least until the
+        // runnable is dropped.
         //
         // We have to use `spawn_unchecked` here instead of `spawn` because the
         // future is non-static.
         let (runnable, task) = unsafe { async_task::spawn_unchecked(future, schedule) };
+
         // Call the schedule function once to create the initial job.
         runnable.schedule();
+
+        // Return the task handle.
         task
     }
 
-    /// Spawns an async closure onto the scope. This future will be
-    /// asynchronously polled to completion some time before the scope
-    /// completes.
-    ///
-    /// Internally the closure is wrapped into a future and passed along to
-    /// [`Scope::spawn_future`]. See the docs on that function for more
-    /// information.
-    pub fn spawn_async<Fn, Fut, T>(&self, f: Fn) -> Task<T>
-    where
-        Fn: FnOnce(&Scope<'scope>) -> Fut + Send + 'static,
-        Fut: Future<Output = T> + Send + 'static,
-        T: Send + 'static,
-    {
-        // Wrap the function into a future using an async block.
-        let scope_ptr = ScopePtr(self);
-        let future = async move {
-            // SAFETY: The scope will be valid at least until this future is
-            // dropped because of the drop guard in `spawn_future`.
-            let scope = unsafe { scope_ptr.as_ref() };
-            f(scope).await
-        };
-        // We just pass this future to `spawn_future`.
-        self.spawn_future(future)
+    /// Adds an additional reference to the scope's reference counter.
+    fn add_reference(&self) {
+        let counter = self.count.fetch_add(1, Ordering::SeqCst);
+        tracing::trace!("scope reference counter increased to {}", counter + 1);
     }
 
-    /// Consumes the scope and blocks until all jobs spawned on it are complete.
-    pub fn complete(self, owner: &WorkerThread) {
-        // SAFETY: The latch is valid until the scope is dropped at the end of
-        // this function.
-        unsafe { Latch::set(&self.job_completed_latch) };
-        // Run the thread until the jobs are complete, then return.
-        owner.run_until(&self.job_completed_latch);
+    /// Removes a reference from the scope's reference counter.
+    fn remove_reference(&self) {
+        let counter = self.count.fetch_sub(1, Ordering::SeqCst);
+        tracing::trace!("scope reference counter decreased to {}", counter - 1);
+        if counter == 1 {
+            // Alerts the owning thread that the scope has completed.
+            //
+            // This should never panic, because the counter can only go to zero
+            // once, when the scope has been dropped and all work has been
+            // completed.
+            //
+            // SAFETY: The signal is passed as a reference, and is live for the
+            // duration of the function.
+            unsafe { Signal::send(&self.signal, ()) };
+        }
+    }
+}
+
+impl Drop for Scope<'_> {
+    fn drop(&mut self) {
+        // When the scope is dropped, block to prevent deallocation until the
+        // reference counter allows the scope to complete.
+        tracing::trace!("completing scope");
+        self.remove_reference();
+        Worker::with_current(|worker| {
+            let worker = worker.unwrap();
+            worker.wait_for_signal(&self.signal);
+        });
     }
 }
 
 // -----------------------------------------------------------------------------
 // Scope pointer
 
-/// Used to capture a scope `&Self` pointer in jobs, without faking a lifetime.
-///
-/// Unsafe code is still required to dereference the pointer, but that's fine in
-/// scope jobs that are guaranteed to execute before the scope ends.
-struct ScopePtr<T>(*const T);
+mod scope_ptr {
+    //! Defines a "lifetime-erased" reference-counting pointer to a scope.
 
-// SAFETY: !Send for raw pointers is not for safety, just as a lint
-unsafe impl<T: Sync> Send for ScopePtr<T> {}
+    use core::pin::Pin;
 
-// SAFETY: !Sync for raw pointers is not for safety, just as a lint
-unsafe impl<T: Sync> Sync for ScopePtr<T> {}
+    use super::Scope;
 
-impl<T> ScopePtr<T> {
-    // Helper to avoid disjoint captures of `scope_ptr.0`
-    //
-    // # Safety
-    //
-    // Callers must ensure the scope pointer is still valid.
-    unsafe fn as_ref(&self) -> &T {
-        // SAFETY: The caller is required to ensure that the scope pointer is
-        // still valid.
-        unsafe { &*self.0 }
+    /// A reference-counted pointer to a scope. Used to capture a scope pointer
+    /// in jobs without faking a lifetime. Holding a `ScopePtr` keeps the
+    /// reference scope from being deallocated.
+    pub struct ScopePtr<'scope>(*const Scope<'scope>);
+
+    // SAFETY: !Send for raw pointers is not for safety, just as a lint.
+    unsafe impl Send for ScopePtr<'_> {}
+
+    // SAFETY: !Sync for raw pointers is not for safety, just as a lint.
+    unsafe impl Sync for ScopePtr<'_> {}
+
+    impl<'scope> ScopePtr<'scope> {
+        /// Creates a new reference-counted scope pointer which can be sent to other
+        /// threads.
+        pub fn new(scope: Pin<&Scope<'scope>>) -> ScopePtr<'scope> {
+            scope.add_reference();
+            ScopePtr(scope.get_ref())
+        }
+
+        /// Passes the scope referred to by this pointer into a closure.
+        pub fn run<F, T>(&self, f: F) -> T
+        where
+            F: FnOnce(Pin<&Scope<'scope>>) -> T + 'scope,
+        {
+            // SAFETY: This pointer is convertible to a shared reference.
+            //
+            // + It was created from an immutable reference, and we never change
+            //   it so it must be non-null and dereferenceable.
+            //
+            // + We incremented the scopes reference counter and will not
+            //   decrement it until this pointer is dropped. Since the scope
+            //   will remain valid as long as the reference counter is above
+            //   zero, we know it is valid.
+            //
+            // + The scope is never accessed mutably, so creating shared
+            //   references is allowed.
+            //
+            let inner_ref = unsafe { &*self.0 };
+
+            // SAFETY: The scope was pinned when passed to `ScopePtr::new` so
+            // the pinning rules must already be satisfied.
+            let pinned_ref = unsafe { Pin::new_unchecked(inner_ref) };
+
+            // Execute the closure on the shared reference.
+            f(pinned_ref)
+        }
+    }
+
+    impl Drop for ScopePtr<'_> {
+        fn drop(&mut self) {
+            // SAFETY: This pointer is convertible to a shared reference.
+            //
+            // + It was created from an immutable reference, and we never change
+            //   it so it must be non-null and dereferenceable.
+            //
+            // + We incremented the scopes reference counter and we have not yet
+            //   decremented it (although we are about to). Since the scope will
+            //   remain valid as long as the reference counter is above zero, we
+            //   know it is valid.
+            //
+            // + The scope is never accessed mutably, so creating shared
+            //   references is allowed.
+            //
+            let scope_ref = unsafe { &*self.0 };
+
+            // Decrement the reference counter, possibly allowing the scope to
+            // complete.
+            scope_ref.remove_reference();
+        }
     }
 }

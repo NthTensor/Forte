@@ -1,8 +1,9 @@
-use crate::{
-    commands,
-    prepare::{Flag, Prepare, PreparedCommand},
-};
 use argh::FromArgs;
+
+use crate::commands;
+use crate::prepare::Flag;
+use crate::prepare::Prepare;
+use crate::prepare::PreparedCommand;
 
 /// The CI command line tool for Forte.
 #[derive(FromArgs)]
