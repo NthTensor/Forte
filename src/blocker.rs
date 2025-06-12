@@ -9,7 +9,7 @@ use crate::platform::*;
 // -----------------------------------------------------------------------------
 // States
 
-/// The blocker is not sleeping, and has not been woken.
+/// The blocker is not sleeping and has not been woken.
 const IDLE: u32 = 0;
 
 // The blocker is sleeping or is about to go to sleep.
@@ -21,7 +21,7 @@ const WAKE: u32 = 2;
 // -----------------------------------------------------------------------------
 // Blocker
 
-/// A blocker lets you block a thread on a the progress of a future.
+/// A blocker lets you block a thread on the progress of a future.
 pub struct Blocker {
     /// The state of a blocker.
     state: AtomicU32,
@@ -36,7 +36,7 @@ impl Blocker {
     }
 
     /// Creates an async waker from a signal. This can be used to schedule a
-    /// signal when a future comples.
+    /// signal when a future completes.
     ///
     /// # Safety
     ///
@@ -76,8 +76,8 @@ const RAW_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
 
 fn wake(this: *const ()) {
     // SAFETY: This was constructed to be non-null, and the blocker must outlive
-    // the waker, and we do not ever access blockers mutabley, so it must be
-    // valid to convert this into an imutable reference.
+    // the waker, and we do not ever access blockers mutably, so it must be
+    // valid to convert this into an immutable reference.
     let blocker = unsafe { &*this.cast::<Blocker>() };
     if blocker.state.swap(WAKE, Ordering::Relaxed) == WAIT {
         atomic_wait::wake_all(&blocker.state);

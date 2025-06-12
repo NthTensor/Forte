@@ -50,7 +50,7 @@ where
     let thread_pool = Box::new(ThreadPool::new());
     let ptr = Box::into_raw(thread_pool);
 
-    // SAFETY: We want to create have a reference to the thread pool which can
+    // SAFETY: We want to create a reference to the thread pool which can
     // be treated as `'static` by the callback `f`. We will assume that `f` has
     // no side-effects except for those created by calls to the thread pool.
     // This problem comes down to ensuring that `thread_pool` lives for the

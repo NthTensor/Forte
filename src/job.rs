@@ -1,4 +1,4 @@
-//! This module defines a executable unit of work called a [`Job`]. Jobs are what
+//! This module defines an executable unit of work called a [`Job`]. Jobs are what
 //! get scheduled on the thread-pool. There are two core job types: [`StackJob`]
 //! and [`HeapJob`].
 //!
@@ -67,7 +67,7 @@ impl JobRef {
     ///
     /// # Safety
     ///
-    /// The caller must ensure that `job_pointer` is remains valid to pass to
+    /// The caller must ensure that `job_pointer` remains valid to pass to
     /// `execute_fn` until the job is executed. What exactly this means is
     /// dependent on the implementation of the execute function.
     #[inline]
@@ -149,7 +149,7 @@ impl JobQueue {
 
 /// A [`StackJob`] is a job that's allocated on the stack. It's efficient, but
 /// relies on us preventing the stack frame from being dropped. Stack jobs are
-/// used mainly for for `join` and other blocking thread pool operations. They
+/// used mainly for `join` and other blocking thread pool operations. They
 /// also support explicit return values, transmitted via an attached signal.
 ///
 /// This is analogous to the chili type `JobStack` and the rayon type `StackJob`.
@@ -176,13 +176,13 @@ where
     ///
     /// # Safety
     ///
-    /// The caller must ensure that the `StackJob` the returned `JobRef` refers
+    /// The caller must ensure that the `StackJob` that the returned `JobRef` refers
     /// to will live as long as the `JobRef`. The caller must also ensure that
     /// the `JobRef` does not outlive the data the `StackJob` closes over; which
     /// is to say, if the closure references something, that thing must exist at
     /// least until the `JobRef` is executed or dropped. Additionally, the
     /// caller must ensure that they never create two different `JobRef`s that
-    /// point to the same `StackJob`
+    /// point to the same `StackJob`.
     pub unsafe fn as_job_ref(&self) -> JobRef {
         let job_pointer = NonNull::from(self).cast();
         // SAFETY: The caller ensures the `StackJob` will outlive the `JobRef`,
@@ -190,7 +190,7 @@ where
         // hence it is possible to pass this pointer to `Self::execute`.
         //
         // `Self::execute` cannot be called multiple times because
-        // `JobRef::execute` takes ownership of the `JobRef`, and we only crate
+        // `JobRef::execute` takes ownership of the `JobRef`, and we only create
         // a single `JobRef` for each stack job.
         unsafe { JobRef::new_raw(job_pointer, Self::execute) }
     }
@@ -312,7 +312,7 @@ where
     ///
     /// # Safety
     ///
-    /// The caller must ensure that `this` is a pointer was created by calling
+    /// The caller must ensure that `this` is a pointer, created by calling
     /// `Box::into_raw` on a `Box<HeapJob>`. After the call `this` must be
     /// treated as dangling.
     unsafe fn execute(this: NonNull<()>, worker: &Worker) {

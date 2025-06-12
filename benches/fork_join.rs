@@ -41,7 +41,7 @@ fn nodes() -> impl Iterator<Item = (usize, usize)> {
 }
 
 // -----------------------------------------------------------------------------
-// Benchamrk
+// Benchmark
 
 #[divan::bench(args = nodes())]
 fn baseline(bencher: Bencher, nodes: (usize, usize)) {

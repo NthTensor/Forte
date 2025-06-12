@@ -202,7 +202,7 @@ struct Tenant {
     last_heartbeat: Instant,
 }
 
-/// Manages thread spawned by the pool.
+/// Manages threads spawned by the pool.
 struct ManagedThreads {
     /// Stores thread controls for workers spawned by the pool.
     workers: Vec<ManagedWorker>,
@@ -210,8 +210,8 @@ struct ManagedThreads {
     heartbeat: Option<ThreadControl>,
 }
 
-/// Represents a worker thread that is managed by the pool, as opposed to an
-/// external threads which temporarally participate in the pool.
+/// Represents a worker thread that is managed by the pool, as opposed to
+/// external threads which temporarily participate in the pool.
 struct ManagedWorker {
     /// The index of this worker in the public worker info list.
     index: usize,
@@ -297,7 +297,7 @@ impl ThreadPool {
         self.resize(|current_size| current_size + added_threads)
     }
 
-    /// Removes the given number of thread from the thread pool. Returns the new
+    /// Removes the given number of threads from the thread pool. Returns the new
     /// size of the pool.
     ///
     /// See [`ThreadPool::resize_to`] for more information about resizing.
@@ -429,7 +429,7 @@ impl ThreadPool {
                     let _ = control.handle.join();
                 }
 
-                // Pull the workers we intend to hault out of the thread manager.
+                // Pull the workers we intend to halt out of the thread manager.
                 let terminating_workers = state.managed_threads.workers.split_off(new_size);
 
                 // Terminate the workers.
@@ -470,7 +470,7 @@ impl ThreadPool {
     /// Tries to ensure the calling thread is a member of the thread pool, and
     /// then executes the provided closure. If the thread is already a member of
     /// the pool, the closure is called directly. Otherwise, the thread will
-    /// attempt to temporarally register itself with the pool (which can be
+    /// attempt to temporarily register itself with the pool (which can be
     /// slightly slower). If registration fails (because the pool is full to
     /// capacity) the closure is passed `None` instead of a worker instance.
     ///
@@ -528,7 +528,7 @@ impl ThreadPool {
         // This function "schedules" work on the future, which in this case
         // pushing a `JobRef` that knows how to run it onto the local work queue.
         let schedule = move |runnable: Runnable| {
-            // Temporarally turn the task into a raw pointer so that it can be
+            // Temporarily turn the task into a raw pointer so that it can be
             // used as a job. We could also use `HeapJob` here, but since
             // `Runnable` is heap allocated this would result in a needless
             // second allocation.
@@ -644,7 +644,7 @@ thread_local! {
 }
 
 /// Holds the local context for a thread pool member, which allows queuing,
-/// executing and sharing jobs on the pool.
+/// executing, and sharing jobs on the pool.
 ///
 /// Workers are the recommended way to interface with a thread pool. To get
 /// access to worker for a given thread pool, users should call
@@ -662,7 +662,7 @@ thread_local! {
 /// Every worker belongs to exactly one thread pool, and must hold a "lease" on
 /// one of the shared slots within that pool.
 ///
-/// Workers have one core memory-safety grantee: Any jobs added to the worker
+/// Workers have one core memory-safety guarantee: Any jobs added to the worker
 /// will eventually be executed.
 pub struct Worker {
     pub(crate) lease: Lease,
@@ -689,12 +689,12 @@ impl Worker {
         if !worker_ptr.is_null() {
             // SAFETY: The `WORKER` static is only set by `occupy`, and it's
             // always set to a stack-allocated `Worker` which is never moved and
-            // is only accseed through shared references. Therefore, if the
+            // is only accessed through shared references. Therefore, if the
             // pointer is non-null, it must be safe to dereference.
             //
             // This creates a reference with an unbounded lifetime. To avoid
             // turning it into a `'static`, we pass it in to a closure. This
-            // restricts it's lifetime to the closure body, and prevents callers
+            // restricts its lifetime to the closure body, and prevents callers
             // from keeping around references to Workers that will be
             // deallocated when `occupy` returns.
             Some(f(unsafe { &*worker_ptr }))
@@ -716,7 +716,7 @@ impl Worker {
         if !worker_ptr.is_null() {
             // SAFETY: The `WORKER` static is only set by `occupy`, and it's
             // always set to a stack-allocated `Worker` which is never moved and
-            // is only accseed through shared references. Therefore, if the
+            // is only accessed through shared references. Therefore, if the
             // pointer is non-null, it must be safe to dereference.
             //
             // This creates a reference with an unbounded lifetime. To avoid
@@ -730,7 +730,7 @@ impl Worker {
         }
     }
 
-    /// Temporarally sets the thread's worker. [`Worker::with_current`] always
+    /// Temporarily sets the thread's worker. [`Worker::with_current`] always
     /// returns a reference to the worker set up by the most recent call to this
     /// worker.
     ///
@@ -806,12 +806,12 @@ impl Worker {
         T: Send,
     {
         loop {
-            // Shot-circuit if the signal has already been sent.
+            // Short-circuit if the signal has already been sent.
             //
             // Panics if a value has already been received over this signal.
             //
             // SAFETY: The `try_recv` and `recv` functions are only called in
-            // this functionm, and are therefore only called on the current thread.
+            // this function, and are therefore only called on the current thread.
             if let Some(value) = unsafe { signal.try_recv() } {
                 return value;
             }
@@ -820,7 +820,7 @@ impl Worker {
                 // If we run out of jobs, just sleep until the signal is received.
                 //
                 // SAFETY: The `try_recv` and `recv` functions are only called in
-                // this functionm, and are therefore only called on the current thread.
+                // this function, and are therefore only called on the current thread.
                 return unsafe { signal.recv() };
             }
         }
@@ -905,7 +905,7 @@ impl Worker {
 
         // Turn the job into an "owning" `JobRef` so it can be queued.
         //
-        // SAFETY: All jobs added to the queue are garneteed to be executed
+        // SAFETY: All jobs added to the queue are guaranteed to be executed
         // eventually, this is one of the core invariants of the thread pool.
         // The closure `f` has a static lifetime, meaning it only closes over
         // data that lasts for the duration of the program, so it's not possible
@@ -966,7 +966,7 @@ impl Worker {
 
     /// Polls a future to completion, then returns the outcome. This function
     /// will prioritize polling the future as soon as it becomes available, and
-    /// while the future is not available it will try to do other meaningfully
+    /// while the future is not available it will try to do other meaningful
     /// work.
     ///
     /// If you do not have access to a [`Worker`], you may call
@@ -1026,9 +1026,9 @@ impl Worker {
 
         // SAFETY: The `StackJob` is allocated on the stack just above, is never
         // moved, and so will live for the entirety of this function in the same
-        // memory location. It closure `a` closes over data, that must be valid
+        // memory location. If closure `a` closes over data, that must be valid
         // for the lifetime of this function as well. The `JobRef` cannot
-        // outlive either, because it is garneteed to be executed before the
+        // outlive either, because it is guaranteed to be executed before the
         // function returns. We also clearly never create more than one `JobRef`
         // using the `stack_job`.
         let job_ref = unsafe { stack_job.as_job_ref() };
@@ -1082,7 +1082,7 @@ impl Worker {
     /// spawn additional tasks into the scope. When the closure returns, it will
     /// block until all tasks that have been spawned into onto the scope complete.
     ///
-    /// It is also possible to crtate a new scope from a worker using
+    /// It is also possible to create a new scope from a worker using
     /// [`Scope::new`], but it must be pinned before it can be used. This
     /// function mostly just does the pinning for you.
     ///
@@ -1255,7 +1255,7 @@ fn managed_worker(lease: Lease, halt: Arc<AtomicBool>, #[cfg(not(loom))] barrier
 /// jobs to shared jobs (which allows other works to claim them) and to reduce
 /// lock contention.
 ///
-/// This is never run on loom,
+/// This is never run on loom.
 #[cfg(not(loom))]
 fn heartbeat_loop(thread_pool: &'static ThreadPool, halt: Arc<AtomicBool>) {
     use std::thread;

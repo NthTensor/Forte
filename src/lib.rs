@@ -2,7 +2,7 @@
 //!
 //! Forte is a parallel & async work scheduler designed to accommodate very large
 //! workloads with many short-lived tasks. It replicates the `rayon_core` api
-//! but with native support for futures and async tasks. It's design was
+//! but with native support for futures and async tasks. Its design was
 //! prompted by the needs of the bevy game engine, but should be applicable to
 //! any problem that involves running both synchronous and asynchronous work
 //! concurrently.

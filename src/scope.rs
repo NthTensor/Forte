@@ -1,4 +1,4 @@
-//! This module defines an utility for spawning non-static jobs. For more
+//! This module defines a utility for spawning non-static jobs. For more
 //! information see [`crate::scope`] or the [`Scope`] type.
 
 use alloc::boxed::Box;
@@ -44,7 +44,7 @@ impl<'scope> Scope<'scope> {
     /// Creates a new scope owned by the given worker thread. For a safe
     /// equivalent, use [`ThreadPool::scope`].
     ///
-    /// Two important lifetimes effect scope: the external lifetime of the scope
+    /// Two important lifetimes affect scope: the external lifetime of the scope
     /// object itself (which we will call `'ext`) and the internal lifetime
     /// `'scope`.
     ///
@@ -95,7 +95,7 @@ impl<'scope> Scope<'scope> {
             scope_ptr.run(f);
         });
 
-        // SAFETY: We must ensure that the heap job does not outlive the data is
+        // SAFETY: We must ensure that the heap job does not outlive the data it
         // closes over. In effect, this means it must not outlive `'scope`.
         //
         // The `'scope` will last until the scope is deallocated, which (due to
@@ -188,7 +188,7 @@ impl<'scope> Scope<'scope> {
             });
         };
 
-        // SAFETY: We must ensure that the runnable does not outlive the data is
+        // SAFETY: We must ensure that the runnable does not outlive the data it
         // closes over. In effect, this means it must not outlive `'scope`.
         //
         // The `'scope` will last until the scope is deallocated, which (due to
@@ -284,7 +284,7 @@ mod scope_ptr {
             // + It was created from an immutable reference, and we never change
             //   it so it must be non-null and dereferenceable.
             //
-            // + We incremented the scopes reference counter and will not
+            // + We incremented the scope's reference counter and will not
             //   decrement it until this pointer is dropped. Since the scope
             //   will remain valid as long as the reference counter is above
             //   zero, we know it is valid.
@@ -310,7 +310,7 @@ mod scope_ptr {
             // + It was created from an immutable reference, and we never change
             //   it so it must be non-null and dereferenceable.
             //
-            // + We incremented the scopes reference counter and we have not yet
+            // + We incremented the scope's reference counter and we have not yet
             //   decremented it (although we are about to). Since the scope will
             //   remain valid as long as the reference counter is above zero, we
             //   know it is valid.
