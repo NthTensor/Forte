@@ -22,7 +22,7 @@ pub const SENT: u32 = 0b10;
 // -----------------------------------------------------------------------------
 // Signal
 
-/// A single transmits a single value across threads, exactly once. Signals are
+/// A signal transmits a single value across threads, exactly once. Signals are
 /// Forte's core synchronization primitive. They take the place of rayon's
 /// latches or chili's oneshot channels.
 ///
@@ -136,21 +136,21 @@ impl<T: Send> Signal<T> {
     ///
     /// This function operates on `*const Self` instead of `&self` to allow it
     /// to become dangling during this call. The caller must ensure that the
-    /// pointer convertible to an immutable reference upon entry, and not
+    /// pointer is convertible to an immutable reference upon entry, and not
     /// invalidated during the call by any actions other than `send` itself.
     #[inline(always)]
     pub unsafe fn send(signal: *const Self, value: T) {
         // Use the unsafe cell to get mutable access to the value.
         //
         // SAFETY: The caller ensures that this pointer is convertible to a
-        // reference, and we have not yet done anything that would case another
+        // reference, and we have not yet done anything that would cause another
         // thread to invalidate it.
         let value_ptr = unsafe { (*signal).value.get_mut() };
 
         // Load the current state of the signal.
         //
         // SAFETY: The caller ensures that this pointer is convertible to a
-        // reference, and we have not yet done anything that would case another
+        // reference, and we have not yet done anything that would cause another
         // thread to invalidate it.
         let state = unsafe { (*signal).state.load(Ordering::Relaxed) };
 
@@ -172,7 +172,7 @@ impl<T: Send> Signal<T> {
         // pointer to become dangling.
         //
         // SAFETY: The caller ensures that this pointer is convertible to a
-        // reference, and we have not yet done anything that would case another
+        // reference, and we have not yet done anything that would cause another
         // thread to invalidate it.
         let state = unsafe { (*signal).state.fetch_or(SENT, Ordering::Release) };
         if state & WAIT != 0 {
@@ -182,7 +182,7 @@ impl<T: Send> Signal<T> {
             // reference. It's not possible for it to have been invalidated
             // because when in the WAIT state, the receiver thread must either
             // be asleep or about to sleep, so setting the SENT bit cannot have
-            // caused the signal to be dealocated.
+            // caused the signal to be deallocated.
             atomic_wait::wake_one(unsafe { &(*signal).state });
         }
     }
@@ -196,5 +196,5 @@ impl<T: Send> Default for Signal<T> {
 
 // SAFETY: References to signals have to be sent between threads for them to
 // work, so they must be `Sync`. And signals themselves transmit values between
-// threads, so the type `T` must be `Send.
+// threads, so the type `T` must be `Send`.
 unsafe impl<T: Send> Sync for Signal<T> {}

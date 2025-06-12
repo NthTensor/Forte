@@ -3,7 +3,7 @@
 An async-compatible thread-pool aiming for "speed through simplicity".
 
 Forte is a parallel & async work scheduler designed to accommodate very large workloads with many short-lived tasks. It replicates the `rayon_core` api but with native support for futures and async tasks. 
-It's design was prompted by the needs of the bevy game engine, but should be applicable to any problem that involves running both synchronous and asynchronous work concurrently.
+Its design was prompted by the needs of the bevy game engine, but should be applicable to any problem that involves running both synchronous and asynchronous work concurrently.
 
 The thread-pool provided by this crate does not employ work-stealing. 
 Forte instead uses "Heartbeat Scheduling", an alternative load-balancing technique that (theoretically) provides provably small overheads and good utilization.
