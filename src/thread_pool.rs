@@ -1189,7 +1189,7 @@ where
 ///
 /// If there is no current thread pool, this panics.
 ///
-/// See also: [`Worker::scope`] and [`Threadpool::scope`].
+/// See also: [`Worker::scope`] and [`ThreadPool::scope`].
 pub fn scope<'scope, F, T>(f: F) -> T
 where
     F: FnOnce(Pin<&Scope<'scope>>) -> T + Send,
