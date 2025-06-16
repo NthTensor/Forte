@@ -1,10 +1,9 @@
 use argh::FromArgs;
 
-use crate::commands::ClippyCommand;
-use crate::commands::FormatCommand;
-use crate::Flag;
-use crate::Prepare;
-use crate::PreparedCommand;
+use crate::{
+    Flag, Prepare, PreparedCommand,
+    commands::{ClippyCommand, FormatCommand},
+};
 
 /// Alias for running the `format` and `clippy` subcommands.
 #[derive(FromArgs, Default)]

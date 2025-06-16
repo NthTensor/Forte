@@ -18,20 +18,16 @@ use core::task::Poll;
 use core::time::Duration;
 use std::time::Instant;
 
-use async_task::Runnable;
-use async_task::Task;
-use tracing::debug;
-use tracing::trace;
-use tracing::trace_span;
+use async_task::{Runnable, Task};
+use tracing::{debug, trace, trace_span};
 
-use crate::blocker::Blocker;
-use crate::job::HeapJob;
-use crate::job::JobQueue;
-use crate::job::JobRef;
-use crate::job::StackJob;
-use crate::platform::*;
-use crate::scope::Scope;
-use crate::signal::Signal;
+use crate::{
+    blocker::Blocker,
+    job::{HeapJob, JobQueue, JobRef, StackJob},
+    platform::*,
+    scope::Scope,
+    signal::Signal,
+};
 
 // -----------------------------------------------------------------------------
 // Thread pool worker leases
@@ -119,7 +115,6 @@ pub const HEARTBEAT_INTERVAL: Duration = Duration::from_micros(500);
 /// [`ThreadPool::resize_to_available`] which will simply fill all the available
 /// space. More granular control is possible through other methods such as
 /// [`ThreadPool::grow`], [`ThreadPool::shrink`], or [`ThreadPool::resize_to`].
-///
 pub struct ThreadPool {
     state: Mutex<ThreadPoolState>,
     job_is_ready: Condvar,
@@ -1242,8 +1237,7 @@ fn managed_worker(lease: Lease, halt: Arc<AtomicBool>, barrier: Arc<Barrier>) {
 /// This is never runs when testing in shuttle.
 #[cfg(not(feature = "shuttle"))]
 fn heartbeat_loop(thread_pool: &'static ThreadPool, halt: Arc<AtomicBool>) {
-    use std::thread;
-    use std::time::Instant;
+    use std::{thread, time::Instant};
 
     trace!("starting managed heartbeat thread");
 

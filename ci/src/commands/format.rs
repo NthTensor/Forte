@@ -1,9 +1,7 @@
 use argh::FromArgs;
 use xshell::cmd;
 
-use crate::Flag;
-use crate::Prepare;
-use crate::PreparedCommand;
+use crate::{Flag, Prepare, PreparedCommand};
 
 /// Check code formatting.
 #[derive(FromArgs, Default)]
@@ -13,8 +11,8 @@ pub struct FormatCommand {}
 impl Prepare for FormatCommand {
     fn prepare<'a>(&self, sh: &'a xshell::Shell, _flags: Flag) -> Vec<PreparedCommand<'a>> {
         vec![PreparedCommand::new::<Self>(
-            cmd!(sh, "cargo +nightly fmt --all -- --check"),
-            "Please run 'cargo +nightly fmt --all' to format your code.",
+            cmd!(sh, "cargo fmt --all -- --check"),
+            "Please run 'cargo fmt --all' to format your code.",
         )]
     }
 }

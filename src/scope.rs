@@ -2,20 +2,21 @@
 //! information see [`crate::scope()`] or the [`Scope`] type.
 
 use alloc::boxed::Box;
-use core::future::Future;
-use core::marker::PhantomData;
-use core::marker::PhantomPinned;
-use core::pin::Pin;
+use core::{
+    future::Future,
+    marker::{PhantomData, PhantomPinned},
+    pin::Pin,
+};
 
-use async_task::Runnable;
-use async_task::Task;
+use async_task::{Runnable, Task};
 use scope_ptr::ScopePtr;
 
-use crate::job::HeapJob;
-use crate::job::JobRef;
-use crate::platform::*;
-use crate::signal::Signal;
-use crate::thread_pool::Worker;
+use crate::{
+    job::{HeapJob, JobRef},
+    platform::*,
+    signal::Signal,
+    thread_pool::Worker,
+};
 
 // -----------------------------------------------------------------------------
 // Scope

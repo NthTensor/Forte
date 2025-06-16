@@ -1,11 +1,11 @@
 use argh::FromArgs;
 
-use crate::commands::ShuttleCheckCommand;
-use crate::commands::ShuttleClippyCommand;
-use crate::commands::ShuttleTestCommand;
 use crate::Flag;
 use crate::Prepare;
 use crate::PreparedCommand;
+use crate::commands::ShuttleCheckCommand;
+use crate::commands::ShuttleClippyCommand;
+use crate::commands::ShuttleTestCommand;
 
 /// Alias for running the `loom-check`, `loom-clippy` and `loom-test` subcommands.
 #[derive(FromArgs, Default)]
