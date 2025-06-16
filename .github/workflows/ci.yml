@@ -25,6 +25,7 @@ jobs:
         run: cargo run -p ci -- compile
         env:
           RUSTFLAGS: ${{ env.RUSTFLAGS }} -D warnings
+
   lints:
     runs-on: ubuntu-latest
     timeout-minutes: 30
