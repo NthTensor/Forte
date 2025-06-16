@@ -4,6 +4,12 @@ on:
   merge_group:
   pull_request:
 
+env:
+  # Only include the debug info necessary for backtraces (file names and line numbers). Any extra
+  # debug info provided by `debuginfo=1` or `debuginfo=2` require an interactive debugger like
+  # `lldb` or `gdb`.
+  RUSTFLAGS: -C debuginfo=line-tables-only
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -18,7 +24,7 @@ jobs:
       - name: Build & run tests
         run: cargo run -p ci -- compile
         env:
-          RUSTFLAGS: "-C debuginfo=0 -D warnings"
+          RUSTFLAGS: ${{ env.RUSTFLAGS }} -D warnings
   lints:
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -46,8 +52,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Build and check doc
         run: cargo run -p ci -- doc
-        env:
-          RUSTFLAGS: "-C debuginfo=0"
 
   typos:
     runs-on: ubuntu-latest
