@@ -7,14 +7,12 @@
 use core::hint::black_box;
 
 use async_task::Task;
-use forte::latch::Latch;
-use forte::prelude::*;
-use loom::model::Builder;
-use loom::sync::atomic::AtomicBool;
-use loom::sync::atomic::AtomicUsize;
-use loom::sync::atomic::Ordering;
-use tracing::Level;
-use tracing::info;
+use forte::{latch::Latch, prelude::*};
+use loom::{
+    model::Builder,
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+};
+use tracing::{Level, info};
 use tracing_subscriber::fmt::Subscriber;
 
 // -----------------------------------------------------------------------------

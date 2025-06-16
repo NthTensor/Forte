@@ -1,9 +1,7 @@
 use argh::FromArgs;
 use xshell::cmd;
 
-use crate::Flag;
-use crate::Prepare;
-use crate::PreparedCommand;
+use crate::{Flag, Prepare, PreparedCommand};
 
 /// Check code formatting.
 #[derive(FromArgs, Default)]

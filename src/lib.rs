@@ -42,14 +42,9 @@ mod thread_pool;
 // -----------------------------------------------------------------------------
 // Top-level exports
 
-pub use thread_pool::ThreadPool;
-pub use thread_pool::Worker;
-pub use thread_pool::block_on;
-pub use thread_pool::join;
-pub use thread_pool::scope;
-pub use thread_pool::spawn;
-pub use thread_pool::spawn_async;
-pub use thread_pool::spawn_future;
+pub use thread_pool::{
+    ThreadPool, Worker, block_on, join, scope, spawn, spawn_async, spawn_future,
+};
 
 // -----------------------------------------------------------------------------
 // Platform Support
@@ -67,19 +62,16 @@ mod platform {
 
     // Core exports
 
-    pub use alloc::sync::Arc;
-    pub use alloc::sync::Weak;
-    pub use core::cell::Cell;
-    pub use core::sync::atomic::AtomicBool;
-    pub use core::sync::atomic::AtomicU32;
-    pub use core::sync::atomic::Ordering;
-    pub use std::sync::Barrier;
-    pub use std::sync::Condvar;
-    pub use std::sync::Mutex;
-    pub use std::thread::Builder as ThreadBuilder;
-    pub use std::thread::JoinHandle;
-    pub use std::thread::available_parallelism;
-    pub use std::thread_local;
+    pub use alloc::sync::{Arc, Weak};
+    pub use core::{
+        cell::Cell,
+        sync::atomic::{AtomicBool, AtomicU32, Ordering},
+    };
+    pub use std::{
+        sync::{Barrier, Condvar, Mutex},
+        thread::{Builder as ThreadBuilder, JoinHandle, available_parallelism},
+        thread_local,
+    };
 
     // Unsafe Cell
 
@@ -135,18 +127,15 @@ mod platform {
 
     use core::ops::Deref;
 
-    pub use loom::cell::Cell;
-    pub use loom::cell::UnsafeCell;
-    pub use loom::sync::Arc;
-    pub use loom::sync::Condvar;
-    pub use loom::sync::Mutex;
-    pub use loom::sync::atomic::AtomicBool;
-    pub use loom::sync::atomic::AtomicU32;
-    pub use loom::sync::atomic::Ordering;
-    pub use loom::sync::atomic::fence;
-    pub use loom::thread::Builder as ThreadBuilder;
-    pub use loom::thread::JoinHandle;
-    pub use loom::thread_local;
+    pub use loom::{
+        cell::{Cell, UnsafeCell},
+        sync::{
+            Arc, Condvar, Mutex,
+            atomic::{AtomicBool, AtomicU32, Ordering, fence},
+        },
+        thread::{Builder as ThreadBuilder, JoinHandle},
+        thread_local,
+    };
 
     // Queue
 

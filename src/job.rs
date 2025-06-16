@@ -11,14 +11,10 @@
 //! (b) The job remains valid until it is executed for the last time.
 //! (c) Each job reference is executed exactly once.
 
-use alloc::boxed::Box;
-use alloc::collections::VecDeque;
-use core::mem::ManuallyDrop;
-use core::ptr::NonNull;
+use alloc::{boxed::Box, collections::VecDeque};
+use core::{mem::ManuallyDrop, ptr::NonNull};
 
-use crate::platform::*;
-use crate::signal::Signal;
-use crate::thread_pool::Worker;
+use crate::{platform::*, signal::Signal, thread_pool::Worker};
 
 // -----------------------------------------------------------------------------
 // Runnable
