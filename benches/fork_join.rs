@@ -95,7 +95,7 @@ fn forte(bencher: Bencher, nodes: (usize, usize)) {
 
     let tree = Node::tree(nodes.0);
 
-    COMPUTE.as_worker(|worker| {
+    COMPUTE.with_worker(|worker| {
         info!("Staring Benchmark");
         bencher.bench_local(move || {
             assert_eq!(sum(&tree, worker), nodes.1 as u64);

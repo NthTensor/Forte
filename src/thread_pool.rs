@@ -71,7 +71,7 @@ pub const HEARTBEAT_INTERVAL: Duration = Duration::from_micros(500);
 ///     THREAD_POOL.resize_to_available();
 ///
 ///     // Register this thread as a worker on the pool.
-///     THREAD_POOL.as_worker(|worker| {
+///     THREAD_POOL.with_worker(|worker| {
 ///         // Spawn a job onto the pool. The closure also accepts a worker, because the
 ///         // job may be executed on a different thread. This will be the worker for whatever
 ///         // thread it executes on.
@@ -467,23 +467,23 @@ impl ThreadPool {
     ///
     /// The provided closure is never sent to another thread.
     #[inline(always)]
-    pub fn as_worker<F, R>(&'static self, f: F) -> R
+    pub fn with_worker<F, R>(&'static self, f: F) -> R
     where
         F: FnOnce(&Worker) -> R,
     {
         Worker::with_current(|worker| match worker {
             Some(worker) if worker.lease.thread_pool.id() == self.id() => f(worker),
-            _ => self.as_worker_cold(f),
+            _ => self.with_worker_cold(f),
         })
     }
 
     /// Tries to register the calling thread on the thread pool, and pass a
     /// worker instance to the provided closure.
     ///
-    /// This is the slow fallback for `as_worker` covering "external calls"
+    /// This is the slow fallback for `with_worker` covering "external calls"
     /// from outside the pool. Never call this directly.
     #[cold]
-    fn as_worker_cold<F, R>(&'static self, f: F) -> R
+    fn with_worker_cold<F, R>(&'static self, f: F) -> R
     where
         F: FnOnce(&Worker) -> R,
     {
@@ -504,7 +504,7 @@ impl ThreadPool {
     where
         F: FnOnce(&Worker) + Send + 'static,
     {
-        self.as_worker(|worker| worker.spawn(f));
+        self.with_worker(|worker| worker.spawn(f));
     }
 
     /// Spawns a future onto the thread pool.
@@ -540,7 +540,7 @@ impl ThreadPool {
             let job_ref = unsafe { JobRef::new_raw(job_pointer, execute_runnable) };
 
             // Send this job off to be executed.
-            self.as_worker(|worker| {
+            self.with_worker(|worker| {
                 worker.queue.push_back(job_ref);
             });
         };
@@ -589,7 +589,7 @@ impl ThreadPool {
         F: Future<Output = T> + Send,
         T: Send,
     {
-        self.as_worker(|worker| worker.block_on(future))
+        self.with_worker(|worker| worker.block_on(future))
     }
 
     /// Executes the two closures, possibly in parallel, and returns the
@@ -604,7 +604,7 @@ impl ThreadPool {
         RA: Send,
         RB: Send,
     {
-        self.as_worker(|worker| worker.join(a, b))
+        self.with_worker(|worker| worker.join(a, b))
     }
 
     /// Create a scope for spawning non-static work.
@@ -616,7 +616,7 @@ impl ThreadPool {
         F: FnOnce(Pin<&Scope<'scope>>) -> T + Send,
         T: Send,
     {
-        self.as_worker(|worker| worker.scope(f))
+        self.with_worker(|worker| worker.scope(f))
     }
 }
 
@@ -632,9 +632,7 @@ thread_local! {
 ///
 /// Workers are the recommended way to interface with a thread pool. To get
 /// access to worker for a given thread pool, users should call
-/// [`ThreadPool::as_worker`] (which keeps work in the same thread, but
-/// sometimes may fail to acquire a worker) or [`ThreadPool::as_worker`] (which
-/// may send work to other threads, but will always acquire a worker).
+/// [`ThreadPool::with_worker`].
 ///
 /// Every thread has at most one worker at a time. If a worker has already been
 /// set up, it may be accessed at any time by calling [`Worker::with_current`].
@@ -1319,7 +1317,7 @@ mod tests {
         THREAD_POOL.populate();
 
         let mut vals = [0; 1_024];
-        THREAD_POOL.as_worker(|worker| increment(worker, &mut vals));
+        THREAD_POOL.with_worker(|worker| increment(worker, &mut vals));
         assert_eq!(vals, [1; 1_024]);
 
         THREAD_POOL.depopulate();
@@ -1347,7 +1345,7 @@ mod tests {
         THREAD_POOL.populate();
 
         let mut vals = vec![0; 1_024 * 1_024];
-        THREAD_POOL.as_worker(|worker| increment(worker, &mut vals));
+        THREAD_POOL.with_worker(|worker| increment(worker, &mut vals));
         assert_eq!(vals, vec![1; 1_024 * 1_024]);
 
         THREAD_POOL.depopulate();

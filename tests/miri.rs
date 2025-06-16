@@ -41,7 +41,7 @@ fn fork_join() {
 
     let tree = Node::tree(layers);
 
-    COMPUTE.as_worker(|worker| {
+    COMPUTE.with_worker(|worker| {
         let worker = worker.unwrap();
         COMPUTE.resize_to_available();
         info!("Work beginning");
