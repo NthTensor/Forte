@@ -3,8 +3,11 @@
 use chili::Scope;
 use divan::Bencher;
 use forte::Worker;
-use tracing::{debug, info};
-use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt};
+use tracing::debug;
+use tracing::info;
+use tracing_subscriber::fmt;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 
 // -----------------------------------------------------------------------------
 // Workload

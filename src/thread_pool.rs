@@ -1,33 +1,36 @@
 //! This module contains the api and worker logic for the Forte thread pool.
 
-use alloc::{
-    collections::{BTreeMap, btree_map::Entry},
-    format,
-    string::ToString,
-    vec::Vec,
-};
-use core::{
-    cmp,
-    future::Future,
-    num::NonZero,
-    pin::{Pin, pin},
-    ptr,
-    ptr::NonNull,
-    task::{Context, Poll},
-    time::Duration,
-};
+use alloc::collections::BTreeMap;
+use alloc::collections::btree_map::Entry;
+use alloc::format;
+use alloc::string::ToString;
+use alloc::vec::Vec;
+use core::cmp;
+use core::future::Future;
+use core::num::NonZero;
+use core::pin::Pin;
+use core::pin::pin;
+use core::ptr;
+use core::ptr::NonNull;
+use core::task::Context;
+use core::task::Poll;
+use core::time::Duration;
 use std::time::Instant;
 
-use async_task::{Runnable, Task};
-use tracing::{debug, trace, trace_span};
+use async_task::Runnable;
+use async_task::Task;
+use tracing::debug;
+use tracing::trace;
+use tracing::trace_span;
 
-use crate::{
-    blocker::Blocker,
-    job::{HeapJob, JobQueue, JobRef, StackJob},
-    platform::*,
-    scope::Scope,
-    signal::Signal,
-};
+use crate::blocker::Blocker;
+use crate::job::HeapJob;
+use crate::job::JobQueue;
+use crate::job::JobRef;
+use crate::job::StackJob;
+use crate::platform::*;
+use crate::scope::Scope;
+use crate::signal::Signal;
 
 // -----------------------------------------------------------------------------
 // Thread pool worker leases
@@ -1253,7 +1256,8 @@ fn managed_worker(lease: Lease, halt: Arc<AtomicBool>, #[cfg(not(loom))] barrier
 /// This is never run on loom.
 #[cfg(not(loom))]
 fn heartbeat_loop(thread_pool: &'static ThreadPool, halt: Arc<AtomicBool>) {
-    use std::{thread, time::Instant};
+    use std::thread;
+    use std::time::Instant;
 
     trace!("starting managed heartbeat thread");
 

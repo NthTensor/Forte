@@ -1,9 +1,10 @@
 use argh::FromArgs;
 
-use crate::{
-    Flag, Prepare, PreparedCommand,
-    commands::{DocCheckCommand, DocTestCommand},
-};
+use crate::Flag;
+use crate::Prepare;
+use crate::PreparedCommand;
+use crate::commands::DocCheckCommand;
+use crate::commands::DocTestCommand;
 
 /// Alias for running the `doc-test` and `doc-check` subcommands.
 #[derive(FromArgs, Default)]
