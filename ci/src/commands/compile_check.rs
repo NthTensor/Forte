@@ -1,7 +1,9 @@
 use argh::FromArgs;
 use xshell::cmd;
 
-use crate::{Flag, Prepare, PreparedCommand};
+use crate::Flag;
+use crate::Prepare;
+use crate::PreparedCommand;
 
 /// Checks that the project compiles.
 #[derive(FromArgs, Default)]

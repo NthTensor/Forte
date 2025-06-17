@@ -1,6 +1,8 @@
 //! Async blocking utilities.
 
-use core::task::{RawWaker, RawWakerVTable, Waker};
+use core::task::RawWaker;
+use core::task::RawWakerVTable;
+use core::task::Waker;
 
 use crate::platform::*;
 

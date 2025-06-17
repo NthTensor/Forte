@@ -7,5 +7,5 @@ style_edition = "2024"
 
 # unstable_features = true
 # group_imports = "StdExternalCrate"
-# imports_granularity = "Crate"
+# imports_granularity = "Item"
 # normalize_comments = true
