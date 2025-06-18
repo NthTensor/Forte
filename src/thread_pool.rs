@@ -1313,8 +1313,8 @@ fn heartbeat_loop(thread_pool: &'static ThreadPool, halt: Arc<AtomicBool>) {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::AtomicU8;
-    use std::vec;
+    use alloc::vec;
+    use core::sync::atomic::AtomicU8;
 
     use super::*;
 
