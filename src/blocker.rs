@@ -25,7 +25,7 @@ const WAKE: u32 = 2;
 pub struct Blocker {
     /// The state of a blocker.
     state: AtomicU32,
-    // When using shuttle, futex is not avalible so we must fall back to a mutex and condvar
+    // When using shuttle, futex is not available so we must fall back to a mutex and condvar
     #[cfg(feature = "shuttle")]
     mutex: Mutex<()>,
     #[cfg(feature = "shuttle")]
