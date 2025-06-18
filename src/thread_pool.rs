@@ -1095,8 +1095,7 @@ impl Worker {
         T: Send,
     {
         let scope = pin!(Scope::new());
-        let scope = scope.into_ref();
-        f(scope)
+        f(scope.into_ref())
     }
 }
 

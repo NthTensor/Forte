@@ -35,7 +35,7 @@ pub struct Scope<'scope> {
     /// It's still safe to let the `Scope` implement `Sync` because the closures
     /// are only *moved* across threads to be executed.
     #[allow(clippy::type_complexity)]
-    marker: PhantomData<Box<dyn FnOnce(&Scope<'scope>) + Send + Sync + 'scope>>,
+    _marker: PhantomData<Box<dyn FnOnce(&Scope<'scope>) + Send + Sync + 'scope>>,
     /// Opt out of Unpin behavior; this type requires strong pinning guaranties.
     _phantom: PhantomPinned,
 }
@@ -44,26 +44,22 @@ impl<'scope> Scope<'scope> {
     /// Creates a new scope owned by the given worker thread. For a safe
     /// equivalent, use [`ThreadPool::scope`].
     ///
-    /// Two important lifetimes affect scope: the external lifetime of the scope
-    /// object itself (which we will call `'ext`) and the internal lifetime
-    /// `'scope`.
+    /// Every scope contains a lifetime `'scope`, which must outlive anything
+    /// spawned onto the scope.
     ///
     /// Before a scope can be used, it must be pinned. The recommended approach
     /// is to use the `pin!` macro to get a `Pin<&mut Scope<'scope>>` which you
     /// then convert into a `Pin<&Scope<'scope>>` via `into_ref`.
-    pub(crate) fn new() -> Scope<'scope> {
+    ///
+    /// When a scope is dropped, it will block the thread until all work
+    /// spawened on the scope is complete.
+    pub fn new() -> Scope<'scope> {
         Scope {
             count: AtomicU32::new(1),
             signal: Signal::new(),
-            marker: PhantomData,
+            _marker: PhantomData,
             _phantom: PhantomPinned,
         }
-    }
-
-    /// Consumes the scope and blocks until all jobs spawned on it are complete.
-    /// This is equivalent to dropping the scope.
-    pub fn complete(self) {
-        drop(self);
     }
 
     /// Spawns a job into the scope. This job will execute sometime before the
@@ -85,6 +81,11 @@ impl<'scope> Scope<'scope> {
     ///
     /// The [`ThreadPool::scope`] function has more extensive documentation about
     /// task spawning.
+    ///
+    /// # Panics
+    ///
+    /// Panics if not called from within a worker.
+    ///
     pub fn spawn<F>(self: Pin<&Self>, f: F)
     where
         F: FnOnce(Pin<&Scope<'scope>>) + Send + 'scope,
@@ -137,6 +138,10 @@ impl<'scope> Scope<'scope> {
     ///    infinite loop will prevent the scope from completing, and is not
     ///    recommended.
     ///
+    /// # Panics
+    ///
+    /// Panics if not called within a worker.
+    ///
     pub fn spawn_future<F, T>(self: Pin<&Self>, future: F) -> Task<T>
     where
         F: Future<Output = T> + Send + 'scope,
@@ -152,6 +157,11 @@ impl<'scope> Scope<'scope> {
     /// Internally the closure is wrapped into a future and passed along to
     /// [`Scope::spawn_future`]. See the docs on that function for more
     /// information.
+    ///
+    /// # Panics
+    ///
+    /// Panics if not called within a worker.
+    ///
     pub fn spawn_async<Fn, Fut, T>(self: Pin<&Self>, f: Fn) -> Task<T>
     where
         Fn: FnOnce(Pin<&Scope<'scope>>) -> Fut + Send + 'scope,
@@ -209,13 +219,23 @@ impl<'scope> Scope<'scope> {
     }
 
     /// Adds an additional reference to the scope's reference counter.
-    fn add_reference(&self) {
+    ///
+    /// Every call to this should have a matching call to
+    /// `Scope::remove_reference`, or the scope will block forever on
+    /// completion.
+    pub fn add_reference(&self) {
         let counter = self.count.fetch_add(1, Ordering::SeqCst);
         tracing::trace!("scope reference counter increased to {}", counter + 1);
     }
 
     /// Removes a reference from the scope's reference counter.
-    fn remove_reference(&self) {
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that there is exactly one a matching call to
+    /// `add_reference` for every call to this function, unless used within
+    /// `Scope::complete`.
+    pub unsafe fn remove_reference(&self) {
         let counter = self.count.fetch_sub(1, Ordering::SeqCst);
         tracing::trace!("scope reference counter decreased to {}", counter - 1);
         if counter == 1 {
@@ -232,12 +252,22 @@ impl<'scope> Scope<'scope> {
     }
 }
 
+impl<'scope> Default for Scope<'scope> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Drop for Scope<'_> {
     fn drop(&mut self) {
         // When the scope is dropped, block to prevent deallocation until the
         // reference counter allows the scope to complete.
         tracing::trace!("completing scope");
-        self.remove_reference();
+        // SAFETY: This is explicetly allowed, because every scope starts off
+        // with a counter of 1. This should be the only call to
+        // `remove_reference` without a coresponding call to `add_reference`, so
+        // the only one that can cause the reference counter to drop to zero.
+        unsafe { self.remove_reference() };
         Worker::with_current(|worker| {
             let worker = worker.unwrap();
             worker.wait_for_signal(&self.signal);
@@ -322,7 +352,9 @@ mod scope_ptr {
 
             // Decrement the reference counter, possibly allowing the scope to
             // complete.
-            scope_ref.remove_reference();
+            //
+            // SAFETY: We call `add_reference` in `ScopePtr::new`.
+            unsafe { scope_ref.remove_reference() };
         }
     }
 }
