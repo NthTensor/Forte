@@ -13,10 +13,10 @@
 
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
+use core::cell::UnsafeCell;
 use core::mem::ManuallyDrop;
 use core::ptr::NonNull;
 
-use crate::platform::*;
 use crate::signal::Signal;
 use crate::thread_pool::Worker;
 
@@ -115,32 +115,29 @@ impl JobQueue {
 
     #[inline(always)]
     pub fn push_back(&self, job_ref: JobRef) {
-        let job_refs = self.job_refs.get_mut();
-
         // SAFETY: The queue itself is only access mutably within `push_back`,
         // `pop_back` and `pop_front`. Since these functions never call each
         // other, we must have exclusive access to the queue.
-        unsafe { job_refs.deref().push_back(job_ref) };
+        let job_refs = unsafe { &mut *self.job_refs.get() };
+        job_refs.push_back(job_ref);
     }
 
     #[inline(always)]
     pub fn pop_back(&self) -> Option<JobRef> {
-        let job_refs = self.job_refs.get_mut();
-
         // SAFETY: The queue itself is only access mutably within `push_back`,
         // `pop_back` and `pop_front`. Since these functions never call each
         // other, we must have exclusive access to the queue.
-        unsafe { job_refs.deref().pop_back() }
+        let job_refs = unsafe { &mut *self.job_refs.get() };
+        job_refs.pop_back()
     }
 
     #[inline(always)]
     pub fn pop_front(&self) -> Option<JobRef> {
-        let job_refs = self.job_refs.get_mut();
-
         // SAFETY: The queue itself is only access mutably within `push_back`,
         // `pop_back` and `pop_front`. Since these functions never call each
         // other, we must have exclusive access to the queue.
-        unsafe { job_refs.deref().pop_front() }
+        let job_refs = unsafe { &mut *self.job_refs.get() };
+        job_refs.pop_front()
     }
 }
 
@@ -203,12 +200,10 @@ where
     ///
     /// This must not be called after `execute`.
     #[inline(always)]
-    pub unsafe fn unwrap(self) -> F {
-        let f_ptr = self.f.get_mut();
-        // SAFETY: This takes ownership, ensuring we have exclusive access that
-        // will not be used again, given that `execute` has not already been
-        // called.
-        unsafe { ManuallyDrop::take(f_ptr.deref()) }
+    pub unsafe fn unwrap(mut self) -> F {
+        // SAFETY: This will not be used again. Given that `execute` has not
+        // already been, it will never be used twice.
+        unsafe { ManuallyDrop::take(self.f.get_mut()) }
     }
 
     /// Returns a reference to the signal embedded in this stack job. The
@@ -240,13 +235,13 @@ where
         // SAFETY: The caller ensures `this` can be converted into an immutable
         // reference.
         let this = unsafe { this.cast::<Self>().as_ref() };
-        // Access the function pointer mutably via the unsafe cell.
-        let f_ptr = this.f.get_mut();
         // SAFETY: This memory location is accessed only in this function and in
         // `unwrap`. The latter cannot have been called, because it drops the
         // stack job, so, since this function is called only once, we can
-        // guarantee that we have exclusive access which will never be used again.
-        let f = unsafe { ManuallyDrop::take(f_ptr.deref()) };
+        // guarantee that we have exclusive access.
+        let f_ref = unsafe { &mut *this.f.get() };
+        // SAFETY: The caller ensures this function is called only once.
+        let f = unsafe { ManuallyDrop::take(f_ref) };
         // Run the job.
         let result = f(worker);
         // SAFETY: This is valid for the access used by `send` because

@@ -1,3 +1,3 @@
 //! General integration tests
 
-#![cfg(not(loom))]
+#![cfg(not(feature = "shuttle"))]

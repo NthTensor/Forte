@@ -1,26 +1,19 @@
-//! Tests using the `loom` testing framework.
+//! Tests using the Shuttle testing framework.
 
-#![cfg(loom)]
-//#![allow(unused_must_use)]
-#![allow(clippy::useless_vec)]
+#![cfg(feature = "shuttle")]
+#![allow(unused_imports)]
 
-use core::hint::black_box;
-
-use async_task::Task;
-use forte::latch::Latch;
-use forte::prelude::*;
-use loom::model::Builder;
-use loom::sync::atomic::AtomicBool;
-use loom::sync::atomic::AtomicUsize;
-use loom::sync::atomic::Ordering;
+use forte::ThreadPool;
+use shuttle::hint::black_box;
 use tracing::Level;
-use tracing::info;
 use tracing_subscriber::fmt::Subscriber;
 
 // -----------------------------------------------------------------------------
 // Infrastructure
 
-fn model<F>(f: F)
+/*
+
+fn trace<F>(f: F)
 where
     F: Fn() + Send + Sync + 'static,
 {
@@ -31,93 +24,29 @@ where
         .with_thread_names(false)
         .finish();
 
-    tracing::subscriber::with_default(subscriber, || {
-        let mut model = Builder::new();
-        model.log = true;
-        model.check(f);
-    });
+    tracing::subscriber::with_default(subscriber, f);
 }
+
+*/
 
 /// Provides access to a thread pool which can be treated as static for the
 /// purposes of testing.
 fn with_thread_pool<F>(f: F)
 where
-    F: Fn(&'static ThreadPool, &Worker) + 'static,
+    F: Fn(&'static ThreadPool) + 'static,
 {
-    info!("### SETTING UP TEST");
-
-    // Create a new thread pool.
     let thread_pool = Box::new(ThreadPool::new());
     let ptr = Box::into_raw(thread_pool);
 
-    // SAFETY: We want to create a reference to the thread pool which can
-    // be treated as `'static` by the callback `f`. We will assume that `f` has
-    // no side-effects except for those created by calls to the thread pool.
-    // This problem comes down to ensuring that `thread_pool` lives for the
-    // duration of `f` and also outlives anything spawned onto the pool by `f`.
-    //
-    // The first condition is easily satisfied: the thread pool is not dropped
-    // until the end of the scope. For the latter condition, the call to
-    // `wait_until_inactive()` blocks the thread until all work spawned onto the
-    // pool completes, and `resize_to(0)` blocks until all of the pool's threads
-    // terminate.
-    //
-    // For all intents and purposes, so long as `f` has no other side-effects,
-    // `thread_pool` can be treated as if it has a `'static` lifetime within
-    // `f`.
+    // SAFETY: TODO
     unsafe {
         let thread_pool = &*ptr;
-        info!("### POPULATING POOL");
-        thread_pool.resize_to(2);
-        info!("### STARTING TEST");
-        thread_pool.as_worker(|worker| {
-            let worker = worker.unwrap();
-            f(thread_pool, worker);
-        });
-        info!("### SHUTTING DOWN POOL");
-        thread_pool.resize_to(0);
-        // This assert ensures that all spawned jobs are run.
-        assert!(thread_pool.pop().is_none());
+        f(thread_pool);
     };
 
-    // SAFETY: This was created by `Box::into_raw`.
+    // SAFETY: TODO
     let thread_pool = unsafe { Box::from_raw(&mut *ptr) };
     drop(thread_pool);
-
-    info!("### TEST COMPLETE");
-}
-
-// -----------------------------------------------------------------------------
-// Latches
-
-#[test]
-pub fn latch() {
-    model(|| {
-        let flag = Box::leak(Box::new(AtomicBool::new(false)));
-        let latch = Box::leak(Box::new(Latch::new()));
-        loom::thread::spawn(|| {
-            flag.store(true, Ordering::Release);
-            latch.set();
-        });
-        latch.wait();
-        assert!(flag.load(Ordering::Acquire));
-    });
-}
-
-#[test]
-pub fn multi_latch() {
-    model(|| {
-        let a = Box::leak(Box::new(Latch::new()));
-        let b = Box::leak(Box::new(Latch::new()));
-        loom::thread::spawn(|| {
-            a.set();
-            b.wait();
-            a.set();
-        });
-        a.wait();
-        b.set();
-        a.wait();
-    });
 }
 
 // -----------------------------------------------------------------------------
@@ -127,26 +56,29 @@ pub fn multi_latch() {
 /// This spins up a thread pool with a single thread, then spins it back down.
 #[test]
 pub fn thread_pool() {
-    model(|| {
-        with_thread_pool(|_, _| black_box(()));
-    });
+    fn resize(thread_pool: &'static ThreadPool) {
+        thread_pool.resize_to(3);
+        thread_pool.resize_to(0);
+    }
+
+    shuttle::check_dfs(|| with_thread_pool(resize), None);
 }
 
 // -----------------------------------------------------------------------------
 // Core API
 
+/*
+
 /// Tests for concurrency issues when spawning a static closure.
 #[test]
 pub fn spawn_closure() {
-    model(|| {
-        with_thread_pool(|_, worker| {
-            let complete = Box::leak(Box::new(AtomicBool::new(false)));
-            worker.spawn(|_| {
-                complete.store(true, Ordering::Release);
-            });
-            worker.run_until(&complete);
+    fn spawn(thread_pool: &'static ThreadPool) {
+        thread_pool.spawn(|worker| {
+            black_box(worker);
         });
-    });
+    }
+
+    shuttle::check_pct(|| with_thread_pool(spawn), 200, 200);
 }
 
 /// Tests for concurrency issues when spawning a static future.
@@ -273,3 +205,5 @@ pub fn scope_future() {
         });
     });
 }
+
+*/

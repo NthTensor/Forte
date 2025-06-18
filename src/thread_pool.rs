@@ -5,6 +5,7 @@ use alloc::collections::btree_map::Entry;
 use alloc::format;
 use alloc::string::ToString;
 use alloc::vec::Vec;
+use core::cell::Cell;
 use core::cmp;
 use core::future::Future;
 use core::num::NonZero;
@@ -47,6 +48,7 @@ pub struct Lease {
 // Thread pool types
 
 /// The "heartbeat interval" controls the frequency at which workers share work.
+#[cfg(not(feature = "shuttle"))]
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_micros(500);
 
 /// The `ThreadPool` object is used to orchestrate and distribute work to a pool
@@ -58,8 +60,7 @@ pub const HEARTBEAT_INTERVAL: Duration = Duration::from_micros(500);
 /// about `LazyStatic` or anything else; to create a new thread pool, just call
 /// [`ThreadPool::new`].
 ///
-/// ```
-/// # #![cfg(not(loom))]
+/// ```rust,no_run
 /// # use forte::ThreadPool;
 /// // Allocate a new thread pool.
 /// static THREAD_POOL: ThreadPool = ThreadPool::new();
@@ -248,7 +249,6 @@ struct ThreadControl {
 #[allow(clippy::new_without_default)]
 impl ThreadPool {
     /// Creates a new thread pool.
-    #[cfg(not(loom))]
     pub const fn new() -> ThreadPool {
         ThreadPool {
             state: Mutex::new(ThreadPoolState {
@@ -260,28 +260,6 @@ impl ThreadPool {
                 },
             }),
             job_is_ready: Condvar::new(),
-        }
-    }
-
-    /// Non-const constructor variant for loom.
-    #[cfg(loom)]
-    pub fn new() -> ThreadPool {
-        let managed_threads = ManagedThreads {
-            workers: Vec::new(),
-            heartbeat: None,
-        };
-
-        let worker_info = [(); MAX_WORKERS].map(|_| WorkerInfo {
-            wake: Latch::new(),
-            queue: Queue::with_recycle(2, RecycleJobRef),
-        });
-
-        ThreadPool {
-            queue: UnboundedQueue::new(),
-            registry: Mutex::new([false; MAX_WORKERS]),
-            worker_info,
-            heartbeat: AtomicU32::new(100),
-            managed_threads: Mutex::new(managed_threads),
         }
     }
 
@@ -390,8 +368,8 @@ impl ThreadPool {
                 new_size = current_size + new_leases.len(); // Scale back the new size to what we can actually spawn.
                 trace!("acquired leases for {} new threads", new_size);
 
-                // When not in loom, start the heartbeat thread if scaling up from zero.
-                #[cfg(not(loom))]
+                // When not in shuttle, start the heartbeat thread if scaling up from zero.
+                #[cfg(not(feature = "shuttle"))]
                 if new_size > 0 && current_size == 0 {
                     debug!("spawning heartbeat runner");
                     let halt = Arc::new(AtomicBool::new(false));
@@ -406,8 +384,6 @@ impl ThreadPool {
                     state.managed_threads.heartbeat = Some(control);
                 }
 
-                // Loom dosn't support barriers.
-                #[cfg(not(loom))]
                 let barrier = Arc::new(Barrier::new(new_leases.len() + 1));
 
                 // Spawn the new workers.
@@ -416,17 +392,11 @@ impl ThreadPool {
                     debug!("spawning managed worker with index {}", index);
                     let halt = Arc::new(AtomicBool::new(false));
                     let worker_halt = halt.clone();
-                    #[cfg(not(loom))]
                     let worker_barrier = barrier.clone();
                     let handle = ThreadBuilder::new()
                         .name(format!("worker {index}"))
                         .spawn(move || {
-                            managed_worker(
-                                lease,
-                                worker_halt,
-                                #[cfg(not(loom))]
-                                worker_barrier,
-                            );
+                            managed_worker(lease, worker_halt, worker_barrier);
                         })
                         .unwrap();
                     let control = ThreadControl { halt, handle };
@@ -438,8 +408,7 @@ impl ThreadPool {
 
                 drop(state);
 
-                // When not in loom, wait for the threads to start.
-                #[cfg(not(loom))]
+                // Wait for the threads to start.
                 barrier.wait();
             }
             // The size decreased
@@ -655,15 +624,8 @@ impl ThreadPool {
 // -----------------------------------------------------------------------------
 // Worker thread data
 
-#[cfg(not(loom))]
 thread_local! {
     static WORKER_PTR: Cell<*const Worker> = const { Cell::new(ptr::null()) };
-}
-
-#[cfg(loom)]
-thread_local! {
-    static RNG: XorShift64Star = XorShift64Star::new();
-    static WORKER_PTR: Cell<*const Worker> = Cell::new(ptr::null());
 }
 
 /// Holds the local context for a thread pool member, which allows queuing,
@@ -1236,7 +1198,7 @@ where
 /// Operating on the principle that you should finish what you start before
 /// starting something new, workers will first execute their queue, then execute
 /// shared jobs, then pull new jobs from the injector.
-fn managed_worker(lease: Lease, halt: Arc<AtomicBool>, #[cfg(not(loom))] barrier: Arc<Barrier>) {
+fn managed_worker(lease: Lease, halt: Arc<AtomicBool>, barrier: Arc<Barrier>) {
     trace!("starting managed worker");
 
     barrier.wait();
@@ -1277,8 +1239,8 @@ fn managed_worker(lease: Lease, halt: Arc<AtomicBool>, #[cfg(not(loom))] barrier
 /// jobs to shared jobs (which allows other works to claim them) and to reduce
 /// lock contention.
 ///
-/// This is never run on loom.
-#[cfg(not(loom))]
+/// This is never runs when testing in shuttle.
+#[cfg(not(feature = "shuttle"))]
 fn heartbeat_loop(thread_pool: &'static ThreadPool, halt: Arc<AtomicBool>) {
     use std::thread;
     use std::time::Instant;
@@ -1318,7 +1280,7 @@ fn heartbeat_loop(thread_pool: &'static ThreadPool, halt: Arc<AtomicBool>) {
 // -----------------------------------------------------------------------------
 // Tests
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "shuttle")))]
 mod tests {
     use alloc::vec;
     use core::sync::atomic::AtomicU8;

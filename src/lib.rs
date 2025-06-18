@@ -22,10 +22,12 @@
 //! scheduling. Support for futures is based on an approach sketched out by
 //! members of the `rayon` community to whom we are deeply indebted.
 
+#![no_std]
+#![cfg_attr(feature = "shuttle", allow(dead_code))]
+#![cfg_attr(feature = "shuttle", allow(unused_imports))]
+
 // -----------------------------------------------------------------------------
 // Boilerplate for building without the standard library
-
-#![no_std]
 
 extern crate alloc;
 extern crate std;
@@ -55,22 +57,19 @@ pub use thread_pool::spawn_future;
 // -----------------------------------------------------------------------------
 // Platform Support
 
-// This crate uses `loom` for testing, which requires mocking all of the core
-// threading primitives (`Mutex` and the like). Unfortunately there are some
-// minor differences between the `loom` and `std`.
+// This crate uses `shuttle` for testing, which requires mocking all of the core
+// threading primitives (`Mutex` and the like).
 //
 // To make things a bit simpler, we re-export all the important types in the
-// `primitives` module. Where necessary we wrap the `std` implementation to make
-// it match up with `loom`.
+// `primitives` module.
 
-#[cfg(not(loom))]
+#[cfg(not(feature = "shuttle"))]
 mod platform {
 
     // Core exports
 
     pub use alloc::sync::Arc;
     pub use alloc::sync::Weak;
-    pub use core::cell::Cell;
     pub use core::sync::atomic::AtomicBool;
     pub use core::sync::atomic::AtomicU32;
     pub use core::sync::atomic::Ordering;
@@ -129,34 +128,26 @@ mod platform {
     }
 }
 
-#[cfg(loom)]
+#[cfg(feature = "shuttle")]
 mod platform {
 
     // Core exports
 
-    use core::ops::Deref;
-
-    pub use loom::cell::Cell;
-    pub use loom::cell::UnsafeCell;
-    pub use loom::sync::Arc;
-    pub use loom::sync::Condvar;
-    pub use loom::sync::Mutex;
-    pub use loom::sync::atomic::AtomicBool;
-    pub use loom::sync::atomic::AtomicU32;
-    pub use loom::sync::atomic::Ordering;
-    pub use loom::sync::atomic::fence;
-    pub use loom::thread::Builder as ThreadBuilder;
-    pub use loom::thread::JoinHandle;
-    pub use loom::thread_local;
-
-    // Queue
-
-    pub type UnboundedQueue<T> = crossbeam_queue::SegQueue<T>;
-    pub type Queue<T, R> = thingbuf::ThingBuf<T, R>;
+    pub use shuttle::sync::Arc;
+    pub use shuttle::sync::Barrier;
+    pub use shuttle::sync::Condvar;
+    pub use shuttle::sync::Mutex;
+    pub use shuttle::sync::Weak;
+    pub use shuttle::sync::atomic::AtomicBool;
+    pub use shuttle::sync::atomic::AtomicU32;
+    pub use shuttle::sync::atomic::Ordering;
+    pub use shuttle::thread::Builder as ThreadBuilder;
+    pub use shuttle::thread::JoinHandle;
+    pub use shuttle::thread_local;
 
     // Available parallelism
 
-    pub fn available_parallelism() -> std::io::Result<std::num::NonZero<usize>> {
-        panic!("available_parallelism does not work on loom");
+    pub fn available_parallelism() -> std::io::Result<core::num::NonZero<usize>> {
+        panic!("available_parallelism does not work on shuttle");
     }
 }

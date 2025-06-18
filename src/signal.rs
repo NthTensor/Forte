@@ -5,6 +5,8 @@
 //! The implementation here is loosely adapted from chili and the oneshot crate,
 //! modified to use a futex instead of a CAS loop.
 
+use core::cell::UnsafeCell;
+
 use crate::platform::*;
 
 // -----------------------------------------------------------------------------
@@ -29,6 +31,7 @@ pub const SENT: u32 = 0b10;
 /// The api contract for signals is somewhat subtle, but it is governed by one
 /// general principle: A signal must be dropped after used (data has been sent
 /// over it).
+#[cfg(not(feature = "shuttle"))]
 pub struct Signal<T = ()> {
     /// The state of the signal, used for synchronization and sleeping.
     state: AtomicU32,
@@ -36,6 +39,7 @@ pub struct Signal<T = ()> {
     value: UnsafeCell<Option<T>>,
 }
 
+#[cfg(not(feature = "shuttle"))]
 impl<T: Send> Signal<T> {
     /// Creates a new signal.
     pub fn new() -> Self {
@@ -59,21 +63,18 @@ impl<T: Send> Signal<T> {
     pub unsafe fn try_recv(&self) -> Option<T> {
         // If the SENT bit has been set, read it and return it.
         if self.state.load(Ordering::Acquire) & SENT != 0 {
-            // Use the unsafe cell to get mutable access to the value.
-            let value_ptr = self.value.get_mut();
-
-            // Read the value from the signal.
-            //
-            // Panic if `recv` or `try_recv` has already returned data.
-            //
             // SAFETY: The other thread only ever accesses this memory
             // location once, before entering the SENT state. Because we are
             // now in the SENT state, and there can be no other calls to
             // `recv` or `try_recv` happening on other threads, we can
             // guarantee that we have exclusive access to this memory
-            // location. The SENT flag also tells us that that the memory
-            // location is initialized.
-            let value = unsafe { value_ptr.deref().take().unwrap() };
+            // location.
+            let value_ref = unsafe { &mut *self.value.get() };
+
+            // Read the value from the signal.
+            //
+            // Panics if `recv` or `try_recv` has already returned data.
+            let value = value_ref.take().unwrap();
 
             Some(value)
         } else {
@@ -101,21 +102,18 @@ impl<T: Send> Signal<T> {
 
             // If the SENT bit has been set, read it and return it.
             if state & SENT != 0 {
-                // Use the unsafe cell to get mutable access to the value.
-                let value_ptr = self.value.get_mut();
-
-                // Read the value from the signal.
-                //
-                // Panic if `recv` or `try_recv` has already returned data.
-                //
                 // SAFETY: The other thread only ever accesses this memory
                 // location once, before entering the SENT state. Because we are
                 // now in the SENT state, and there can be no other calls to
                 // `recv` or `try_recv` happening on other threads, we can
                 // guarantee that we have exclusive access to this memory
-                // location. The SENT flag also tells us that that the memory
-                // location is initialized.
-                return unsafe { value_ptr.deref().take().unwrap() };
+                // location.
+                let value_ref = unsafe { &mut *self.value.get() };
+
+                // Read the value from the signal.
+                //
+                // Panisc if `recv` or `try_recv` has already returned data.
+                return value_ref.take().unwrap();
             }
 
             // If a value has not been sent, wait until it is.
@@ -140,13 +138,6 @@ impl<T: Send> Signal<T> {
     /// invalidated during the call by any actions other than `send` itself.
     #[inline(always)]
     pub unsafe fn send(signal: *const Self, value: T) {
-        // Use the unsafe cell to get mutable access to the value.
-        //
-        // SAFETY: The caller ensures that this pointer is convertible to a
-        // reference, and we have not yet done anything that would cause another
-        // thread to invalidate it.
-        let value_ptr = unsafe { (*signal).value.get_mut() };
-
         // Load the current state of the signal.
         //
         // SAFETY: The caller ensures that this pointer is convertible to a
@@ -159,14 +150,21 @@ impl<T: Send> Signal<T> {
             panic!("attempted to send value over signal, but signal has already been sent");
         }
 
+        // Access the value of the signal.
+        //
+        // SAFETY: The caller ensures that this pointer is convertible to a
+        // reference, and we have not yet done anything that would cause another
+        // thread to invalidate it.
+        let value_ref = unsafe { &(*signal).value };
+
         // Write the value into the signal.
         //
-        // SAFETY: The other thread only ever accesses this memory location when
-        // the signal is in the SENT state. Because we are responsible for
-        // setting that state, and the assert above ensures that we are not
-        // already in that state, we can be sure that we have unique access to
-        // the memory location.
-        unsafe { *value_ptr.deref() = Some(value) };
+        // SAFETY: For the unsafe cell: The other thread only ever accesses this
+        // memory location when the signal is in the SENT state. Because we are
+        // responsible for setting that state, and the assert above ensures that
+        // we are not already in that state, we can be sure that we have unique
+        // access to the memory location.
+        unsafe { *value_ref.get() = Some(value) };
 
         // Set the bit for the SENT state. Note: This can cause the `signal`
         // pointer to become dangling.
@@ -198,3 +196,49 @@ impl<T: Send> Default for Signal<T> {
 // work, so they must be `Sync`. And signals themselves transmit values between
 // threads, so the type `T` must be `Send`.
 unsafe impl<T: Send> Sync for Signal<T> {}
+
+// -----------------------------------------------------------------------------
+// Shuttle Compat
+
+#[cfg(feature = "shuttle")]
+pub struct Signal<T = ()> {
+    mutex: Mutex<Option<T>>,
+    condvar: Condvar,
+}
+
+#[cfg(feature = "shuttle")]
+impl<T: Send> Signal<T> {
+    pub fn new() -> Self {
+        Self {
+            mutex: Mutex::new(None),
+            condvar: Condvar::new(),
+        }
+    }
+
+    /// Marked unsafe only for compatability.
+    pub unsafe fn try_recv(&self) -> Option<T> {
+        self.mutex.lock().unwrap().take()
+    }
+
+    /// Marked unsafe only for compatability.
+    #[cold]
+    pub unsafe fn recv(&self) -> T {
+        let mut state = self.mutex.lock().unwrap();
+        loop {
+            match state.take() {
+                Some(value) => return value,
+                None => state = self.condvar.wait(state).unwrap(),
+            }
+        }
+    }
+
+    #[inline(always)]
+    pub unsafe fn send(signal: *const Self, value: T) {
+        // SAFETY: The caller ensures that this pointer is convertible to a
+        // reference, and we have not yet done anything that would cause another
+        // thread to invalidate it.
+        let state = unsafe { &*signal };
+        *state.mutex.lock().unwrap() = Some(value);
+        state.condvar.notify_all();
+    }
+}
