@@ -215,12 +215,12 @@ impl<T: Send> Signal<T> {
         }
     }
 
-    /// Marked unsafe only for compatability.
+    /// Marked unsafe only for compatibility.
     pub unsafe fn try_recv(&self) -> Option<T> {
         self.mutex.lock().unwrap().take()
     }
 
-    /// Marked unsafe only for compatability.
+    /// Marked unsafe only for compatibility.
     #[cold]
     pub unsafe fn recv(&self) -> T {
         let mut state = self.mutex.lock().unwrap();

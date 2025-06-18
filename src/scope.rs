@@ -263,9 +263,9 @@ impl Drop for Scope<'_> {
         // When the scope is dropped, block to prevent deallocation until the
         // reference counter allows the scope to complete.
         tracing::trace!("completing scope");
-        // SAFETY: This is explicetly allowed, because every scope starts off
+        // SAFETY: This is explicitly allowed, because every scope starts off
         // with a counter of 1. This should be the only call to
-        // `remove_reference` without a coresponding call to `add_reference`, so
+        // `remove_reference` without a corresponding call to `add_reference`, so
         // the only one that can cause the reference counter to drop to zero.
         unsafe { self.remove_reference() };
         Worker::with_current(|worker| {

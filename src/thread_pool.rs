@@ -90,13 +90,13 @@ pub const HEARTBEAT_INTERVAL: Duration = Duration::from_micros(500);
 ///         // are suspended.
 ///         let task = THREAD_POOL.spawn_async(async || { "Hello World" });
 ///
-///         // Do two operations in paralell, and await the result of each. This is the most
-///         // efficent and hyper-optimized thread pool operation.
+///         // Do two operations in parallel, and await the result of each. This is the most
+///         // efficient and hyper-optimized thread pool operation.
 ///         let (a, b) = worker.join(|_| "a", |_| "b");
 ///         assert_eq!(a, "a");
 ///         assert_eq!(b, "b");
 ///
-///         // Wait for that task we completed earlyer, without using `await`.
+///         // Wait for that task we completed earlier, without using `await`.
 ///         let result = worker.block_on(task);
 ///         assert_eq!(result, "Hello World");
 ///     });
