@@ -8,15 +8,14 @@ use crate::PreparedCommand;
 /// Checks that the loom test suite compiles.
 #[derive(FromArgs, Default)]
 #[argh(subcommand, name = "loom-check")]
-pub struct LoomCheckCommand {}
+pub struct ShuttleCheckCommand {}
 
-impl Prepare for LoomCheckCommand {
+impl Prepare for ShuttleCheckCommand {
     fn prepare<'a>(&self, sh: &'a xshell::Shell, _flags: Flag) -> Vec<PreparedCommand<'a>> {
         let command = PreparedCommand::new::<Self>(
-            cmd!(sh, "cargo check --test loom"),
+            cmd!(sh, "cargo check --test shuttle --features shuttle"),
             "Please fix compiler errors in output above.",
-        )
-        .with_env_var("RUSTFLAGS", "--cfg loom");
+        );
         vec![command]
     }
 }

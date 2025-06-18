@@ -14,6 +14,7 @@ exclude = ["coz"]
 [dependencies]
 async-task = "4.7.1"
 atomic-wait = "1.1.0"
+shuttle = { version = "0.8.0", optional = true }
 tracing = { version = "0.1.41", features = ["release_max_level_off"] }
 tracing-subscriber = "0.3.19"
 
@@ -25,11 +26,21 @@ chili = "0.2"
 # Used for A/B perf testing
 criterion = { version = "0.5" }
 
+[features]
+shuttle = ["dep:shuttle"]
+
 [profile.release]
 debug = true
 
 [profile.bench]
 debug = true
+
+# Custom profile for shuttle tests: enable release optimizations so that the shuttle
+# tests are less slow, but don't disable debug assertions.
+[profile.shuttle]
+inherits = "test"
+lto = true
+opt-level = 3
 
 [lints.clippy]
 doc_markdown = "warn"
@@ -53,19 +64,6 @@ alloc_instead_of_core = "warn"
 missing_docs = "warn"
 unsafe_op_in_unsafe_fn = "warn"
 unused_qualifications = "warn"
-
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
-
-# Add loom as a dependency for tests
-[target.'cfg(loom)'.dependencies]
-loom = { version = "0.7", features = [ "checkpoint" ] }
-
-# Custom profile for Loom tests: enable release optimizations so that the loom
-# tests are less slow, but don't disable debug assertions.
-[profile.loom]
-inherits = "test"
-lto = true
-opt-level = 3
 
 [[test]]
 name = "integration"

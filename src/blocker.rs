@@ -25,6 +25,11 @@ const WAKE: u32 = 2;
 pub struct Blocker {
     /// The state of a blocker.
     state: AtomicU32,
+    // When using shuttle, futex is not avalible so we must fall back to a mutex and condvar
+    #[cfg(feature = "shuttle")]
+    mutex: Mutex<()>,
+    #[cfg(feature = "shuttle")]
+    condvar: Condvar,
 }
 
 impl Blocker {
@@ -32,6 +37,10 @@ impl Blocker {
     pub fn new() -> Self {
         Self {
             state: AtomicU32::new(IDLE),
+            #[cfg(feature = "shuttle")]
+            mutex: Mutex::new(()),
+            #[cfg(feature = "shuttle")]
+            condvar: Condvar::new(),
         }
     }
 
@@ -60,7 +69,10 @@ impl Blocker {
     pub fn block(&self) {
         let state = self.state.swap(WAIT, Ordering::Relaxed);
         if state != WAKE {
+            #[cfg(not(feature = "shuttle"))]
             atomic_wait::wait(&self.state, state);
+            #[cfg(feature = "shuttle")]
+            let _ = self.condvar.wait(self.mutex.lock().unwrap());
         }
         self.state.store(IDLE, Ordering::Relaxed);
     }
@@ -80,6 +92,9 @@ fn wake(this: *const ()) {
     // valid to convert this into an immutable reference.
     let blocker = unsafe { &*this.cast::<Blocker>() };
     if blocker.state.swap(WAKE, Ordering::Relaxed) == WAIT {
+        #[cfg(not(feature = "shuttle"))]
         atomic_wait::wake_all(&blocker.state);
+        #[cfg(feature = "shuttle")]
+        blocker.condvar.notify_all();
     }
 }
