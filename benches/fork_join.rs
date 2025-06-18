@@ -58,8 +58,8 @@ fn baseline(bencher: Bencher, nodes: (usize, usize)) {
     #[inline]
     fn sum(node: &Node) -> u64 {
         let (left, right) = join_no_overhead(
-            || node.left.as_deref().map(|n| sum(n)).unwrap_or_default(),
-            || node.right.as_deref().map(|n| sum(n)).unwrap_or_default(),
+            || node.left.as_deref().map(sum).unwrap_or_default(),
+            || node.right.as_deref().map(sum).unwrap_or_default(),
         );
 
         node.val + left + right
