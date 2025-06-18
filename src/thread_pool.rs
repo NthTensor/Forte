@@ -131,7 +131,7 @@ struct ThreadPoolState {
 }
 
 impl ThreadPoolState {
-    pub fn claim_shared_job(&mut self) -> Option<JobRef> {
+    fn claim_shared_job(&mut self) -> Option<JobRef> {
         self.shared_jobs.pop_first().map(|(_, job_ref)| job_ref)
     }
 
@@ -140,7 +140,7 @@ impl ThreadPoolState {
     ///
     /// There are a finite number of leases available on each pool. If they are
     /// already claimed, this returns `None`.
-    pub fn claim_lease(&mut self, thread_pool: &'static ThreadPool) -> Lease {
+    fn claim_lease(&mut self, thread_pool: &'static ThreadPool) -> Lease {
         let heartbeat = Arc::new(AtomicBool::new(false));
         let tenant = Tenant {
             heartbeat: Arc::downgrade(&heartbeat),
@@ -169,7 +169,7 @@ impl ThreadPoolState {
     /// Attempts to claim several leases at once. See
     /// [`ThreadPool::claim_lease`] for more information. If no leases are
     /// available, this returns an empty vector.
-    pub fn claim_leases(&mut self, thread_pool: &'static ThreadPool, num: usize) -> Vec<Lease> {
+    fn claim_leases(&mut self, thread_pool: &'static ThreadPool, num: usize) -> Vec<Lease> {
         let mut leases = Vec::with_capacity(num);
 
         let now = Instant::now();
@@ -283,6 +283,13 @@ impl ThreadPool {
             heartbeat: AtomicU32::new(100),
             managed_threads: Mutex::new(managed_threads),
         }
+    }
+
+    /// Claims a lease on the thread pool which can be occupied by a worker
+    /// (using [`Worker::occupy`]), allowing a thread to participate in the pool.
+    pub fn claim_lease(&'static self) -> Lease {
+        let mut state = self.state.lock().unwrap();
+        state.claim_lease(self)
     }
 
     /// Resizes the thread pool to fill all available space. After this returns,
