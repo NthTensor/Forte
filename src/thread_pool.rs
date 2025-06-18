@@ -60,32 +60,47 @@ pub const HEARTBEAT_INTERVAL: Duration = Duration::from_micros(500);
 ///
 /// ```
 /// # #![cfg(not(loom))]
-/// # use forte::prelude::*;
+/// # use forte::ThreadPool;
 /// // Allocate a new thread pool.
 /// static THREAD_POOL: ThreadPool = ThreadPool::new();
 ///
 /// fn main() {
+///
 ///     // Resize the pool to fill the available number of cores.
 ///     THREAD_POOL.resize_to_available();
-///     // Access one of the pool's worker threads.
-///     THREAD_POOL.install(|w| {
-///         // Spawn a compute job.
-///         w.spawn(|w| {
-///             // Then spawn another one using the provided worker.
-///             w.spawn(|_| 1);
-///             // Spawn one using the thread pool directly.
-///             THREAD_POOL.spawn(|_| 2);
-///             // Spawn one using the current thread pool, without the worker.
-///             forte::spawn(|_| 3);
+///
+///     // Register this thread as a worker on the pool.
+///     THREAD_POOL.as_worker(|worker| {
+///         // Spawn a job onto the pool. The closure also accepts a worker, because the
+///         // job may be executed on a different thread. This will be the worker for whatever
+///         // thread it executes on.
+///         worker.spawn(|worker| {
+///             // Spawn another job after this one runs, using the provided local worker.
+///             worker.spawn(|_| { });
+///             // Spawn another job using the thread pool directly (this will be slower).
+///             THREAD_POOL.spawn(|_| { });
+///             // Spawn a third job, which will automagically use the parent thread pool.
+///             // This will also be slower than using the worker.
+///             forte::spawn(|_| { });
 ///         });
-///         // Spawn an async job.
-///         let task = w.spawn_async(async || { "Hello World" });
-///         // Do two operations in parallel.
-///         let (a, b) = w.join(|_| 1, |_| 2);
-///         // Wait for a task to complete.
-///         let result = w.block_on(task);
+///
+///         // Spawn an async job, which can return a value through a `Future`. This does not
+///         // provide access to a worker, because futures may move between threads while they
+///         // are suspended.
+///         let task = THREAD_POOL.spawn_async(async || { "Hello World" });
+///
+///         // Do two operations in paralell, and await the result of each. This is the most
+///         // efficent and hyper-optimized thread pool operation.
+///         let (a, b) = worker.join(|_| "a", |_| "b");
+///         assert_eq!(a, "a");
+///         assert_eq!(b, "b");
+///
+///         // Wait for that task we completed earlyer, without using `await`.
+///         let result = worker.block_on(task);
+///         assert_eq!(result, "Hello World");
 ///     });
-///     // Halt all the threads in the pool.
+///
+///     // Halt the thread pool by removing all the managed workers.
 ///     THREAD_POOL.resize_to(0);
 /// }
 /// ```
@@ -354,7 +369,6 @@ impl ThreadPool {
             "attempting to resize thread pool from {} to {} thread(s)",
             current_size, new_size
         );
-
         match new_size.cmp(&current_size) {
             // The size remained the same
             cmp::Ordering::Equal => {
@@ -431,6 +445,8 @@ impl ThreadPool {
 
                 // Pull the workers we intend to halt out of the thread manager.
                 let terminating_workers = state.managed_threads.workers.split_off(new_size);
+
+                drop(state);
 
                 // Terminate the workers.
                 for worker in &terminating_workers {
@@ -1053,7 +1069,6 @@ impl Worker {
         // Attempt to recover the job from the queue. It should still be there
         // if we didn't share it.
         if let Some(job) = self.queue.pop_back() {
-
             // If the shoe fits, this is our original `JobRef`, and we can
             // unwrap it to recover the closure `a` to execute it directly.
             if job.id() == job_ref_id {
@@ -1066,7 +1081,7 @@ impl Worker {
                 let result_a = a(self);
                 return (result_a, result_b);
             }
-            
+
             // Even if it's not the droid we were looking for, we must still
             // execute the job.
             job.execute(self);
@@ -1095,7 +1110,8 @@ impl Worker {
         T: Send,
     {
         let scope = pin!(Scope::new());
-        f(scope.into_ref())
+        let scope = scope.into_ref();
+        f(scope)
     }
 }
 
@@ -1220,7 +1236,7 @@ fn managed_worker(lease: Lease, halt: Arc<AtomicBool>, #[cfg(not(loom))] barrier
 
     // Register as the indicated worker, and work until we are told to halt.
     Worker::occupy(lease, |worker| {
-        loop {
+        while !halt.load(Ordering::Relaxed) {
             if let Some(job) = worker.queue.pop_back() {
                 job.execute(worker);
                 continue;
@@ -1262,11 +1278,7 @@ fn heartbeat_loop(thread_pool: &'static ThreadPool, halt: Arc<AtomicBool>) {
 
     trace!("starting managed heartbeat thread");
 
-    loop {
-        if halt.load(Ordering::Relaxed) {
-            break;
-        }
-
+    while !halt.load(Ordering::Relaxed) {
         let mut state = thread_pool.state.lock().unwrap();
 
         let mut num_tenants = 0;
@@ -1293,5 +1305,110 @@ fn heartbeat_loop(thread_pool: &'static ThreadPool, halt: Arc<AtomicBool>) {
             let sleep_interval = HEARTBEAT_INTERVAL / num_tenants;
             thread::sleep(sleep_interval);
         }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Tests
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::AtomicU8;
+    use std::vec;
+
+    use super::*;
+
+    #[test]
+    fn join_basic() {
+        static THREAD_POOL: ThreadPool = ThreadPool::new();
+        THREAD_POOL.populate();
+
+        let mut a = 0;
+        let mut b = 0;
+        THREAD_POOL.join(|_| a += 1, |_| b += 1);
+
+        assert_eq!(a, 1);
+        assert_eq!(b, 1);
+
+        THREAD_POOL.depopulate();
+    }
+
+    #[test]
+    fn join_long() {
+        fn increment(worker: &Worker, slice: &mut [u32]) {
+            match slice.len() {
+                0 => (),
+                1 => slice[0] += 1,
+                _ => {
+                    let (head, tail) = slice.split_at_mut(1);
+
+                    worker.join(|_| head[0] += 1, |worker| increment(worker, tail));
+                }
+            }
+        }
+
+        static THREAD_POOL: ThreadPool = ThreadPool::new();
+        THREAD_POOL.populate();
+
+        let mut vals = [0; 1_024];
+        THREAD_POOL.as_worker(|worker| increment(worker, &mut vals));
+        assert_eq!(vals, [1; 1_024]);
+
+        THREAD_POOL.depopulate();
+    }
+
+    #[test]
+    fn join_very_long() {
+        fn increment(worker: &Worker, slice: &mut [u32]) {
+            match slice.len() {
+                0 => (),
+                1 => slice[0] += 1,
+                _ => {
+                    let mid = slice.len() / 2;
+                    let (left, right) = slice.split_at_mut(mid);
+
+                    worker.join(
+                        |worker| increment(worker, left),
+                        |worker| increment(worker, right),
+                    );
+                }
+            }
+        }
+
+        static THREAD_POOL: ThreadPool = ThreadPool::new();
+        THREAD_POOL.populate();
+
+        let mut vals = vec![0; 1_024 * 1_024];
+        THREAD_POOL.as_worker(|worker| increment(worker, &mut vals));
+        assert_eq!(vals, vec![1; 1_024 * 1_024]);
+
+        THREAD_POOL.depopulate();
+    }
+
+    #[test]
+    fn concurrent_scopes() {
+        const NUM_JOBS: u8 = 128;
+
+        static THREAD_POOL: ThreadPool = ThreadPool::new();
+        THREAD_POOL.resize_to(4);
+
+        let a = AtomicU8::new(0);
+        let b = AtomicU8::new(0);
+
+        THREAD_POOL.scope(|scope| {
+            for _ in 0..NUM_JOBS {
+                scope.spawn(|_| {
+                    THREAD_POOL.join(
+                        |_| a.fetch_add(1, Ordering::Relaxed),
+                        |_| b.fetch_add(1, Ordering::Relaxed),
+                    );
+                });
+            }
+        });
+
+        assert_eq!(a.load(Ordering::Relaxed), NUM_JOBS);
+        assert_eq!(b.load(Ordering::Relaxed), NUM_JOBS);
+
+        THREAD_POOL.depopulate();
     }
 }
