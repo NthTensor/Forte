@@ -672,7 +672,7 @@ thread_local! {
 /// Workers are the recommended way to interface with a thread pool. To get
 /// access to worker for a given thread pool, users should call
 /// [`ThreadPool::as_worker`] (which keeps work in the same thread, but
-/// sometimes may fail to acquire a worker) or [`ThreadPool::in_worker`] (which
+/// sometimes may fail to acquire a worker) or [`ThreadPool::as_worker`] (which
 /// may send work to other threads, but will always acquire a worker).
 ///
 /// Every thread has at most one worker at a time. If a worker has already been
@@ -1216,7 +1216,7 @@ where
 ///
 /// If there is no current thread pool, this panics.
 ///
-/// See also: [`Worker::scope`] and [`Threadpool::scope`].
+/// See also: [`Worker::scope`] and [`ThreadPool::scope`].
 pub fn scope<'scope, F, T>(f: F) -> T
 where
     F: FnOnce(Pin<&Scope<'scope>>) -> T + Send,

@@ -1,5 +1,5 @@
 //! This module defines a utility for spawning non-static jobs. For more
-//! information see [`crate::scope`] or the [`Scope`] type.
+//! information see [`crate::scope()`] or the [`Scope`] type.
 
 use alloc::boxed::Box;
 use core::future::Future;
@@ -21,7 +21,7 @@ use crate::thread_pool::Worker;
 // Scope
 
 /// A scope which can spawn a number of non-static jobs and async tasks. See
-/// [`ThreadPool::scope`] for more information.
+/// [`ThreadPool::scope`](crate::ThreadPool::scope) for more information.
 pub struct Scope<'scope> {
     /// Number of active references to the scope (including the owning
     /// allocation). This is incremented each time a new `ScopePtr` is created,
@@ -42,7 +42,7 @@ pub struct Scope<'scope> {
 
 impl<'scope> Scope<'scope> {
     /// Creates a new scope owned by the given worker thread. For a safe
-    /// equivalent, use [`ThreadPool::scope`].
+    /// equivalent, use [`ThreadPool::scope`](crate::ThreadPool::scope).
     ///
     /// Every scope contains a lifetime `'scope`, which must outlive anything
     /// spawned onto the scope.
@@ -79,8 +79,8 @@ impl<'scope> Scope<'scope> {
     ///
     /// # See also
     ///
-    /// The [`ThreadPool::scope`] function has more extensive documentation about
-    /// task spawning.
+    /// The [`ThreadPool::scope`](crate::ThreadPool::scope) function has more
+    /// extensive documentation about task spawning.
     ///
     /// # Panics
     ///
