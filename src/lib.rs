@@ -80,52 +80,6 @@ mod platform {
     pub use std::thread::JoinHandle;
     pub use std::thread::available_parallelism;
     pub use std::thread_local;
-
-    // Unsafe Cell
-
-    pub struct UnsafeCell<T> {
-        data: core::cell::UnsafeCell<T>,
-    }
-
-    impl<T> UnsafeCell<T> {
-        #[inline(always)]
-        pub const fn new(data: T) -> Self {
-            UnsafeCell {
-                data: core::cell::UnsafeCell::new(data),
-            }
-        }
-
-        #[inline(always)]
-        pub fn get_mut(&self) -> MutPtr<T> {
-            MutPtr {
-                ptr: self.data.get(),
-            }
-        }
-    }
-
-    pub struct MutPtr<T: ?Sized> {
-        ptr: *mut T,
-    }
-
-    #[allow(clippy::mut_from_ref)]
-    impl<T: ?Sized> MutPtr<T> {
-        /// Dereferences the pointer.
-        ///
-        /// # Safety
-        ///
-        /// This is equivalent to dereferencing a *mut T pointer, so all the
-        /// same safety considerations apply here.
-        ///
-        /// Because the `MutPtr` type can only be created by calling
-        /// `UnsafeCell::get_mut` on a valid `UnsafeCell`, we know the pointer
-        /// will never be null.
-        #[inline(always)]
-        pub unsafe fn deref(&self) -> &mut T {
-            // SAFETY: The safety requirements of this pointer dereference are
-            // identical to those of the function.
-            unsafe { &mut *self.ptr }
-        }
-    }
 }
 
 #[cfg(feature = "shuttle")]
