@@ -13,6 +13,8 @@ This project is currently in early [pre-release], and there may be arbitrary bre
 
 ## [Unreleased]
 
+## [1.0.0-alpha.3]
+
 ### Added
 
 - `ThreadPool::claim_lease` method.
