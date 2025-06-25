@@ -651,9 +651,13 @@ pub struct Worker {
     pub(crate) queue: JobQueue,
 }
 
+/// Describes the outcome of a call to [`Worker::yield_now`] or [`Worker::yield_local`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Yield {
+    /// Indicates that a job was executed.
     Executed,
+    /// Indicates that no job was executed, and the worker should perhaps be put
+    /// to sleep.
     Idle,
 }
 
@@ -831,6 +835,9 @@ impl Worker {
 
     /// Cooperatively yields execution to the threadpool, allowing it to execute
     /// some work.
+    ///
+    /// This function only executes local work: work already queued on the
+    /// worker. It will never claim shaired work.
     #[inline]
     pub fn yield_local(&self) -> Yield {
         match self.queue.pop_back() {
@@ -844,6 +851,12 @@ impl Worker {
 
     /// Cooperatively yields execution to the threadpool, allowing it to execute
     /// some work.
+    ///
+    /// Tis function may execute either local or shared work: work already
+    /// queued on the worker, or work off-loaded by a different worker. If there
+    /// is no work on the pool, this will lock the thread-pool mutex, so it
+    /// should not be called within a hot loop. Consider using
+    /// [`Worker::yield_local`] instead.
     #[inline]
     pub fn yield_now(&self) -> Yield {
         match self.find_work() {
