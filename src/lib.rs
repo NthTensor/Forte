@@ -47,6 +47,7 @@ mod thread_pool;
 pub use scope::Scope;
 pub use thread_pool::ThreadPool;
 pub use thread_pool::Worker;
+pub use thread_pool::Yield;
 pub use thread_pool::block_on;
 pub use thread_pool::join;
 pub use thread_pool::scope;
