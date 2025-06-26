@@ -1,5 +1,8 @@
 # Forte
 
+[![Crates.io](https://img.shields.io/crates/v/forte.svg)](https://crates.io/crates/forte)
+[![Docs](https://docs.rs/forte/badge.svg)](https://docs.rs/forte/latest/forte/)
+
 An async-compatible thread-pool aiming for "speed through simplicity".
 
 Forte is a parallel & async work scheduler designed to accommodate very large workloads with many short-lived tasks. It replicates the `rayon_core` api but with native support for futures and async tasks. 
