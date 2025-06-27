@@ -1,0 +1,10 @@
+[package]
+name = "rayon-compat"
+version = "1.12.1"
+edition = "2024"
+
+[dependencies]
+forte = { path = ".." }
+
+[features]
+web_spin_lock = []

@@ -32,6 +32,7 @@ use crate::job::StackJob;
 use crate::platform::*;
 use crate::scope::Scope;
 use crate::signal::Signal;
+use crate::unwind;
 
 // -----------------------------------------------------------------------------
 // Thread pool worker leases
@@ -613,8 +614,7 @@ impl ThreadPool {
     #[inline]
     pub fn scope<'scope, F, T>(&'static self, f: F) -> T
     where
-        F: FnOnce(Pin<&Scope<'scope>>) -> T + Send,
-        T: Send,
+        F: FnOnce(Pin<&Scope<'scope>>) -> T,
     {
         self.with_worker(|worker| worker.scope(f))
     }
@@ -647,6 +647,7 @@ thread_local! {
 /// Workers have one core memory-safety guarantee: Any jobs added to the worker
 /// will eventually be executed.
 pub struct Worker {
+    pub(crate) migrated: Cell<bool>,
     pub(crate) lease: Lease,
     pub(crate) queue: JobQueue,
 }
@@ -736,6 +737,7 @@ impl Worker {
         // problem that the same thread can occupy multiple workers on the same
         // thread. We many eventually need to design something to prevent this.
         let worker = Worker {
+            migrated: Cell::new(false),
             lease,
             queue: JobQueue::new(),
         };
@@ -749,7 +751,7 @@ impl Worker {
 
         // Execute the work queue until it's empty
         while let Some(job_ref) = worker.queue.pop_front() {
-            job_ref.execute(&worker);
+            worker.execute(job_ref, false);
         }
 
         // Swap back to pointing to the previous value (possibly null).
@@ -760,6 +762,10 @@ impl Worker {
         // Return the intermediate values created while running the closure,
         // namely the result and any jobs still remaining on the local queue.
         result
+    }
+
+    pub fn index(&self) -> usize {
+        self.lease.index
     }
 
     /// Tries to promote the oldest job in the local stack to a shared job. If
@@ -814,12 +820,17 @@ impl Worker {
 
     /// Tries to find a job to execute, either in the local queue or shared on
     /// the threadpool.
+    ///
+    /// The second value is true if the job was shared, or false if it was spawned locally.
     #[inline]
-    pub fn find_work(&self) -> Option<JobRef> {
+    pub fn find_work(&self) -> Option<(JobRef, bool)> {
         // We give preference first to things in our local deque, then in other
         // workers deques, and finally to injected jobs from the outside. The
         // idea is to finish what we started before we take on something new.
-        self.queue.pop_back().or_else(|| self.claim_shared_job())
+        self.queue
+            .pop_back()
+            .map(|job| (job, false))
+            .or_else(|| self.claim_shared_job().map(|job| (job, true)))
     }
 
     /// Claims a shared job from the thread pool.
@@ -842,7 +853,7 @@ impl Worker {
     pub fn yield_local(&self) -> Yield {
         match self.queue.pop_back() {
             Some(job_ref) => {
-                job_ref.execute(self);
+                self.execute(job_ref, false);
                 Yield::Executed
             }
             None => Yield::Idle,
@@ -860,12 +871,28 @@ impl Worker {
     #[inline]
     pub fn yield_now(&self) -> Yield {
         match self.find_work() {
-            Some(job_ref) => {
-                job_ref.execute(self);
+            Some((job_ref, migrated)) => {
+                self.execute(job_ref, migrated);
                 Yield::Executed
             }
             None => Yield::Idle,
         }
+    }
+
+    /// Returns `true` if the current job is executing on a different thread
+    /// from the one on which it was created. Returns `false` if not executing a
+    /// job, or if the current job was created on the current thread.
+    #[inline]
+    pub fn migrated(&self) -> bool {
+        self.migrated.get()
+    }
+
+    /// Executes a job on a worker
+    #[inline]
+    pub fn execute(&self, job_ref: JobRef, migrated: bool) {
+        let migrated = self.migrated.replace(migrated);
+        job_ref.execute(self);
+        self.migrated.set(migrated);
     }
 }
 
@@ -1063,12 +1090,16 @@ impl Worker {
 
             // Even if it's not the droid we were looking for, we must still
             // execute the job.
-            job.execute(self);
+            self.execute(job, false);
         }
 
-        // Wait for the job to complete, then return the result.
+        // Wait for the job to complete.
         let result_a = self.wait_for_signal(stack_job.signal());
-        (result_a, result_b)
+        // If the job panicked, resume the panic on this thread.
+        match result_a {
+            Ok(result_a) => (result_a, result_b),
+            Err(error) => unwind::resume_unwinding(error),
+        }
     }
 
     /// Creates a scope on which non-static work can be spawned. Spawned jobs
@@ -1085,8 +1116,7 @@ impl Worker {
     #[inline]
     pub fn scope<'scope, F, T>(&self, f: F) -> T
     where
-        F: FnOnce(Pin<&Scope<'scope>>) -> T + Send,
-        T: Send,
+        F: FnOnce(Pin<&Scope<'scope>>) -> T,
     {
         let scope = pin!(Scope::new());
         let scope = scope.into_ref();
@@ -1191,8 +1221,7 @@ where
 /// See also: [`Worker::scope`] and [`ThreadPool::scope`].
 pub fn scope<'scope, F, T>(f: F) -> T
 where
-    F: FnOnce(Pin<&Scope<'scope>>) -> T + Send,
-    T: Send,
+    F: FnOnce(Pin<&Scope<'scope>>) -> T,
 {
     Worker::with_current(|worker| {
         worker
@@ -1217,7 +1246,7 @@ fn managed_worker(lease: Lease, halt: Arc<AtomicBool>, barrier: Arc<Barrier>) {
     Worker::occupy(lease, |worker| {
         while !halt.load(Ordering::Relaxed) {
             if let Some(job) = worker.queue.pop_back() {
-                job.execute(worker);
+                worker.execute(job, false);
                 continue;
             }
 
@@ -1226,7 +1255,7 @@ fn managed_worker(lease: Lease, halt: Arc<AtomicBool>, barrier: Arc<Barrier>) {
             while !halt.load(Ordering::Relaxed) {
                 if let Some(job) = state.claim_shared_job() {
                     drop(state);
-                    job.execute(worker);
+                    worker.execute(job, true);
                     break;
                 }
 

@@ -312,7 +312,7 @@ dependencies = [
 
 [[package]]
 name = "forte"
-version = "1.0.0-alpha.3"
+version = "1.0.0-dev"
 dependencies = [
  "async-task",
  "atomic-wait",
@@ -601,6 +601,13 @@ checksum = "b418a60154510ca1a002a752ca9714984e21e4241e804d32555251faf8b78ffa"
 dependencies = [
  "either",
  "rayon-core",
+]
+
+[[package]]
+name = "rayon-compat"
+version = "1.12.1"
+dependencies = [
+ "forte",
 ]
 
 [[package]]
