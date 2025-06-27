@@ -604,6 +604,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "rayon-compat"
+version = "1.12.1"
+dependencies = [
+ "forte",
+]
+
+[[package]]
 name = "rayon-core"
 version = "1.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -40,6 +40,7 @@ mod job;
 mod scope;
 mod signal;
 mod thread_pool;
+mod unwind;
 
 // -----------------------------------------------------------------------------
 // Top-level exports

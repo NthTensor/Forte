@@ -1,7 +1,6 @@
 //! This module contains the api and worker logic for the Forte thread pool.
 
-use alloc::collections::BTreeMap;
-use alloc::collections::btree_map::Entry;
+use alloc::collections::VecDeque;
 use alloc::format;
 use alloc::string::ToString;
 use alloc::vec::Vec;
@@ -16,7 +15,6 @@ use core::ptr::NonNull;
 use core::task::Context;
 use core::task::Poll;
 use core::time::Duration;
-use std::time::Instant;
 
 use async_task::Runnable;
 use async_task::Task;
@@ -32,6 +30,7 @@ use crate::job::StackJob;
 use crate::platform::*;
 use crate::scope::Scope;
 use crate::signal::Signal;
+use crate::unwind;
 
 // -----------------------------------------------------------------------------
 // Thread pool worker leases
@@ -49,7 +48,7 @@ pub struct Lease {
 
 /// The "heartbeat interval" controls the frequency at which workers share work.
 #[cfg(not(feature = "shuttle"))]
-pub const HEARTBEAT_INTERVAL: Duration = Duration::from_micros(500);
+pub const HEARTBEAT_INTERVAL: Duration = Duration::from_micros(100);
 
 /// The `ThreadPool` object is used to orchestrate and distribute work to a pool
 /// of threads, and is generally the main entry point to using `Forte`.
@@ -122,17 +121,18 @@ pub const HEARTBEAT_INTERVAL: Duration = Duration::from_micros(500);
 pub struct ThreadPool {
     state: Mutex<ThreadPoolState>,
     job_is_ready: Condvar,
+    new_participant: Condvar,
 }
 
 struct ThreadPoolState {
-    shared_jobs: BTreeMap<usize, JobRef>,
+    shared_jobs: VecDeque<JobRef>,
     tenants: Vec<Option<Tenant>>,
     managed_threads: ManagedThreads,
 }
 
 impl ThreadPoolState {
     fn claim_shared_job(&mut self) -> Option<JobRef> {
-        self.shared_jobs.pop_first().map(|(_, job_ref)| job_ref)
+        self.shared_jobs.pop_front()
     }
 
     /// Claims a lease on the thread pool. A lease can be passed to
@@ -144,7 +144,6 @@ impl ThreadPoolState {
         let heartbeat = Arc::new(AtomicBool::new(false));
         let tenant = Tenant {
             heartbeat: Arc::downgrade(&heartbeat),
-            last_heartbeat: Instant::now(),
         };
 
         for (index, occupant) in self.tenants.iter_mut().enumerate() {
@@ -172,8 +171,6 @@ impl ThreadPoolState {
     fn claim_leases(&mut self, thread_pool: &'static ThreadPool, num: usize) -> Vec<Lease> {
         let mut leases = Vec::with_capacity(num);
 
-        let now = Instant::now();
-
         for (index, occupant) in self.tenants.iter_mut().enumerate() {
             if leases.len() == num {
                 return leases;
@@ -183,7 +180,6 @@ impl ThreadPoolState {
                 let heartbeat = Arc::new(AtomicBool::new(false));
                 let tenant = Tenant {
                     heartbeat: Arc::downgrade(&heartbeat),
-                    last_heartbeat: now,
                 };
                 *occupant = Some(tenant);
                 leases.push(Lease {
@@ -198,7 +194,6 @@ impl ThreadPoolState {
             let heartbeat = Arc::new(AtomicBool::new(false));
             let tenant = Tenant {
                 heartbeat: Arc::downgrade(&heartbeat),
-                last_heartbeat: now,
             };
             self.tenants.push(Some(tenant));
             leases.push(Lease {
@@ -214,7 +209,6 @@ impl ThreadPoolState {
 
 struct Tenant {
     heartbeat: Weak<AtomicBool>,
-    last_heartbeat: Instant,
 }
 
 /// Manages threads spawned by the pool.
@@ -251,7 +245,7 @@ impl ThreadPool {
     pub const fn new() -> ThreadPool {
         ThreadPool {
             state: Mutex::new(ThreadPoolState {
-                shared_jobs: BTreeMap::new(),
+                shared_jobs: VecDeque::new(),
                 tenants: Vec::new(),
                 managed_threads: ManagedThreads {
                     workers: Vec::new(),
@@ -259,12 +253,14 @@ impl ThreadPool {
                 },
             }),
             job_is_ready: Condvar::new(),
+            new_participant: Condvar::new(),
         }
     }
 
     /// Claims a lease on the thread pool which can be occupied by a worker
     /// (using [`Worker::occupy`]), allowing a thread to participate in the pool.
     pub fn claim_lease(&'static self) -> Lease {
+        self.new_participant.notify_one();
         let mut state = self.state.lock().unwrap();
         state.claim_lease(self)
     }
@@ -613,8 +609,7 @@ impl ThreadPool {
     #[inline]
     pub fn scope<'scope, F, T>(&'static self, f: F) -> T
     where
-        F: FnOnce(Pin<&Scope<'scope>>) -> T + Send,
-        T: Send,
+        F: FnOnce(&Scope<'scope>) -> T,
     {
         self.with_worker(|worker| worker.scope(f))
     }
@@ -647,6 +642,7 @@ thread_local! {
 /// Workers have one core memory-safety guarantee: Any jobs added to the worker
 /// will eventually be executed.
 pub struct Worker {
+    pub(crate) migrated: Cell<bool>,
     pub(crate) lease: Lease,
     pub(crate) queue: JobQueue,
 }
@@ -736,6 +732,7 @@ impl Worker {
         // problem that the same thread can occupy multiple workers on the same
         // thread. We many eventually need to design something to prevent this.
         let worker = Worker {
+            migrated: Cell::new(false),
             lease,
             queue: JobQueue::new(),
         };
@@ -749,7 +746,7 @@ impl Worker {
 
         // Execute the work queue until it's empty
         while let Some(job_ref) = worker.queue.pop_front() {
-            job_ref.execute(&worker);
+            worker.execute(job_ref, false);
         }
 
         // Swap back to pointing to the previous value (possibly null).
@@ -762,6 +759,12 @@ impl Worker {
         result
     }
 
+    /// Returns the index of the worker in the leases list.
+    #[inline]
+    pub fn index(&self) -> usize {
+        self.lease.index
+    }
+
     /// Tries to promote the oldest job in the local stack to a shared job. If
     /// the local job queue is empty, or if the shared queue is full, this does
     /// nothing. If the promotion is successful, it tries to wake another
@@ -769,11 +772,9 @@ impl Worker {
     #[cold]
     fn promote(&self) {
         let mut state = self.lease.thread_pool.state.lock().unwrap();
-        if let Entry::Vacant(e) = state.shared_jobs.entry(self.lease.index) {
-            if let Some(job) = self.queue.pop_front() {
-                e.insert(job);
-                self.lease.thread_pool.job_is_ready.notify_one();
-            }
+        if let Some(job) = self.queue.pop_front() {
+            state.shared_jobs.push_back(job);
+            self.lease.thread_pool.job_is_ready.notify_one();
         }
     }
 
@@ -814,12 +815,17 @@ impl Worker {
 
     /// Tries to find a job to execute, either in the local queue or shared on
     /// the threadpool.
+    ///
+    /// The second value is true if the job was shared, or false if it was spawned locally.
     #[inline]
-    pub fn find_work(&self) -> Option<JobRef> {
+    pub fn find_work(&self) -> Option<(JobRef, bool)> {
         // We give preference first to things in our local deque, then in other
         // workers deques, and finally to injected jobs from the outside. The
         // idea is to finish what we started before we take on something new.
-        self.queue.pop_back().or_else(|| self.claim_shared_job())
+        self.queue
+            .pop_back()
+            .map(|job| (job, false))
+            .or_else(|| self.claim_shared_job().map(|job| (job, true)))
     }
 
     /// Claims a shared job from the thread pool.
@@ -842,7 +848,7 @@ impl Worker {
     pub fn yield_local(&self) -> Yield {
         match self.queue.pop_back() {
             Some(job_ref) => {
-                job_ref.execute(self);
+                self.execute(job_ref, false);
                 Yield::Executed
             }
             None => Yield::Idle,
@@ -860,12 +866,29 @@ impl Worker {
     #[inline]
     pub fn yield_now(&self) -> Yield {
         match self.find_work() {
-            Some(job_ref) => {
-                job_ref.execute(self);
+            Some((job_ref, migrated)) => {
+                self.execute(job_ref, migrated);
                 Yield::Executed
             }
             None => Yield::Idle,
         }
+    }
+
+    /// Returns `true` if the current job is executing on a different thread
+    /// from the one on which it was created. Returns `false` if not executing a
+    /// job, or if the current job was created on the current thread.
+    #[inline]
+    pub fn migrated(&self) -> bool {
+        self.migrated.get()
+    }
+
+    /// Executes a job. This wrapper swaps in the correct thread-migration flag
+    /// before the job runs, then swaps it back to what it was before.
+    #[inline]
+    fn execute(&self, job_ref: JobRef, migrated: bool) {
+        let migrated = self.migrated.replace(migrated);
+        job_ref.execute(self);
+        self.migrated.set(migrated);
     }
 }
 
@@ -1063,12 +1086,17 @@ impl Worker {
 
             // Even if it's not the droid we were looking for, we must still
             // execute the job.
-            job.execute(self);
+            self.execute(job, false);
         }
 
-        // Wait for the job to complete, then return the result.
+        // Wait for the job to complete.
         let result_a = self.wait_for_signal(stack_job.signal());
-        (result_a, result_b)
+
+        // If the job panicked, resume the panic on this thread.
+        match result_a {
+            Ok(result_a) => (result_a, result_b),
+            Err(error) => unwind::resume_unwinding(error),
+        }
     }
 
     /// Creates a scope on which non-static work can be spawned. Spawned jobs
@@ -1076,21 +1104,18 @@ impl Worker {
     /// spawn additional tasks into the scope. When the closure returns, it will
     /// block until all tasks that have been spawned into onto the scope complete.
     ///
-    /// It is also possible to create a new scope from a worker using
-    /// [`Scope::new`], but it must be pinned before it can be used. This
-    /// function mostly just does the pinning for you.
-    ///
     /// If you do not have access to a [`Worker`], you may call
     /// [`ThreadPool::scope`] or simply [`scope`].
     #[inline]
     pub fn scope<'scope, F, T>(&self, f: F) -> T
     where
-        F: FnOnce(Pin<&Scope<'scope>>) -> T + Send,
-        T: Send,
+        F: FnOnce(&Scope<'scope>) -> T,
     {
-        let scope = pin!(Scope::new());
-        let scope = scope.into_ref();
-        f(scope)
+        // SAFETY: The scope is pinned upon creation and dropped when the
+        // function returns.
+        let scope = unsafe { pin!(Scope::new()) };
+        let scope_ref = Pin::get_ref(scope.into_ref());
+        f(scope_ref)
     }
 }
 
@@ -1191,8 +1216,7 @@ where
 /// See also: [`Worker::scope`] and [`ThreadPool::scope`].
 pub fn scope<'scope, F, T>(f: F) -> T
 where
-    F: FnOnce(Pin<&Scope<'scope>>) -> T + Send,
-    T: Send,
+    F: FnOnce(&Scope<'scope>) -> T,
 {
     Worker::with_current(|worker| {
         worker
@@ -1217,7 +1241,7 @@ fn managed_worker(lease: Lease, halt: Arc<AtomicBool>, barrier: Arc<Barrier>) {
     Worker::occupy(lease, |worker| {
         while !halt.load(Ordering::Relaxed) {
             if let Some(job) = worker.queue.pop_back() {
-                job.execute(worker);
+                worker.execute(job, false);
                 continue;
             }
 
@@ -1226,7 +1250,7 @@ fn managed_worker(lease: Lease, halt: Arc<AtomicBool>, barrier: Arc<Barrier>) {
             while !halt.load(Ordering::Relaxed) {
                 if let Some(job) = state.claim_shared_job() {
                     drop(state);
-                    job.execute(worker);
+                    worker.execute(job, true);
                     break;
                 }
 
@@ -1253,36 +1277,50 @@ fn managed_worker(lease: Lease, halt: Arc<AtomicBool>, barrier: Arc<Barrier>) {
 #[cfg(not(feature = "shuttle"))]
 fn heartbeat_loop(thread_pool: &'static ThreadPool, halt: Arc<AtomicBool>) {
     use std::thread;
-    use std::time::Instant;
 
     trace!("starting managed heartbeat thread");
 
-    while !halt.load(Ordering::Relaxed) {
-        let mut state = thread_pool.state.lock().unwrap();
+    // Stores the index of the tenant we intend to send the next heartbeat to.
+    let mut queued_to_heartbeat = 0;
 
-        let mut num_tenants = 0;
-        let now = Instant::now();
-        for tenancy in state.tenants.iter_mut() {
-            if let Some(tenant) = tenancy {
+    let mut state = thread_pool.state.lock().unwrap();
+
+    while !halt.load(Ordering::Relaxed) {
+        let num_slots = state.tenants.len();
+        let mut num_occupied: u32 = 0;
+        let mut sent_heartbeat = false;
+
+        // Iterate through all the tenants, starting at the one queued to wake
+        for i in 0..num_slots {
+            let tenant_index = (queued_to_heartbeat + i) % num_slots;
+            // Just ignore slots that don't have a current tenant.
+            if let Some(tenant) = &mut state.tenants[tenant_index] {
+                // Clean up any old tenants who's heartbeat atomics have been de-allocated.
                 let Some(heartbeat) = tenant.heartbeat.upgrade() else {
-                    *tenancy = None;
+                    state.tenants[tenant_index] = None;
                     continue;
                 };
 
-                if now.duration_since(tenant.last_heartbeat) >= HEARTBEAT_INTERVAL {
+                // Send a single heartbeat to the first live tenant we find.
+                if !sent_heartbeat {
                     heartbeat.store(true, Ordering::Relaxed);
-                    tenant.last_heartbeat = now;
+                    sent_heartbeat = true;
+                    // Start with the next tenant on the next invocation of the loop.
+                    queued_to_heartbeat = (tenant_index + 1) % num_slots;
                 }
 
-                num_tenants += 1;
+                // Count every occupied slot, even if we didn't sent them a heartbeat.
+                num_occupied += 1;
             }
         }
 
-        drop(state);
-
-        if num_tenants > 0 {
-            let sleep_interval = HEARTBEAT_INTERVAL / num_tenants;
+        if num_occupied > 0 {
+            drop(state);
+            let sleep_interval = HEARTBEAT_INTERVAL / num_occupied;
             thread::sleep(sleep_interval);
+            state = thread_pool.state.lock().unwrap();
+        } else {
+            state = thread_pool.new_participant.wait(state).unwrap();
         }
     }
 }

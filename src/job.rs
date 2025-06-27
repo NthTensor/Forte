@@ -16,9 +16,11 @@ use alloc::collections::VecDeque;
 use core::cell::UnsafeCell;
 use core::mem::ManuallyDrop;
 use core::ptr::NonNull;
+use std::thread::Result as ThreadResult;
 
 use crate::signal::Signal;
 use crate::thread_pool::Worker;
+use crate::unwind;
 
 // -----------------------------------------------------------------------------
 // Runnable
@@ -152,7 +154,7 @@ impl JobQueue {
 /// This is analogous to the chili type `JobStack` and the rayon type `StackJob`.
 pub struct StackJob<F, T> {
     f: UnsafeCell<ManuallyDrop<F>>,
-    signal: Signal<T>,
+    signal: Signal<ThreadResult<T>>,
 }
 
 impl<F, T> StackJob<F, T>
@@ -210,7 +212,7 @@ where
     /// closure's return value is sent over this signal after the job is
     /// executed.
     #[inline(always)]
-    pub fn signal(&self) -> &Signal<T> {
+    pub fn signal(&self) -> &Signal<ThreadResult<T>> {
         &self.signal
     }
 }
@@ -235,6 +237,9 @@ where
         // SAFETY: The caller ensures `this` can be converted into an immutable
         // reference.
         let this = unsafe { this.cast::<Self>().as_ref() };
+        // Create an abort guard. If the closure panics, this will convert the
+        // panic into an abort. Doing so prevents use-after-free for other elements of the stack.
+        let abort_guard = unwind::AbortOnDrop;
         // SAFETY: This memory location is accessed only in this function and in
         // `unwrap`. The latter cannot have been called, because it drops the
         // stack job, so, since this function is called only once, we can
@@ -242,13 +247,15 @@ where
         let f_ref = unsafe { &mut *this.f.get() };
         // SAFETY: The caller ensures this function is called only once.
         let f = unsafe { ManuallyDrop::take(f_ref) };
-        // Run the job.
-        let result = f(worker);
+        // Run the job. If the job panics, we propagate the panic back to the main thread.
+        let result = unwind::halt_unwinding(|| f(worker));
         // SAFETY: This is valid for the access used by `send` because
         // `&this.signal` is an immutable reference to a `Signal`. Because
         // `send` is only called in this function, and this function is never
         // called again, `send` is never called again.
         unsafe { Signal::send(&this.signal, result) }
+        // Forget the abort guard, re-enabling panics.
+        core::mem::forget(abort_guard);
     }
 }
 

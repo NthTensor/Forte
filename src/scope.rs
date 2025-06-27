@@ -5,7 +5,6 @@ use alloc::boxed::Box;
 use core::future::Future;
 use core::marker::PhantomData;
 use core::marker::PhantomPinned;
-use core::pin::Pin;
 
 use async_task::Runnable;
 use async_task::Task;
@@ -47,13 +46,15 @@ impl<'scope> Scope<'scope> {
     /// Every scope contains a lifetime `'scope`, which must outlive anything
     /// spawned onto the scope.
     ///
-    /// Before a scope can be used, it must be pinned. The recommended approach
-    /// is to use the `pin!` macro to get a `Pin<&mut Scope<'scope>>` which you
-    /// then convert into a `Pin<&Scope<'scope>>` via `into_ref`.
-    ///
     /// When a scope is dropped, it will block the thread until all work
     /// spawened on the scope is complete.
-    pub fn new() -> Scope<'scope> {
+    ///
+    /// # Safety
+    ///
+    /// The caller must pin the scope before it can be used (This cannot be
+    /// enforced on the type-level due to compatibility requirements with rayon)
+    /// and must ensure the scope is eventually dropped.
+    pub(crate) unsafe fn new() -> Scope<'scope> {
         Scope {
             count: AtomicU32::new(1),
             signal: Signal::new(),
@@ -86,12 +87,16 @@ impl<'scope> Scope<'scope> {
     ///
     /// Panics if not called from within a worker.
     ///
-    pub fn spawn<F>(self: Pin<&Self>, f: F)
+    pub fn spawn<F>(&self, f: F)
     where
-        F: FnOnce(Pin<&Scope<'scope>>) + Send + 'scope,
+        F: FnOnce(&Scope<'scope>) + Send + 'scope,
     {
         // Create a job to execute the spawned function in the scope.
-        let scope_ptr = ScopePtr::new(self);
+        //
+        // SAFETY: This scope must be pinned, since the only way to create a
+        // scope is via `Scope::new` and that function requires the caller pin
+        // the scope before using it.
+        let scope_ptr = unsafe { ScopePtr::new(self) };
         let job = HeapJob::new(move |_| {
             scope_ptr.run(f);
         });
@@ -142,7 +147,7 @@ impl<'scope> Scope<'scope> {
     ///
     /// Panics if not called within a worker.
     ///
-    pub fn spawn_future<F, T>(self: Pin<&Self>, future: F) -> Task<T>
+    pub fn spawn_future<F, T>(&self, future: F) -> Task<T>
     where
         F: Future<Output = T> + Send + 'scope,
         T: Send + 'scope,
@@ -162,14 +167,18 @@ impl<'scope> Scope<'scope> {
     ///
     /// Panics if not called within a worker.
     ///
-    pub fn spawn_async<Fn, Fut, T>(self: Pin<&Self>, f: Fn) -> Task<T>
+    pub fn spawn_async<Fn, Fut, T>(&self, f: Fn) -> Task<T>
     where
-        Fn: FnOnce(Pin<&Scope<'scope>>) -> Fut + Send + 'scope,
+        Fn: FnOnce(&Scope<'scope>) -> Fut + Send + 'scope,
         Fut: Future<Output = T> + Send + 'scope,
         T: Send + 'scope,
     {
         // Wrap the function into a future using an async block.
-        let scope_ptr = ScopePtr::new(self);
+        //
+        // SAFETY: This scope must be pinned, since the only way to create a
+        // scope is via `Scope::new` and that function requires the caller pin
+        // the scope before using it.
+        let scope_ptr = unsafe { ScopePtr::new(self) };
         let future = async move { scope_ptr.run(f).await };
 
         // The schedule function will turn the future into a job when woken.
@@ -223,7 +232,7 @@ impl<'scope> Scope<'scope> {
     /// Every call to this should have a matching call to
     /// `Scope::remove_reference`, or the scope will block forever on
     /// completion.
-    pub fn add_reference(&self) {
+    fn add_reference(&self) {
         let counter = self.count.fetch_add(1, Ordering::SeqCst);
         tracing::trace!("scope reference counter increased to {}", counter + 1);
     }
@@ -235,7 +244,7 @@ impl<'scope> Scope<'scope> {
     /// The caller must ensure that there is exactly one a matching call to
     /// `add_reference` for every call to this function, unless used within
     /// `Scope::complete`.
-    pub unsafe fn remove_reference(&self) {
+    unsafe fn remove_reference(&self) {
         let counter = self.count.fetch_sub(1, Ordering::SeqCst);
         tracing::trace!("scope reference counter decreased to {}", counter - 1);
         if counter == 1 {
@@ -249,12 +258,6 @@ impl<'scope> Scope<'scope> {
             // duration of the function.
             unsafe { Signal::send(&self.signal, ()) };
         }
-    }
-}
-
-impl<'scope> Default for Scope<'scope> {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -281,8 +284,6 @@ impl Drop for Scope<'_> {
 mod scope_ptr {
     //! Defines a "lifetime-erased" reference-counting pointer to a scope.
 
-    use core::pin::Pin;
-
     use super::Scope;
 
     /// A reference-counted pointer to a scope. Used to capture a scope pointer
@@ -299,37 +300,39 @@ mod scope_ptr {
     impl<'scope> ScopePtr<'scope> {
         /// Creates a new reference-counted scope pointer which can be sent to other
         /// threads.
-        pub fn new(scope: Pin<&Scope<'scope>>) -> ScopePtr<'scope> {
+        ///
+        /// # SAFETY:
+        ///
+        /// The scope must be pinned (this cannot be enforced on the type level
+        /// due to compatibility requirements with rayon).
+        pub unsafe fn new(scope: &Scope<'scope>) -> ScopePtr<'scope> {
             scope.add_reference();
-            ScopePtr(scope.get_ref())
+            ScopePtr(scope)
         }
 
         /// Passes the scope referred to by this pointer into a closure.
         pub fn run<F, T>(&self, f: F) -> T
         where
-            F: FnOnce(Pin<&Scope<'scope>>) -> T + 'scope,
+            F: FnOnce(&Scope<'scope>) -> T + 'scope,
         {
             // SAFETY: This pointer is convertible to a shared reference.
             //
-            // + It was created from an immutable reference, and we never change
-            //   it so it must be non-null and dereferenceable.
+            // + It was created from an immutable reference to a pinned scope.
+            //   The only way for this to be invalidated is if the scope was
+            //   dropped in the time since we created the pointer.
             //
             // + We incremented the scope's reference counter and will not
             //   decrement it until this pointer is dropped. Since the scope
-            //   will remain valid as long as the reference counter is above
-            //   zero, we know it is valid.
+            //   will not be dropped while the reference counter is above
+            //   zero, we know the pointer is still valid.
             //
             // + The scope is never accessed mutably, so creating shared
             //   references is allowed.
             //
-            let inner_ref = unsafe { &*self.0 };
-
-            // SAFETY: The scope was pinned when passed to `ScopePtr::new` so
-            // the pinning rules must already be satisfied.
-            let pinned_ref = unsafe { Pin::new_unchecked(inner_ref) };
+            let scope_ref = unsafe { &*self.0 };
 
             // Execute the closure on the shared reference.
-            f(pinned_ref)
+            f(scope_ref)
         }
     }
 
@@ -337,13 +340,14 @@ mod scope_ptr {
         fn drop(&mut self) {
             // SAFETY: This pointer is convertible to a shared reference.
             //
-            // + It was created from an immutable reference, and we never change
-            //   it so it must be non-null and dereferenceable.
+            // + It was created from an immutable reference to a pinned scope.
+            //   The only way for this to be invalidated is if the scope was
+            //   dropped in the time since we created the pointer.
             //
-            // + We incremented the scope's reference counter and we have not yet
-            //   decremented it (although we are about to). Since the scope will
-            //   remain valid as long as the reference counter is above zero, we
-            //   know it is valid.
+            // + We incremented the scope's reference counter and will not
+            //   decrement it until this pointer is dropped. Since the scope
+            //   will not be dropped while the reference counter is above
+            //   zero, we know the pointer is still valid.
             //
             // + The scope is never accessed mutably, so creating shared
             //   references is allowed.
