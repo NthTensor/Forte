@@ -13,6 +13,24 @@ This project is currently in early [pre-release], and there may be arbitrary bre
 
 ## [Unreleased]
 
+### Added
+
+- `rayon-compat` crate, for running rayon on top of forte.
+- `Worker::migrated()` which is `true` when the current job has moved between threads.
+
+### Changed
+
+- Heartbeat frequency is now 100 microseconds.
+- Heartbeats are now more evenly distributed between workers.
+- The heartbeat thread goes to sleep when the pool is not in use.
+- Shared work is now queued and claimed in the order it was shared.
+- The `Scope` API is now identical to `rayon-core` and does not use `Pin<T>`.
+- `Scope::new`, `Scope::add_reference` and `Scope::remove_reference` are now private.
+
+### Security
+
+- Forte now implements exception safety. Panics can no longer cause UB.
+
 ## [1.0.0-alpha.3]
 
 ### Added

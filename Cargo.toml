@@ -8,8 +8,7 @@ repository = "https://github.com/NthTensor/Forte"
 
 [workspace]
 resolver = "2"
-members = ["ci"]
-exclude = ["coz"]
+members = ["ci", "rayon-compat"]
 
 [dependencies]
 async-task = "4.7.1"
