@@ -12,10 +12,11 @@ pub struct DocTestCommand {}
 
 impl Prepare for DocTestCommand {
     fn prepare<'a>(&self, sh: &'a xshell::Shell, flags: Flag) -> Vec<PreparedCommand<'a>> {
-        let no_fail_fast = flags
-            .contains(Flag::KEEP_GOING)
-            .then_some("--no-fail-fast")
-            .unwrap_or_default();
+        let no_fail_fast = if flags.contains(Flag::KEEP_GOING) {
+            "--no-fail-fast"
+        } else {
+            ""
+        };
 
         vec![PreparedCommand::new::<Self>(
             cmd!(sh, "cargo test --workspace --doc {no_fail_fast}"),

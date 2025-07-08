@@ -312,7 +312,7 @@ dependencies = [
 
 [[package]]
 name = "forte"
-version = "1.0.0-alpha.3"
+version = "1.0.0-dev"
 dependencies = [
  "async-task",
  "atomic-wait",
