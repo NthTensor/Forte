@@ -1,6 +1,6 @@
 [package]
 name = "forte"
-version = "1.0.0-dev"
+version = "1.0.0-alpha.4"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "A low-overhead thread-pool with support for non-static async closures"
