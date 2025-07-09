@@ -13,6 +13,8 @@ This project is currently in early [pre-release], and there may be arbitrary bre
 
 ## [Unreleased]
 
+## [1.0.0-alpha.4]
+
 ### Added
 
 - `forte-rayon-compat` crate, for running rayon on top of forte.
