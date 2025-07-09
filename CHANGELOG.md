@@ -15,7 +15,7 @@ This project is currently in early [pre-release], and there may be arbitrary bre
 
 ### Added
 
-- `rayon-compat` crate, for running rayon on top of forte.
+- `forte-rayon-compat` crate, for running rayon on top of forte.
 - `Worker::migrated()` which is `true` when the current job has moved between threads.
 
 ### Changed

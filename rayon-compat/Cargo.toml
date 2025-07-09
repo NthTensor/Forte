@@ -1,10 +1,13 @@
 [package]
-name = "rayon-compat"
-version = "1.12.1"
+name = "forte-rayon-compat"
+version = "1.12.0-dev"
 edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "A shim that allows replacing rayon-core with forte"
+repository = "https://github.com/NthTensor/Forte"
 
 [dependencies]
-forte = { path = ".." }
+forte = { version = "1.0.0-dev", path = ".." }
 
 [features]
 web_spin_lock = []
