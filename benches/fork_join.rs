@@ -1,9 +1,9 @@
 //! A benchmark for fork-join workloads adapted from `chili`.
 
 use chili::Scope;
+use criterion::black_box;
 use divan::Bencher;
 use forte::Worker;
-use tracing::debug;
 use tracing::info;
 use tracing_subscriber::fmt;
 use tracing_subscriber::layer::SubscriberExt;
@@ -33,7 +33,7 @@ impl Node {
 // Returns an iterator over the number of layers. Also returns the total number
 // of nodes.
 const LAYERS: &[usize] = &[
-    5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
+    5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, // 10, 24, 27,
 ];
 
 fn nodes() -> impl Iterator<Item = (usize, usize)> {
@@ -80,12 +80,10 @@ fn forte(bencher: Bencher, nodes: (usize, usize)) {
         let (left, right) = worker.join(
             |w| {
                 let sum = node.left.as_deref().map(|n| sum(n, w)).unwrap_or_default();
-                debug!("sum: {}", sum);
                 sum
             },
             |w| {
                 let sum = node.right.as_deref().map(|n| sum(n, w)).unwrap_or_default();
-                debug!("sum: {}", sum);
                 sum
             },
         );

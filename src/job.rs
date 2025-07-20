@@ -12,13 +12,14 @@
 //! (c) Each job reference is executed exactly once.
 
 use alloc::boxed::Box;
-use alloc::collections::VecDeque;
+use arraydeque::ArrayDeque;
 use core::cell::UnsafeCell;
-use core::mem::ManuallyDrop;
+use core::mem::{ManuallyDrop, MaybeUninit};
 use core::ptr::NonNull;
+use core::sync::atomic::{Ordering, fence};
 use std::thread::Result as ThreadResult;
 
-use crate::signal::Signal;
+use crate::latch::Latch;
 use crate::thread_pool::Worker;
 use crate::unwind;
 
@@ -72,7 +73,7 @@ impl JobRef {
     /// The caller must ensure that `job_pointer` remains valid to pass to
     /// `execute_fn` until the job is executed. What exactly this means is
     /// dependent on the implementation of the execute function.
-    #[inline]
+    #[inline(always)]
     pub unsafe fn new_raw(
         job_pointer: NonNull<()>,
         execute_fn: unsafe fn(NonNull<()>, &Worker),
@@ -85,13 +86,13 @@ impl JobRef {
 
     /// Returns an opaque handle that can be saved and compared, without making
     /// `JobRef` itself `Copy + Eq`.
-    #[inline]
+    #[inline(always)]
     pub fn id(&self) -> impl Eq + use<> {
         (self.job_pointer, self.execute_fn)
     }
 
     /// Executes the `JobRef` by passing the execute function on the job pointer.
-    #[inline]
+    #[inline(always)]
     pub fn execute(self, worker: &Worker) {
         // SAFETY: The constructor of `JobRef` is required to ensure this is valid.
         unsafe { (self.execute_fn)(self.job_pointer, worker) }
@@ -105,23 +106,27 @@ unsafe impl Send for JobRef {}
 // Job queue
 
 pub struct JobQueue {
-    job_refs: UnsafeCell<VecDeque<JobRef>>,
+    job_refs: UnsafeCell<ArrayDeque<JobRef, 64>>,
 }
 
 impl JobQueue {
     pub fn new() -> JobQueue {
         JobQueue {
-            job_refs: UnsafeCell::new(VecDeque::new()),
+            job_refs: UnsafeCell::new(ArrayDeque::new()),
         }
     }
 
     #[inline(always)]
-    pub fn push_back(&self, job_ref: JobRef) {
+    pub fn push_back(&self, job_ref: JobRef) -> Option<JobRef> {
         // SAFETY: The queue itself is only access mutably within `push_back`,
         // `pop_back` and `pop_front`. Since these functions never call each
         // other, we must have exclusive access to the queue.
         let job_refs = unsafe { &mut *self.job_refs.get() };
-        job_refs.push_back(job_ref);
+        if let Err(full) = job_refs.push_back(job_ref) {
+            Some(full.element)
+        } else {
+            None
+        }
     }
 
     #[inline(always)]
@@ -154,7 +159,8 @@ impl JobQueue {
 /// This is analogous to the chili type `JobStack` and the rayon type `StackJob`.
 pub struct StackJob<F, T> {
     f: UnsafeCell<ManuallyDrop<F>>,
-    signal: Signal<ThreadResult<T>>,
+    completed: Latch,
+    return_value: UnsafeCell<MaybeUninit<ThreadResult<T>>>,
 }
 
 impl<F, T> StackJob<F, T>
@@ -162,11 +168,13 @@ where
     F: FnOnce(&Worker) -> T + Send,
     T: Send,
 {
-    /// Creates a new `StackJob` and returns it directly.
-    pub fn new(f: F) -> StackJob<F, T> {
+    /// Creates a new `StackJob` owned by the current worker.
+    #[inline(always)]
+    pub fn new(f: F, worker: &Worker) -> StackJob<F, T> {
         StackJob {
             f: UnsafeCell::new(ManuallyDrop::new(f)),
-            signal: Signal::new(),
+            completed: worker.new_latch(),
+            return_value: UnsafeCell::new(MaybeUninit::uninit()),
         }
     }
 
@@ -182,6 +190,7 @@ where
     /// least until the `JobRef` is executed or dropped. Additionally, the
     /// caller must ensure that they never create two different `JobRef`s that
     /// point to the same `StackJob`.
+    #[inline(always)]
     pub unsafe fn as_job_ref(&self) -> JobRef {
         let job_pointer = NonNull::from(self).cast();
         // SAFETY: The caller ensures the `StackJob` will outlive the `JobRef`,
@@ -200,7 +209,7 @@ where
     ///
     /// # Safety
     ///
-    /// This must not be called after `execute`.
+    /// This may only be called before the job is executed.
     #[inline(always)]
     pub unsafe fn unwrap(mut self) -> F {
         // SAFETY: This will not be used again. Given that `execute` has not
@@ -212,8 +221,25 @@ where
     /// closure's return value is sent over this signal after the job is
     /// executed.
     #[inline(always)]
-    pub fn signal(&self) -> &Signal<ThreadResult<T>> {
-        &self.signal
+    pub fn completion_latch(&self) -> &Latch {
+        &self.completed
+    }
+
+    /// Unwraps the job into it's return value.
+    ///
+    /// # Safety
+    ///
+    /// This may only be called after the job has finished executing.
+    #[inline(always)]
+    pub unsafe fn return_value(mut self) -> ThreadResult<T> {
+        // Synchronize with the fence in `StackJob::execute`.
+        fence(Ordering::Acquire);
+        // Get a ref to the result.
+        let result_ref = self.return_value.get_mut();
+        // SAFETY: The job has completed, which means the return value must have
+        // been initialized. This consumes the job, so there's no chance of this
+        // accidentally duplicating data.
+        unsafe { result_ref.assume_init_read() }
     }
 }
 
@@ -226,34 +252,41 @@ where
     ///
     /// # Safety
     ///
-    /// The caller must ensure that `this` can be converted into an immutable
-    /// reference to a `StackJob`. If the stack job is allocated on the stack
-    /// (and it should be) then this amounts to ensuring this is called before
-    /// the stack frame containing the allocation is popped. Put another way:
-    /// don't leave a block where you allocate a stack job until you run it.
-    ///
-    /// This function must be called only once.
+    /// The caller must ensure that `this` is valid to access a `StackJob`
+    /// immutably at least until the `Latch` within the `StackJob` has been set.
+    /// As a consequence, this may not be run after a latch has been set. Since
+    /// this function sets the latch, the caller must ensure to only call this
+    /// function once.
+    #[inline(always)]
     unsafe fn execute(this: NonNull<()>, worker: &Worker) {
         // SAFETY: The caller ensures `this` can be converted into an immutable
-        // reference.
+        // reference until we set the latch, and the latch has not yet been set.
         let this = unsafe { this.cast::<Self>().as_ref() };
         // Create an abort guard. If the closure panics, this will convert the
         // panic into an abort. Doing so prevents use-after-free for other elements of the stack.
         let abort_guard = unwind::AbortOnDrop;
         // SAFETY: This memory location is accessed only in this function and in
-        // `unwrap`. The latter cannot have been called, because it drops the
-        // stack job, so, since this function is called only once, we can
+        // `unwrap`. The latter cannot have been called because it consumes the
+        // stack job. And since this function is called only once, we can
         // guarantee that we have exclusive access.
         let f_ref = unsafe { &mut *this.f.get() };
         // SAFETY: The caller ensures this function is called only once.
         let f = unsafe { ManuallyDrop::take(f_ref) };
         // Run the job. If the job panics, we propagate the panic back to the main thread.
         let result = unwind::halt_unwinding(|| f(worker));
-        // SAFETY: This is valid for the access used by `send` because
-        // `&this.signal` is an immutable reference to a `Signal`. Because
-        // `send` is only called in this function, and this function is never
-        // called again, `send` is never called again.
-        unsafe { Signal::send(&this.signal, result) }
+        // Get the uninitialized memory where we should put the return value.
+        let return_value = this.return_value.get();
+        // SAFETY: The return value is only accessed here and in
+        // `StackJob::return_value`. Since the other method consumes the stack
+        // job, it's not possible for it to run concurrently. Therefore, we must
+        // have exclusive access to the return value.
+        unsafe { (*return_value).write(result) };
+        // Latches do not participate in memory ordering, so we need to do this manually.
+        fence(Ordering::Release);
+        // SAFETY: The caller ensures the job is valid until the latch is set.
+        // Since the latch is a field of the job, the latch must be valid until
+        // it is set.
+        unsafe { Latch::set(&this.completed) };
         // Forget the abort guard, re-enabling panics.
         core::mem::forget(abort_guard);
     }
@@ -274,6 +307,7 @@ where
     F: FnOnce(&Worker) + Send,
 {
     /// Allocates a new `HeapJob` on the heap.
+    #[inline(always)]
     pub fn new(f: F) -> Box<Self> {
         Box::new(HeapJob { f })
     }
@@ -291,6 +325,7 @@ where
     /// outlived the data it closes over. In other words, if the closure
     /// references something, that thing must live until the `JobRef` is
     /// executed or dropped.
+    #[inline(always)]
     pub unsafe fn into_job_ref(self: Box<Self>) -> JobRef {
         // SAFETY: Pointers produced by `Box::into_raw` are never null.
         let job_pointer = unsafe { NonNull::new_unchecked(Box::into_raw(self)).cast() };
@@ -317,6 +352,7 @@ where
     /// The caller must ensure that `this` is a pointer, created by calling
     /// `Box::into_raw` on a `Box<HeapJob>`. After the call `this` must be
     /// treated as dangling.
+    #[inline(always)]
     unsafe fn execute(this: NonNull<()>, worker: &Worker) {
         // SAFETY: The caller ensures `this` was created by `Box::into_raw` and
         // that this is called only once.
