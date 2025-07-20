@@ -14,8 +14,8 @@ use scope_ptr::ScopePtr;
 use crate::ThreadPool;
 use crate::job::HeapJob;
 use crate::job::JobRef;
+use crate::latch::Latch;
 use crate::platform::*;
-use crate::signal::Signal;
 use crate::thread_pool::Worker;
 use crate::unwind;
 use crate::unwind::AbortOnDrop;
@@ -30,8 +30,8 @@ pub struct Scope<'scope, 'env: 'scope> {
     /// and decremented when a `ScopePtr` is dropped or the owning thead is done
     /// using it.
     count: AtomicU32,
-    /// A signal used to communicate when the scope has been completed.
-    signal: Signal,
+    /// A latch used to communicate when the scope has been completed.
+    completed: Latch,
     /// If any job panics, we store the result here to propagate it.
     panic: AtomicPtr<Box<dyn Any + Send + 'static>>,
     /// Makes `Scope` invariant over 'scope
@@ -52,7 +52,7 @@ where
     // dropped at the end of this function, after the call to `complete`. The
     // abort guard above prevents the stack from being dropped early during a
     // panic unwind.
-    let scope = unsafe { Scope::new() };
+    let scope = unsafe { Scope::new(worker) };
     // Panics that occur within the closure should be caught and propagated once
     // all spawned work is complete. This is not a safety requirement, it's just
     // a nicer behavior than aborting.
@@ -66,7 +66,8 @@ where
     // Now that the user has (presuamably) spawnd some work onto the scope, we
     // must wait for it to complete.
     //
-    // SAFETY: This is called only once.
+    // SAFETY: This is called only once, and we provide the same worker used to
+    // create the scope.
     unsafe { scope.complete(worker) };
     // At this point all work on the scope is complete, so it is safe to drop
     // the scope. This also means we can relinquish our abort guard (returning
@@ -86,10 +87,10 @@ impl<'scope, 'env> Scope<'scope, 'env> {
     /// The caller must promise not to move or mutably reference this scope
     /// until it is dropped, and must not allow the scope to be dropped until
     /// after `Scope::complete` is run and returns.
-    unsafe fn new() -> Scope<'scope, 'env> {
+    unsafe fn new(worker: &Worker) -> Scope<'scope, 'env> {
         Scope {
             count: AtomicU32::new(1),
-            signal: Signal::new(),
+            completed: worker.new_latch(),
             panic: AtomicPtr::new(ptr::null_mut()),
             _scope: PhantomData,
             _env: PhantomData,
@@ -249,7 +250,7 @@ impl<'scope, 'env> Scope<'scope, 'env> {
             //
             // SAFETY: The signal is passed as a reference, and is live for the
             // duration of the function.
-            unsafe { Signal::send(&self.signal, ()) };
+            unsafe { Latch::set(&self.completed) };
         }
     }
 
@@ -294,7 +295,8 @@ impl<'scope, 'env> Scope<'scope, 'env> {
     ///
     /// # Safety
     ///
-    /// This must be called only once.
+    /// This must be called only once. This must be called with a reference to
+    /// the same worker the scope was created with.
     unsafe fn complete(&self, worker: &Worker) {
         // SAFETY: This is explicitly allowed, because every scope starts off
         // with a counter of 1. Because this is called only once, the following
@@ -306,7 +308,7 @@ impl<'scope, 'env> Scope<'scope, 'env> {
         // return.
         unsafe { self.remove_reference() };
         // Wait for the remaining work to complete.
-        worker.wait_for_signal(&self.signal);
+        worker.wait_for(&self.completed);
     }
 }
 

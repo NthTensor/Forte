@@ -35,12 +35,12 @@ extern crate std;
 // -----------------------------------------------------------------------------
 // Modules
 
-mod blocker;
 mod job;
+mod latch;
 mod scope;
-mod signal;
 mod thread_pool;
 mod unwind;
+mod util;
 
 // -----------------------------------------------------------------------------
 // Top-level exports
@@ -71,7 +71,6 @@ mod platform {
     // Core exports
 
     pub use alloc::sync::Arc;
-    pub use alloc::sync::Weak;
     pub use core::sync::atomic::AtomicBool;
     pub use core::sync::atomic::AtomicPtr;
     pub use core::sync::atomic::AtomicU32;

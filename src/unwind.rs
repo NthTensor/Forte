@@ -13,7 +13,7 @@ use std::thread::Result;
 /// `Err` result. The assumption is that any panic will be propagated
 /// later with `resume_unwinding`, and hence `f` can be treated as
 /// exception safe.
-#[cold]
+#[inline(always)]
 pub fn halt_unwinding<F, R>(func: F) -> Result<R>
 where
     F: FnOnce() -> R,

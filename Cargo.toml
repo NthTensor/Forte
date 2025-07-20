@@ -11,8 +11,11 @@ resolver = "2"
 members = ["ci", "rayon-compat"]
 
 [dependencies]
+arraydeque = "0.5.1"
 async-task = "4.7.1"
 atomic-wait = "1.1.0"
+crossbeam-queue = "0.3.12"
+crossbeam-utils = "0.8.21"
 shuttle = { version = "0.8.0", optional = true }
 tracing = { version = "0.1.41", features = ["release_max_level_off"] }
 tracing-subscriber = "0.3.19"
@@ -22,6 +25,7 @@ tracing-subscriber = "0.3.19"
 divan = "0.1.17"
 rayon = "1.10.0"
 chili = "0.2"
+bevy_tasks = { version = "0.16.1", features = [ "multi_threaded" ] }
 # Used for A/B perf testing
 criterion = { version = "0.5" }
 
@@ -70,4 +74,8 @@ path = "tests/tests.rs"
 
 [[bench]]
 name = "fork_join"
+harness = false
+
+[[bench]]
+name = "bevy_tasks"
 harness = false

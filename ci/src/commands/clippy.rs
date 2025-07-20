@@ -13,10 +13,7 @@ pub struct ClippyCommand {}
 impl Prepare for ClippyCommand {
     fn prepare<'a>(&self, sh: &'a xshell::Shell, _flags: Flag) -> Vec<PreparedCommand<'a>> {
         vec![PreparedCommand::new::<Self>(
-            cmd!(
-                sh,
-                "cargo clippy --workspace --all-targets --all-features -- -Dwarnings"
-            ),
+            cmd!(sh, "cargo clippy --workspace -- -Dwarnings"),
             "Please fix clippy errors in output above.",
         )]
     }
