@@ -8,7 +8,7 @@ repository = "https://github.com/NthTensor/Forte"
 
 [workspace]
 resolver = "2"
-members = ["ci", "rayon-compat"]
+members = ["ci"]
 
 [dependencies]
 arraydeque = "0.5.1"

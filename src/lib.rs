@@ -46,6 +46,8 @@ mod util;
 // Top-level exports
 
 pub use scope::Scope;
+pub use scope::ScopedSpawn;
+pub use thread_pool::Spawn;
 pub use thread_pool::ThreadPool;
 pub use thread_pool::Worker;
 pub use thread_pool::Yield;
@@ -53,8 +55,6 @@ pub use thread_pool::block_on;
 pub use thread_pool::join;
 pub use thread_pool::scope;
 pub use thread_pool::spawn;
-pub use thread_pool::spawn_async;
-pub use thread_pool::spawn_future;
 
 // -----------------------------------------------------------------------------
 // Platform Support
