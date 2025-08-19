@@ -11,7 +11,6 @@ use async_task::Runnable;
 use async_task::Task;
 use scope_ptr::ScopePtr;
 
-use crate::ThreadPool;
 use crate::job::HeapJob;
 use crate::job::JobRef;
 use crate::latch::Latch;
@@ -24,6 +23,9 @@ use crate::unwind::AbortOnDrop;
 // Scope
 
 /// A scope which can spawn a number of non-static jobs and async tasks.
+///
+/// For an explanation of the lifetimes 'scope and 'env, refer to the
+/// documentation on the `with_scope` function.
 pub struct Scope<'scope, 'env: 'scope> {
     /// Number of active references to the scope (including the owning
     /// allocation). This is incremented each time a new `ScopePtr` is created,
@@ -34,14 +36,57 @@ pub struct Scope<'scope, 'env: 'scope> {
     completed: Latch,
     /// If any job panics, we store the result here to propagate it.
     panic: AtomicPtr<Box<dyn Any + Send + 'static>>,
-    /// Makes `Scope` invariant over 'scope
+    /// This adds invariance over 'scope, to make sure 'scope cannot shrink,
+    /// which is necessary for soundness.
+    ///
+    /// Without invariance, this would compile fine but be unsound:
+    ///
+    /// ```compile_fail
+    /// # use forte::ThreadPool;
+    /// # static THREAD_POOL: ThreadPool = ThreadPool::new();
+    /// # THREAD_POOL.populate();
+    /// # THREAD_POOL.with_worker(|worker| {
+    /// worker.scope(|scope| {
+    ///     scope.spawn_on(worker, |worker: &Worker| {
+    ///         let a = String::from("abcd");
+    ///         scope.spawn_on(worker, |_: &Worker| println!("{a:?}")); // might run after `a` is dropped
+    ///     });
+    /// });
+    /// # });
+    /// ```
     _scope: PhantomData<&'scope mut &'scope ()>,
-    /// Makes `Scope` invantiant over 'env
+    /// This adds covariance over 'env
     _env: PhantomData<&'env mut &'env ()>,
 }
 
-/// Crates a new scope on a worker. [`Worker::scope`] is just an alias for this
-/// function.
+/// Executes a new scope on a worker. [`Worker::scope`],
+/// [`ThreadPool::scope`][crate::ThreadPool::scope] and [`scope`][crate::scope()] are all just
+/// an aliases for this function.
+///
+/// # Lifetimes
+///
+/// This implementation of scopes is heavily based on `std::thread::scope`, and
+/// this section is ported from the excellent stdlib docs.
+///
+/// A scope has two lifetimes: `'scope` and `'env`.
+///
+/// The `'scope` lifetime represents the lifetime of the scope itself. That is:
+/// the time during which new scoped jobs may be spawned, and also the time
+/// during which they might still be running. This lifetime starts within the
+/// `with_scope` function, before the closure `f` (the argument to `with_scope`)
+/// is executed. It ends after the closure `f` returns and after all scoped work
+/// is complete, but before `with_scope` returns.
+///
+/// The `'env` lifetime represents the lifetime of whatever is borrowed by the
+/// scoped jobs. This lifetime must outlast the call to `with_scope`, and thus
+/// cannot be smaller than `'scope`. It can be as small as the call to
+/// `with_scope`, meaning that anything that outlives this call, such as local
+/// variables defined right before the scope, can be borrowed by the scoped
+/// jobs.
+///
+/// The `'env: 'scope` bound is part of the definition of the `Scope` type. The
+/// requirement that scoped work outlive `'scope` is part of the definition of
+/// the `ScopedSpawn` trait.
 #[inline]
 pub fn with_scope<'env, F, T>(worker: &Worker, f: F) -> T
 where
@@ -63,7 +108,7 @@ where
             None
         }
     };
-    // Now that the user has (presuamably) spawnd some work onto the scope, we
+    // Now that the user has (presumably) spawned some work onto the scope, we
     // must wait for it to complete.
     //
     // SAFETY: This is called only once, and we provide the same worker used to
@@ -97,128 +142,39 @@ impl<'scope, 'env> Scope<'scope, 'env> {
         }
     }
 
-    /// Spawns a scoped job onto the local worker. This job will execute
-    /// sometime before the scope completes.
+    /// Spawns a scoped job onto the current worker. Refer to [`spawn_on`] for
+    /// more extensive documentation.
     ///
-    /// # Returns
+    /// # Panics
     ///
-    /// Nothing. The spawned closures cannot pass back values to the caller
-    /// directly, though they can write to local variables on the stack (if
-    /// those variables outlive the scope) or communicate through shared
-    /// channels.
-    ///
-    /// If you need to return a value, spawn a `Future` instead with
-    /// [`Scope::spawn_future_on`].
-    ///
-    pub fn spawn_on<F>(&self, worker: &Worker, f: F)
-    where
-        F: FnOnce(&Worker) + Send + 'scope,
-    {
-        // Create a job to execute the spawned function in the scope.
-        let scope_ptr = ScopePtr::new(self);
-        let job = HeapJob::new(move |worker| {
-            // Catch any panics and store them on the scope.
-            let result = unwind::halt_unwinding(|| f(worker));
-            if let Err(err) = result {
-                scope_ptr.store_panic(err);
-            };
-            drop(scope_ptr);
-        });
-
-        // SAFETY: We must ensure that the heap job does not outlive the data it
-        // closes over. In effect, this means it must not outlive `'scope`.
-        //
-        // This is ensured by the `scope_ptr` and the scope rules, which will
-        // keep the calling stack frame alive until this job completes,
-        // effectively extending the lifetime of `'scope` for as long as is
-        // nessicary.
-        let job_ref = unsafe { job.into_job_ref() };
-
-        // Send the job to a queue to be executed.
-        worker.enqueue(job_ref);
+    /// If not in a worker, this panics.
+    pub fn spawn<T, S: ScopedSpawn<'scope, T>>(&'scope self, scoped_work: S) -> T {
+        Worker::with_current(|worker| scoped_work.spawn_on(worker.unwrap(), self))
     }
 
-    /// Spawns a future onto the scope. This future will be asynchronously
-    /// polled to completion some time before the scope completes.
+    /// Spawns a scoped job onto the provided worker. This job will execute
+    /// sometime before the scope completes.
     ///
-    /// # Returns
+    /// This function can be passed either a closure (for serial work) or a
+    /// future (for async work):
+    /// + If passed a closure, this returns nothing.
+    /// + If passed a future, this returns a `Task<T>` handle that can be used
+    ///   to await the result.
     ///
-    /// This returns a task, which represents a handle to the async computation
-    /// and is itself a future that can be awaited to receive the output of the
-    /// future. There's four ways to interact with a task:
+    /// # See also
     ///
-    /// 1. Await the task. This will eventually produce the output of the
-    ///    provided future. The scope will not complete until the output is
-    ///    returned to the awaiting logic.
+    /// The [`ThreadPool::scope`](crate::ThreadPool::scope) function has more
+    /// extensive documentation about task spawning.
     ///
-    /// 2. Drop the task. This will stop execution of the future and potentially
-    ///    allow the scope to complete immediately.
+    /// # Panics
     ///
-    /// 3. Cancel the task. This has the same effect as dropping the task, but
-    ///    waits until the futures stops running (which in the worst-case means
-    ///    waiting for the scope to complete).
-    ///
-    /// 4. Detach the task. This will allow the future to continue executing
-    ///    even after the task itself is dropped. The scope will only complete
-    ///    after the future polls to completion. Detaching a task with an
-    ///    infinite loop will prevent the scope from completing, and is not
-    ///    recommended.
-    ///
-    pub fn spawn_future_on<F, T>(&self, thread_pool: &'static ThreadPool, future: F) -> Task<T>
-    where
-        F: Future<Output = T> + Send + 'scope,
-        T: Send,
-    {
-        // Embed the scope pointer into the future.
-        let scope_ptr = ScopePtr::new(self);
-        let future = async move {
-            let result = future.await;
-            drop(scope_ptr);
-            result
-        };
-
-        // The schedule function will turn the future into a job when woken.
-        let schedule = move |runnable: Runnable| {
-            // Turn the runnable into a job-ref that we can send to a worker.
-
-            // SAFETY: We provide a pointer to a non-null runnable, and we turn
-            // it back into a non-null runnable. The runnable will remain valid
-            // until the task is run.
-            let job_ref = unsafe {
-                JobRef::new_raw(runnable.into_raw(), |this, _| {
-                    let runnable = Runnable::<()>::from_raw(this);
-                    // Poll the task.
-                    runnable.run();
-                })
-            };
-
-            // Send this job off to be executed. When this schedule function is
-            // called on a worker thread this re-schedules it onto the worker's
-            // local queue, which will generally cause tasks to stick to the
-            // same thread instead of jumping around randomly. This is also
-            // faster than injecting into the global queue.
-            thread_pool.with_worker(|worker| {
-                worker.enqueue(job_ref);
-            });
-        };
-
-        // SAFETY: We must ensure that the runnable does not outlive the data it
-        // closes over. In effect, this means it must not outlive `'scope`.
-        //
-        // This is ensured by the `scope_ptr` and the scope rules, which will
-        // keep the calling stack frame alive until the runnable is dropped,
-        // effectively extending the lifetime of `'scope` for as long as is
-        // nessicary.
-        //
-        // We have to use `spawn_unchecked` here instead of `spawn` because the
-        // future is non-static.
-        let (runnable, task) = unsafe { async_task::spawn_unchecked(future, schedule) };
-
-        // Call the schedule function once to create the initial job.
-        runnable.schedule();
-
-        // Return the task handle.
-        task
+    /// Panics if not called from within a worker.
+    pub fn spawn_on<T, S: ScopedSpawn<'scope, T>>(
+        &'scope self,
+        worker: &Worker,
+        scoped_work: S,
+    ) -> T {
+        scoped_work.spawn_on(worker, self)
     }
 
     /// Adds an additional reference to the scope's reference counter.
@@ -313,6 +269,109 @@ impl<'scope, 'env> Scope<'scope, 'env> {
 }
 
 // -----------------------------------------------------------------------------
+// Generalized scoped spawn trait
+
+/// Logic for spawning scoped work onto a thread pool.
+///
+/// This trait defines the behavior of [`Scope::spawn`] for various types.
+pub trait ScopedSpawn<'scope, T>: 'scope {
+    /// Spawns scoped work onto the thread pool.
+    fn spawn_on<'env>(self, worker: &Worker, scope: &'scope Scope<'scope, 'env>) -> T;
+}
+
+impl<'scope, F> ScopedSpawn<'scope, ()> for F
+where
+    F: FnOnce(&Worker) + Send + 'scope,
+{
+    #[inline]
+    fn spawn_on<'env>(self, worker: &Worker, scope: &'scope Scope<'scope, 'env>) {
+        // Create a job to execute the spawned function in the scope.
+        let scope_ptr = ScopePtr::new(scope);
+        let job = HeapJob::new(move |worker| {
+            // Catch any panics and store them on the scope.
+            let result = unwind::halt_unwinding(|| self(worker));
+            if let Err(err) = result {
+                scope_ptr.store_panic(err);
+            };
+            drop(scope_ptr);
+        });
+
+        // SAFETY: We must ensure that the heap job does not outlive the data it
+        // closes over. In effect, this means it must not outlive `'scope`.
+        //
+        // This is ensured by the `scope_ptr` and the scope rules, which will
+        // keep the calling stack frame alive until this job completes,
+        // effectively extending the lifetime of `'scope` for as long as is
+        // nessicary.
+        let job_ref = unsafe { job.into_job_ref() };
+
+        // Send the job to a queue to be executed.
+        worker.enqueue(job_ref);
+    }
+}
+
+impl<'scope, Fut, T> ScopedSpawn<'scope, Task<T>> for Fut
+where
+    Fut: Future<Output = T> + Send + 'scope,
+    T: Send,
+{
+    #[inline]
+    fn spawn_on<'env>(self, worker: &Worker, scope: &'scope Scope<'scope, 'env>) -> Task<T> {
+        // Embed the scope pointer into the future.
+        let scope_ptr = ScopePtr::new(scope);
+        let future = async move {
+            let result = self.await;
+            drop(scope_ptr);
+            result
+        };
+
+        // The schedule function will turn the future into a job when woken.
+        let thread_pool = worker.thread_pool();
+        let schedule = move |runnable: Runnable| {
+            // Turn the runnable into a job-ref that we can send to a worker.
+
+            // SAFETY: We provide a pointer to a non-null runnable, and we turn
+            // it back into a non-null runnable. The runnable will remain valid
+            // until the task is run.
+            let job_ref = unsafe {
+                JobRef::new_raw(runnable.into_raw(), |this, _| {
+                    let runnable = Runnable::<()>::from_raw(this);
+                    // Poll the task.
+                    runnable.run();
+                })
+            };
+
+            // Send this job off to be executed. When this schedule function is
+            // called on a worker thread this re-schedules it onto the worker's
+            // local queue, which will generally cause tasks to stick to the
+            // same thread instead of jumping around randomly. This is also
+            // faster than injecting into the global queue.
+            thread_pool.with_worker(|worker| {
+                worker.enqueue(job_ref);
+            });
+        };
+
+        // SAFETY: We must ensure that the runnable does not outlive the data it
+        // closes over. In effect, this means it must not outlive `'scope`.
+        //
+        // This is ensured by the `scope_ptr` and the scope rules, which will
+        // keep the calling stack frame alive until the runnable is dropped,
+        // effectively extending the lifetime of `'scope` for as long as is
+        // nessicary.
+        //
+        // We have to use `spawn_unchecked` here instead of `spawn` because the
+        // future is non-static.
+        let (runnable, task) = unsafe { async_task::spawn_unchecked(future, schedule) };
+
+        // Call the schedule function once to create the initial job.
+        runnable.schedule();
+
+        // Return the task handle.
+        task
+    }
+}
+
+// -----------------------------------------------------------------------------
 // Scope pointer
 
 mod scope_ptr {
@@ -377,12 +436,19 @@ mod scope_ptr {
 
 #[cfg(all(test, not(feature = "shuttle")))]
 mod tests {
+    use core::pin::Pin;
     use core::sync::atomic::AtomicU8;
     use core::sync::atomic::Ordering;
+    use core::task::Context;
+    use core::task::Poll;
 
     use crate::ThreadPool;
+    use crate::Worker;
     use crate::scope;
 
+    /// Test that it is possible to borrow local data within a scope, modify it,
+    /// and then read it later. This is mostly here to ensure stuff like this
+    /// compiles.
     #[test]
     fn scoped_borrow() {
         static THREAD_POOL: ThreadPool = ThreadPool::new();
@@ -391,39 +457,96 @@ mod tests {
         let mut string = "a";
         THREAD_POOL.with_worker(|worker| {
             scope(|scope| {
-                scope.spawn_on(worker, |_| {
+                scope.spawn_on(worker, |_: &Worker| {
                     string = "b";
-                })
+                });
             });
         });
         assert_eq!(string, "b");
+
+        THREAD_POOL.depopulate();
     }
 
+    /// Test that it is possible to borrow local data immutably within deeply
+    /// nested scopes. This is also mostly here to ensure stuff like this
+    /// compiles.
     #[test]
     fn scoped_borrow_twice() {
         static THREAD_POOL: ThreadPool = ThreadPool::new();
         THREAD_POOL.populate();
 
-        let mut string = "a";
+        let counter = AtomicU8::new(0);
         THREAD_POOL.with_worker(|worker| {
             scope(|scope| {
-                scope.spawn_on(worker, |worker| {
-                    string = "b";
-                    scope.spawn_on(worker, |_| {
-                        string = "c";
+                scope.spawn_on(worker, |_: &Worker| {
+                    counter.fetch_add(1, Ordering::Relaxed);
+                    scope.spawn(|_: &Worker| {
+                        counter.fetch_add(1, Ordering::Relaxed);
+                    });
+                });
+                scope.spawn_on(worker, |worker: &Worker| {
+                    counter.fetch_add(1, Ordering::Relaxed);
+                    scope.spawn_on(worker, |_: &Worker| {
+                        counter.fetch_add(1, Ordering::Relaxed);
                     })
                 })
             });
         });
-        assert_eq!(string, "c");
+        assert_eq!(counter.load(Ordering::Relaxed), 4);
+
+        THREAD_POOL.depopulate();
     }
 
+    /// This is a handy future that needs to be polled repeatedly before
+    /// resolving.
+    ///
+    /// Each time it is polled, it wakes itself (so it will be polled again) and
+    /// yields. It does this until it has been polled 128 times.
+    ///
+    /// This lets us test the behavior of scopes for sleeping tasks, to ensure
+    /// we do not return from the scope while tasks are still pending.
+    #[derive(Default)]
+    struct CountFuture {
+        /// The number of times the future has been polled.
+        count: usize,
+    }
+
+    impl Future for CountFuture {
+        type Output = ();
+
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            if self.count == 128 {
+                Poll::Ready(())
+            } else {
+                self.count += 1;
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+        }
+    }
+
+    /// Tests that we can spawn futures onto a scope, and that the scope really
+    /// does poll wait for the future to complete before returning.
+    #[test]
+    fn scoped_future() {
+        static THREAD_POOL: ThreadPool = ThreadPool::new();
+        THREAD_POOL.resize_to_available();
+
+        THREAD_POOL.with_worker(|worker| {
+            let task = worker.scope(|scope| scope.spawn_on(worker, CountFuture::default()));
+            assert!(task.is_finished());
+        });
+
+        THREAD_POOL.depopulate();
+    }
+
+    /// Tests that blocking functions like `join` can be nested within scopes.
     #[test]
     fn scoped_concurrency() {
         const NUM_JOBS: u8 = 128;
 
         static THREAD_POOL: ThreadPool = ThreadPool::new();
-        THREAD_POOL.resize_to(4);
+        THREAD_POOL.resize_to_available();
 
         let a = AtomicU8::new(0);
         let b = AtomicU8::new(0);
@@ -431,7 +554,7 @@ mod tests {
         THREAD_POOL.with_worker(|worker| {
             scope(|scope| {
                 for _ in 0..NUM_JOBS {
-                    scope.spawn_on(worker, |_| {
+                    scope.spawn_on(worker, |_: &Worker| {
                         THREAD_POOL.join(
                             |_| a.fetch_add(1, Ordering::Relaxed),
                             |_| b.fetch_add(1, Ordering::Relaxed),
@@ -443,6 +566,35 @@ mod tests {
 
         assert_eq!(a.load(Ordering::Relaxed), NUM_JOBS);
         assert_eq!(b.load(Ordering::Relaxed), NUM_JOBS);
+
+        THREAD_POOL.depopulate();
+    }
+
+    /// Tests that nesting two scopes on different workers will not deadlock.
+    #[test]
+    fn scoped_nesting() {
+        static THREAD_POOL: ThreadPool = ThreadPool::new();
+        THREAD_POOL.resize_to_available();
+
+        let mut string = "a";
+
+        THREAD_POOL.with_worker(|worker| {
+            worker.scope(|scope| {
+                scope.spawn_on(worker, |_: &Worker| {
+                    // Creating a new worker instead of reusing the old one is
+                    // bad form, but we may as well test it.
+                    THREAD_POOL.with_worker(|worker| {
+                        worker.scope(|scope| {
+                            scope.spawn_on(worker, |_: &Worker| {
+                                string = "b";
+                            });
+                        });
+                    });
+                });
+            });
+        });
+
+        assert_eq!(string, "b");
 
         THREAD_POOL.depopulate();
     }

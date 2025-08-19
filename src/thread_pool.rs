@@ -54,6 +54,7 @@ pub const HEARTBEAT_INTERVAL: Duration = Duration::from_micros(5);
 ///
 /// ```rust,no_run
 /// # use forte::ThreadPool;
+/// # use forte::Worker;
 /// // Allocate a new thread pool.
 /// static THREAD_POOL: ThreadPool = ThreadPool::new();
 ///
@@ -67,20 +68,20 @@ pub const HEARTBEAT_INTERVAL: Duration = Duration::from_micros(5);
 ///         // Spawn a job onto the pool. The closure also accepts a worker, because the
 ///         // job may be executed on a different thread. This will be the worker for whatever
 ///         // thread it executes on.
-///         worker.spawn(|worker| {
+///         worker.spawn(|worker: &Worker| {
 ///             // Spawn another job after this one runs, using the provided local worker.
-///             worker.spawn(|_| { });
+///             worker.spawn(|_: &Worker| { });
 ///             // Spawn another job using the thread pool directly (this will be slower).
-///             THREAD_POOL.spawn(|_| { });
+///             THREAD_POOL.spawn(|_: &Worker| { });
 ///             // Spawn a third job, which will automatically use the parent thread pool.
 ///             // This will also be slower than using the worker.
-///             forte::spawn(|_| { });
+///             forte::spawn(|_: &Worker| { });
 ///         });
 ///
 ///         // Spawn an async job, which can return a value through a `Future`. This does not
 ///         // provide access to a worker, because futures may move between threads while they
 ///         // are suspended.
-///         let task = THREAD_POOL.spawn_async(async || { "Hello World" });
+///         let task = THREAD_POOL.spawn(async { "Hello World" });
 ///
 ///         // Do two operations in parallel, and await the result of each. This is the most
 ///         // efficient and hyper-optimized thread pool operation.
@@ -112,13 +113,15 @@ pub const HEARTBEAT_INTERVAL: Duration = Duration::from_micros(5);
 /// space. More granular control is possible through other methods such as
 /// [`ThreadPool::grow`], [`ThreadPool::shrink`], or [`ThreadPool::resize_to`].
 pub struct ThreadPool {
-    /// The internal state of the thread pool. This mutex should only be
-    /// accessed infrequently.
+    /// The internal state of the thread pool
+    ///
+    /// This should only be locked infrequently for short periods of time in
+    /// cold functions.
     state: Mutex<ThreadPoolState>,
     /// A queue used for cooperatively sharing jobs between workers.
     shared_jobs: SegQueue<JobRef>,
     /// A condvar that is used to signal a new worker taking a lease on a seat.
-    new_participant: Condvar,
+    start_heartbeat: Condvar,
 }
 
 /// The internal state of a thread pool.
@@ -285,14 +288,15 @@ impl ThreadPool {
                 },
             }),
             shared_jobs: SegQueue::new(),
-            new_participant: Condvar::new(),
+            start_heartbeat: Condvar::new(),
         }
     }
 
     /// Claims a lease on the thread pool which can be occupied by a worker
     /// (using [`Worker::occupy`]), allowing a thread to participate in the pool.
+    #[cold]
     pub fn claim_lease(&'static self) -> Lease {
-        self.new_participant.notify_one();
+        self.start_heartbeat.notify_one();
         let mut state = self.state.lock().unwrap();
         state.claim_lease(self)
     }
@@ -440,45 +444,44 @@ impl ThreadPool {
             }
             // The size decreased
             cmp::Ordering::Less => {
-                let mut heartbeat_handle = None;
-
-                // Halt the heartbeat thread when scaling to zero.
-                if new_size == 0
-                    && let Some(control) = state.managed_threads.heartbeat.take()
-                {
-                    control.halt.store(true, Ordering::Relaxed);
-                    heartbeat_handle = Some(control.handle);
-                }
-
                 // Pull the workers we intend to halt out of the thread manager.
                 let terminating_workers = state.managed_threads.workers.split_off(new_size);
 
-                // Terminate the workers.
+                // Halt the heartbeat thread when scaling to zero.
+                let heartbeat_control = if new_size == 0 {
+                    state.managed_threads.heartbeat.take()
+                } else {
+                    None
+                };
+
+                // Terminate and wake the workers.
                 for worker in &terminating_workers {
                     // Tell the worker to halt.
                     worker.control.halt.store(true, Ordering::Relaxed);
+                    // Wake the worker up.
+                    state.seats[worker.index].data.sleep_controller.wake();
                 }
 
-                // Wake any sleeping workers to ensure they will eventually see the termination notice.
-                for seat in &state.seats {
-                    seat.data.sleep_controller.wake();
-                }
-
+                // Drop the lock on the state so as not to block the workers or heartbeat.
                 drop(state);
 
-                let own_lease = Worker::map_current(|worker| worker.lease.index);
+                // Determine our seat index.
+                let own_seat = Worker::map_current(|worker| worker.lease.index);
 
-                // Wait for the workers to fully halt.
+                // Wait for the other workers to fully halt.
                 for worker in terminating_workers {
                     // It's possible we may be trying to terminate ourselves, in
                     // which case we can skip the thread-join.
-                    if Some(worker.index) != own_lease {
+                    if Some(worker.index) != own_seat {
                         let _ = worker.control.handle.join();
                     }
                 }
 
-                if let Some(handle) = heartbeat_handle {
-                    let _ = handle.join();
+                // If we took control of the heartbeat, halt it after the workers.
+                if let Some(control) = heartbeat_control {
+                    control.halt.store(true, Ordering::Relaxed);
+                    self.start_heartbeat.notify_one();
+                    let _ = control.handle.join();
                 }
             }
         }
@@ -531,29 +534,60 @@ impl ThreadPool {
 }
 
 // -----------------------------------------------------------------------------
-// Thread pool scheduling api
+// Generalized spawn trait
 
-impl ThreadPool {
-    /// Spawns a job into the thread pool.
-    ///
-    /// See also: [`Worker::spawn`] and [`spawn`].
-    #[inline(always)]
-    pub fn spawn<F>(&'static self, f: F)
-    where
-        F: FnOnce(&Worker) + Send + 'static,
-    {
-        self.with_worker(|worker| worker.spawn(f));
+/// Logic for spawning work onto a thread pool.
+///
+/// This trait defines the behavior of [`ThreadPool::spawn`] for various types.
+pub trait Spawn<T> {
+    /// Spawns work onto the thread pool.
+    fn spawn(self, thread_pool: &'static ThreadPool, worker: Option<&Worker>) -> T;
+}
+
+impl<F> Spawn<()> for F
+where
+    F: for<'worker> FnOnce(&'worker Worker) + Send + 'static,
+{
+    #[inline]
+    fn spawn(self, thread_pool: &'static ThreadPool, worker: Option<&Worker>) {
+        // Allocate a new job on the heap to store the closure.
+        let job = HeapJob::new(self);
+
+        // Turn the job into an "owning" `JobRef` so it can be queued.
+        //
+        // SAFETY: All jobs added to the queue are guaranteed to be executed
+        // eventually, this is one of the core invariants of the thread pool.
+        // The closure `f` has a static lifetime, meaning it only closes over
+        // data that lasts for the duration of the program, so it's not possible
+        // for this job to outlive the data `f` closes over.
+        let job_ref = unsafe { job.into_job_ref() };
+
+        // Queue the job for evaluation
+        if let Some(worker) = worker {
+            worker.enqueue(job_ref);
+        } else {
+            thread_pool.shared_jobs.push(job_ref);
+        }
     }
+}
 
-    /// Spawns a future onto the thread pool.
-    ///
-    /// See also: [`Worker::spawn_future`] and [`spawn_future`].
-    #[inline(always)]
-    pub fn spawn_future<F, T>(&'static self, future: F) -> Task<T>
-    where
-        F: Future<Output = T> + Send + 'static,
-        T: Send + 'static,
-    {
+// Executes a raw pointer to a runnable as a job.
+#[inline(always)]
+fn execute_runnable(this: NonNull<()>, _worker: &Worker) {
+    // SAFETY: This pointer was created by the call to `Runnable::into_raw` just above.
+    let runnable = unsafe { Runnable::<()>::from_raw(this) };
+    // Poll the task. This will drop the future if the task is
+    // canceled or the future completes.
+    runnable.run();
+}
+
+impl<Fut, T> Spawn<Task<T>> for Fut
+where
+    Fut: Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    #[inline]
+    fn spawn(self, thread_pool: &'static ThreadPool, _worker: Option<&Worker>) -> Task<T> {
         // This function "schedules" work on the future, which in this case
         // pushing a `JobRef` that knows how to run it onto the local work queue.
         let schedule = move |runnable: Runnable| {
@@ -563,28 +597,18 @@ impl ThreadPool {
             // second allocation.
             let job_pointer = runnable.into_raw();
 
-            // Define a function to run the runnable that will be compatible with `JobRef`.
-            #[inline(always)]
-            fn execute_runnable(this: NonNull<()>, _worker: &Worker) {
-                // SAFETY: This pointer was created by the call to `Runnable::into_raw` just above.
-                let runnable = unsafe { Runnable::<()>::from_raw(this) };
-                // Poll the task. This will drop the future if the task is
-                // canceled or the future completes.
-                runnable.run();
-            }
-
             // SAFETY: The raw runnable pointer will remain valid until it is
             // used by `execute_runnable`, after which it will be dropped.
             let job_ref = unsafe { JobRef::new_raw(job_pointer, execute_runnable) };
 
             // Send this job off to be executed.
-            self.with_worker(|worker| {
+            thread_pool.with_worker(|worker| {
                 worker.enqueue(job_ref);
             });
         };
 
         // Creates a task from the future and schedule.
-        let (runnable, task) = async_task::spawn(future, schedule);
+        let (runnable, task) = async_task::spawn(self, schedule);
 
         // This calls the schedule function, pushing a `JobRef` for the future
         // onto the local work queue. If the future dosn't complete, it will
@@ -601,21 +625,18 @@ impl ThreadPool {
         // Return the task, which acts as a handle for this series of jobs.
         task
     }
+}
 
-    /// Spawns an async closure onto the thread pool.
+// -----------------------------------------------------------------------------
+// Thread pool scheduling api
+
+impl ThreadPool {
+    /// Spawns a job into the thread pool.
     ///
-    /// See also: [`Worker::spawn_async`] and [`spawn_async`].
-    #[inline(always)]
-    pub fn spawn_async<Fn, Fut, T>(&'static self, f: Fn) -> Task<T>
-    where
-        Fn: FnOnce() -> Fut + Send + 'static,
-        Fut: Future<Output = T> + Send + 'static,
-        T: Send + 'static,
-    {
-        // Wrap the function into a future using an async block.
-        let future = async move { f().await };
-        // We just pass this future to `spawn_future`.
-        self.spawn_future(future)
+    /// See also: [`Worker::spawn`] and [`spawn`].
+    #[inline]
+    pub fn spawn<T, S: Spawn<T>>(&'static self, work: S) -> T {
+        work.spawn(self, None)
     }
 
     /// Blocks the thread waiting for a future to complete.
@@ -687,7 +708,7 @@ thread_local! {
 pub struct Worker {
     migrated: Cell<bool>,
     lease: Lease,
-    pub(crate) queue: JobQueue,
+    queue: JobQueue,
     rng: XorShift64Star,
     // Make non-send
     _phantom: PhantomData<*const ()>,
@@ -813,6 +834,12 @@ impl Worker {
         self.lease.index
     }
 
+    /// Returns the index of the threadpool of the worker.
+    #[inline(always)]
+    pub fn thread_pool(&self) -> &'static ThreadPool {
+        self.lease.thread_pool
+    }
+
     /// Pushes a job onto the local queue, overflowing to the shared queue when
     /// full.
     #[inline(always)]
@@ -886,7 +913,7 @@ impl Worker {
         // workers deques, and finally to injected jobs from the outside. The
         // idea is to finish what we started before we take on something new.
         self.queue
-            .pop_back()
+            .pop_front()
             .map(|job| (job, false))
             .or_else(|| self.claim_shared_job().map(|job| (job, true)))
     }
@@ -904,7 +931,7 @@ impl Worker {
     /// worker. It will never claim shared work.
     #[inline(always)]
     pub fn yield_local(&self) -> Yield {
-        match self.queue.pop_back() {
+        match self.queue.pop_front() {
             Some(job_ref) => {
                 self.execute(job_ref, false);
                 Yield::Executed
@@ -953,91 +980,26 @@ impl Worker {
 // -----------------------------------------------------------------------------
 // Worker scheduling api
 
+/// # Scheduling API
 impl Worker {
-    /// Spawns a new closure onto the thread pool. Just like a standard thread,
-    /// this task is not tied to the current stack frame, and hence it cannot
-    /// hold any references other than those with 'static lifetime. If you want
-    /// to spawn a task that references stack data, use the
-    /// [`Worker::scope()`] function to create a scope.
+    /// Spawns work (a closure or future) onto the thread pool. Just like a
+    /// standard thread, this work executes concurrently (and potentially in
+    /// parallel) to the place where it is spawned. It is not tied to the
+    /// current stack frame, and hence it cannot hold any references other than
+    /// those with `'static` lifetime. If you want to spawn a task that
+    /// references stack data, use the [`scope`], [`ThreadPool::scope`] or
+    /// [`Worker::scope`] functions.
     ///
     /// Since tasks spawned with this function cannot hold references into the
     /// enclosing stack frame, you almost certainly want to use a move closure
     /// as their argument (otherwise, the closure will typically hold references
     /// to any variables from the enclosing function that you happen to use).
     ///
-    /// To spawn an async closure or future, use [`Worker::spawn_async`] or
-    /// [`Worker::spawn_future`]. To spawn a non-static closure, use
-    /// [`ThreadPool::scope`].
-    ///
     /// If you do not have access to a [`Worker`], you may call
     /// [`ThreadPool::spawn`] or simply [`spawn`].
-    #[inline(always)]
-    pub fn spawn<F>(&self, f: F)
-    where
-        F: FnOnce(&Worker) + Send + 'static,
-    {
-        // Allocate a new job on the heap to store the closure.
-        let job = HeapJob::new(f);
-
-        // Turn the job into an "owning" `JobRef` so it can be queued.
-        //
-        // SAFETY: All jobs added to the queue are guaranteed to be executed
-        // eventually, this is one of the core invariants of the thread pool.
-        // The closure `f` has a static lifetime, meaning it only closes over
-        // data that lasts for the duration of the program, so it's not possible
-        // for this job to outlive the data `f` closes over.
-        let job_ref = unsafe { job.into_job_ref() };
-
-        // Queue the `JobRef` on the worker so that it will be evaluated.
-        self.enqueue(job_ref);
-    }
-
-    /// Spawns a future onto the thread pool. See [`Worker::spawn`] for more
-    /// information about spawning jobs. Only static futures are supported
-    /// through this function, but you can use [`Worker::scope`] to get a scope
-    /// on which non-static futures and async tasks can be spawned.
-    ///
-    /// # Returns
-    ///
-    /// Spawning a future returns a [`Task`], which represents a handle to the async
-    /// computation and is itself a future that can be awaited to receive the
-    /// return value. There's four ways to interact with a task:
-    ///
-    /// 1. Await the task. This will eventually produce the output of the
-    ///    provided future.
-    ///
-    /// 2. Drop the task. This will stop execution of the future.
-    ///
-    /// 3. Cancel the task. This has the same effect as dropping the task, but
-    ///    waits until the future stops running (which can take a while).
-    ///
-    /// 4. Detach the task. This will allow the future to continue executing
-    ///    even after the task itself is dropped.
-    ///
-    /// If you do not have access to a [`Worker`], you may call
-    /// [`ThreadPool::spawn_future`] or simply [`spawn_future`].
-    #[inline(always)]
-    pub fn spawn_future<F, T>(&self, future: F) -> Task<T>
-    where
-        F: Future<Output = T> + Send + 'static,
-        T: Send + 'static,
-    {
-        self.lease.thread_pool.spawn_future(future)
-    }
-
-    /// Spawns an async closure onto the task pool. This is a simple wrapper
-    /// around [`Worker::spawn_future`].
-    ///
-    /// If you do not have access to a [`Worker`], you may call
-    /// [`ThreadPool::spawn_async`] or simply [`spawn_async`].
-    #[inline(always)]
-    pub fn spawn_async<Fn, Fut, T>(&self, f: Fn) -> Task<T>
-    where
-        Fn: FnOnce() -> Fut + Send + 'static,
-        Fut: Future<Output = T> + Send + 'static,
-        T: Send + 'static,
-    {
-        self.lease.thread_pool.spawn_async(f)
+    #[inline]
+    pub fn spawn<T, S: Spawn<T>>(&self, work: S) -> T {
+        work.spawn(self.lease.thread_pool, Some(self))
     }
 
     /// Polls a future to completion, then returns the outcome. This function
@@ -1188,49 +1150,11 @@ impl Worker {
 /// If there is no current thread pool, this panics.
 ///
 /// See also: [`Worker::spawn`] and [`ThreadPool::spawn`].
-pub fn spawn<F>(f: F)
-where
-    F: FnOnce(&Worker) + Send + 'static,
-{
+pub fn spawn<T, S: Spawn<T>>(work: S) -> T {
     Worker::with_current(|worker| {
         worker
             .expect("attempt to call `forte::spawn` from outside a thread pool")
-            .spawn(f);
-    });
-}
-
-/// Spawns a future onto the current thread pool.
-///
-/// If there is no current thread pool, this panics.
-///
-/// See also: [`Worker::spawn_future`] and [`ThreadPool::spawn_future`].
-pub fn spawn_future<F, T>(future: F) -> Task<T>
-where
-    F: Future<Output = T> + Send + 'static,
-    T: Send + 'static,
-{
-    Worker::with_current(|worker| {
-        worker
-            .expect("attempt to call `forte::spawn_future` from outside a thread pool")
-            .spawn_future(future)
-    })
-}
-
-/// Spawns an async closure onto the current thread pool.
-///
-/// If there is no current thread pool, this panics.
-///
-/// See also: [`Worker::spawn_async`] and [`ThreadPool::spawn_async`].
-pub fn spawn_async<Fn, Fut, T>(f: Fn) -> Task<T>
-where
-    Fn: FnOnce() -> Fut + Send + 'static,
-    Fut: Future<Output = T> + Send + 'static,
-    T: Send + 'static,
-{
-    Worker::with_current(|worker| {
-        worker
-            .expect("attempt to call `forte::spawn_async` from outside a thread pool")
-            .spawn_async(f)
+            .spawn(work)
     })
 }
 
@@ -1238,7 +1162,7 @@ where
 ///
 /// If there is no current thread pool, this panics.
 ///
-/// See also: [`Worker::spawn_future`] and [`ThreadPool::spawn_future`].
+/// See also: [`Worker::block_on`] and [`ThreadPool::block_on`].
 pub fn block_on<F, T>(future: F) -> T
 where
     F: Future<Output = T> + Send,
@@ -1302,13 +1226,14 @@ where
 ///
 /// ```
 /// # use forte::ThreadPool;
+/// # use forte::Worker;
 /// # static THREAD_POOL: ThreadPool = ThreadPool::new();
 /// # THREAD_POOL.populate();
 /// # THREAD_POOL.with_worker(|worker| {
 /// let ok: Vec<i32> = vec![1, 2, 3];
 /// forte::scope(|scope| {
 ///     let bad: Vec<i32> = vec![4, 5, 6];
-///     scope.spawn_on(worker, |_| {
+///     scope.spawn_on(worker, |_: &Worker| {
 ///         // Transfer ownership of `bad` into a local variable (also named `bad`).
 ///         // This will force the closure to take ownership of `bad` from the environment.
 ///         let bad = bad;
@@ -1316,7 +1241,7 @@ where
 ///         println!("bad: {:?}", bad); // refers to our local variable, above.
 ///     });
 ///
-///     scope.spawn_on(worker, |_| println!("ok: {:?}", ok)); // we too can borrow `ok`
+///     scope.spawn_on(worker, |_: &Worker| println!("ok: {:?}", ok)); // we too can borrow `ok`
 /// });
 /// # });
 /// ```
@@ -1328,20 +1253,21 @@ where
 ///
 /// ```rust
 /// # use forte::ThreadPool;
+/// # use forte::Worker;
 /// # static THREAD_POOL: ThreadPool = ThreadPool::new();
 /// # THREAD_POOL.populate();
 /// # THREAD_POOL.with_worker(|worker| {
 /// let ok: Vec<i32> = vec![1, 2, 3];
 /// forte::scope(|scope| {
 ///     let bad: Vec<i32> = vec![4, 5, 6];
-///     scope.spawn_on(worker, move |_| {
+///     scope.spawn_on(worker, move |_: &Worker| {
 ///         println!("ok: {:?}", ok);
 ///         println!("bad: {:?}", bad);
 ///     });
 ///
 ///     // That closure is fine, but now we can't use `ok` anywhere else,
 ///     // since it is owned by the previous task:
-///     // scope.spawn_on(worker, |_| println!("ok: {:?}", ok));
+///     // scope.spawn_on(worker, |_: &Worker| println!("ok: {:?}", ok));
 /// });
 /// # });
 /// ```
@@ -1353,6 +1279,7 @@ where
 ///
 /// ```rust
 /// # use forte::ThreadPool;
+/// # use forte::Worker;
 /// # static THREAD_POOL: ThreadPool = ThreadPool::new();
 /// # THREAD_POOL.populate();
 /// # THREAD_POOL.with_worker(|worker| {
@@ -1360,7 +1287,7 @@ where
 /// forte::scope(|scope| {
 ///     let bad: Vec<i32> = vec![4, 5, 6];
 ///     let ok: &Vec<i32> = &ok; // shadow the original `ok`
-///     scope.spawn_on(worker, move |_| {
+///     scope.spawn_on(worker, move |_: &Worker| {
 ///         println!("ok: {:?}", ok); // captures the shadowed version
 ///         println!("bad: {:?}", bad);
 ///     });
@@ -1369,7 +1296,7 @@ where
 ///     // can be shared freely. Note that we need a `move` closure here though,
 ///     // because otherwise we'd be trying to borrow the shadowed `ok`,
 ///     // and that doesn't outlive `scope`.
-///     scope.spawn_on(worker, move |_| println!("ok: {:?}", ok));
+///     scope.spawn_on(worker, move |_: &Worker| println!("ok: {:?}", ok));
 /// });
 /// # });
 /// ```
@@ -1379,13 +1306,14 @@ where
 ///
 /// ```rust
 /// # use forte::ThreadPool;
+/// # use forte::Worker;
 /// # static THREAD_POOL: ThreadPool = ThreadPool::new();
 /// # THREAD_POOL.populate();
 /// # THREAD_POOL.with_worker(|worker| {
 /// let ok: Vec<i32> = vec![1, 2, 3];
 /// forte::scope(|scope| {
 ///     let bad: Vec<i32> = vec![4, 5, 6];
-///     scope.spawn_on(worker, |_| {
+///     scope.spawn_on(worker, |_: &Worker| {
 ///         // Transfer ownership of `bad` into a local variable (also named `bad`).
 ///         // This will force the closure to take ownership of `bad` from the environment.
 ///         let bad = bad;
@@ -1393,7 +1321,7 @@ where
 ///         println!("bad: {:?}", bad); // refers to our local variable, above.
 ///     });
 ///
-///     scope.spawn_on(worker, |_| println!("ok: {:?}", ok)); // we too can borrow `ok`
+///     scope.spawn_on(worker, |_: &Worker| println!("ok: {:?}", ok)); // we too can borrow `ok`
 /// });
 /// # });
 /// ```
@@ -1405,6 +1333,7 @@ where
 ///
 /// ```compile_fail
 /// # use forte::ThreadPool;
+/// # use forte::Worker;
 /// # static THREAD_POOL: ThreadPool = ThreadPool::new();
 /// # THREAD_POOL.populate();
 /// # THREAD_POOL.with_worker(|worker| {
@@ -1421,16 +1350,18 @@ where
 ///
 /// ```
 /// # use forte::ThreadPool;
+/// # use forte::Worker;
 /// # static THREAD_POOL: ThreadPool = ThreadPool::new();
 /// # THREAD_POOL.populate();
 /// # THREAD_POOL.with_worker(|worker| {
 /// let mut counter = 0;
+/// let counter_ref = &mut counter;
 /// forte::scope(|scope| {
-///     scope.spawn_on(worker, |worker| {
-///         counter += 1;
+///     scope.spawn_on(worker, |worker: &Worker| {
+///         *counter_ref += 1;
 ///         // Note: we borrow the scope again here.
-///         scope.spawn_on(worker, |_| {
-///             counter += 1;
+///         scope.spawn_on(worker, move |_: &Worker| {
+///             *counter_ref += 1;
 ///         });
 ///     });
 /// });
@@ -1444,6 +1375,7 @@ where
 ///
 /// ```compile_fail
 /// # use forte::ThreadPool;
+/// # use forte::Worker;
 /// # static THREAD_POOL: ThreadPool = ThreadPool::new();
 /// # THREAD_POOL.populate();
 /// THREAD_POOL.with_worker(|worker| {
@@ -1500,7 +1432,7 @@ fn managed_worker(lease: Lease, halt: Arc<AtomicBool>, barrier: Arc<Barrier>) {
     // Register as the indicated worker, and work until we are told to halt.
     Worker::occupy(lease, |worker| {
         while !halt.load(Ordering::Relaxed) {
-            if let Some(job) = worker.queue.pop_back() {
+            if let Some(job) = worker.queue.pop_front() {
                 worker.execute(job, false);
                 continue;
             }
@@ -1574,7 +1506,7 @@ fn heartbeat_loop(thread_pool: &'static ThreadPool, halt: Arc<AtomicBool>) {
             thread::sleep(sleep_interval);
             state = thread_pool.state.lock().unwrap();
         } else {
-            state = thread_pool.new_participant.wait(state).unwrap();
+            state = thread_pool.start_heartbeat.wait(state).unwrap();
         }
     }
 }
@@ -1591,7 +1523,7 @@ mod tests {
     #[test]
     fn join_basic() {
         static THREAD_POOL: ThreadPool = ThreadPool::new();
-        THREAD_POOL.populate();
+        THREAD_POOL.resize_to_available();
 
         let mut a = 0;
         let mut b = 0;
@@ -1618,7 +1550,7 @@ mod tests {
         }
 
         static THREAD_POOL: ThreadPool = ThreadPool::new();
-        THREAD_POOL.populate();
+        THREAD_POOL.resize_to_available();
 
         let mut vals = [0; 1_024];
         THREAD_POOL.with_worker(|worker| increment(worker, &mut vals));
@@ -1646,11 +1578,11 @@ mod tests {
         }
 
         static THREAD_POOL: ThreadPool = ThreadPool::new();
-        THREAD_POOL.populate();
+        THREAD_POOL.resize_to_available();
 
-        let mut vals = vec![0; 1_024 * 1_024];
+        let mut vals = vec![0; 512 * 64];
         THREAD_POOL.with_worker(|worker| increment(worker, &mut vals));
-        assert_eq!(vals, vec![1; 1_024 * 1_024]);
+        assert_eq!(vals, vec![1; 512 * 64]);
 
         THREAD_POOL.depopulate();
     }
