@@ -73,6 +73,7 @@ mod platform {
     pub use alloc::sync::Arc;
     pub use alloc::sync::Weak;
     pub use core::sync::atomic::AtomicBool;
+    pub use core::sync::atomic::AtomicPtr;
     pub use core::sync::atomic::AtomicU32;
     pub use core::sync::atomic::Ordering;
     pub use std::sync::Barrier;
@@ -95,6 +96,7 @@ mod platform {
     pub use shuttle::sync::Mutex;
     pub use shuttle::sync::Weak;
     pub use shuttle::sync::atomic::AtomicBool;
+    pub use shuttle::sync::atomic::AtomicPtr;
     pub use shuttle::sync::atomic::AtomicU32;
     pub use shuttle::sync::atomic::Ordering;
     pub use shuttle::thread::Builder as ThreadBuilder;

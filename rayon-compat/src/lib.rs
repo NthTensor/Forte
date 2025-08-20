@@ -80,25 +80,40 @@ where
 // -----------------------------------------------------------------------------
 // Scope
 
-pub use forte::Scope;
+pub struct Scope<'scope, 'env> {
+    inner_scope: &'scope forte::Scope<'scope, 'env>,
+}
 
-#[inline(always)]
-pub fn scope<'scope, OP, R>(op: OP) -> R
-where
-    OP: FnOnce(&Scope<'scope>) -> R + Send,
-    R: Send,
-{
-    ensure_started();
-    forte::scope(op)
+impl<'scope, 'env> Scope<'scope, 'env> {
+    pub fn spawn<F>(self, f: F)
+    where
+        F: FnOnce(Scope<'scope, 'env>) + Send + 'scope,
+    {
+        forte::Worker::with_current(|worker| {
+            let worker = worker.unwrap();
+            let inner_scope = self.inner_scope;
+            inner_scope.spawn_on(worker, |_| f(Scope { inner_scope }))
+        });
+    }
 }
 
 #[inline(always)]
-pub fn in_place_scope<'scope, OP, R>(op: OP) -> R
+pub fn scope<'env, OP, R>(op: OP) -> R
 where
-    OP: FnOnce(&Scope<'scope>) -> R,
+    OP: for<'scope> FnOnce(Scope<'scope, 'env>) -> R + Send,
+    R: Send,
 {
     ensure_started();
-    forte::scope(op)
+    forte::scope(|inner_scope| op(Scope { inner_scope }))
+}
+
+#[inline(always)]
+pub fn in_place_scope<'env, OP, R>(op: OP) -> R
+where
+    OP: for<'scope> FnOnce(Scope<'scope, 'env>) -> R,
+{
+    ensure_started();
+    forte::scope(|inner_scope| op(Scope { inner_scope }))
 }
 
 // -----------------------------------------------------------------------------
