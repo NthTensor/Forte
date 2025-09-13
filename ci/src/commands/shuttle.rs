@@ -7,9 +7,9 @@ use crate::commands::ShuttleCheckCommand;
 use crate::commands::ShuttleClippyCommand;
 use crate::commands::ShuttleTestCommand;
 
-/// Alias for running the `loom-check`, `loom-clippy` and `loom-test` subcommands.
+/// Alias for running the `shuttle-check`, `shuttle-clippy` and `shuttle-test` subcommands.
 #[derive(FromArgs, Default)]
-#[argh(subcommand, name = "loom")]
+#[argh(subcommand, name = "shuttle")]
 pub struct ShuttleCommand {}
 
 impl Prepare for ShuttleCommand {
