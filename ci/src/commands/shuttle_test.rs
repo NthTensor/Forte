@@ -7,7 +7,7 @@ use crate::PreparedCommand;
 
 /// Runs the loom concurrency test suite.
 #[derive(FromArgs, Default)]
-#[argh(subcommand, name = "loom-test")]
+#[argh(subcommand, name = "shuttle-test")]
 pub struct ShuttleTestCommand {}
 
 impl Prepare for ShuttleTestCommand {

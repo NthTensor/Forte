@@ -1,15 +1,5 @@
 //! Comparative benchmarks against bevy_tasks
 
-struct BevyParChunks<'a, T>(core::slice::Chunks<'a, T>);
-impl<'a, T> bevy_tasks::ParallelIterator<core::slice::Iter<'a, T>> for BevyParChunks<'a, T>
-where
-    T: 'a + Send + Sync,
-{
-    fn next_batch(&mut self) -> Option<core::slice::Iter<'a, T>> {
-        self.0.next().map(|s| s.iter())
-    }
-}
-
 struct BevyParChunksMut<'a, T>(core::slice::ChunksMut<'a, T>);
 impl<'a, T> bevy_tasks::ParallelIterator<core::slice::IterMut<'a, T>> for BevyParChunksMut<'a, T>
 where
@@ -97,7 +87,7 @@ mod overhead {
 
         bencher.bench_local(|| {
             THREAD_POOL.with_worker(|worker| {
-                forte_chunks::<100, _, _>(worker, &mut vec, &|c| {
+                forte_chunks::<8, _, _>(worker, &mut vec, &|c| {
                     c.iter_mut().for_each(work);
                 });
             })

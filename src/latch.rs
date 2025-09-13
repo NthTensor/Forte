@@ -60,28 +60,21 @@ impl Latch {
     /// Waits for the latch to be set. In actuality, this may be woken.
     ///
     /// Returns true if the latch signal was received, and false otherwise.
-    #[inline(always)]
-    pub fn wait(&self) -> bool {
+    #[cold]
+    pub fn wait(&self) {
         // First, check if the latch has been set.
         //
         // In the event of a race with `set`:
         // + If this happens before the store, then we will go to sleep.
         // + If this happens after the store, then we notice and return.
         if self.state.load(Ordering::Relaxed) == SIGNAL {
-            return true;
+            return;
         }
         // If it has not been set, go to sleep.
         //
         // In the event of a race with `set`, the `wake` will always cause this
         // to return regardless of memory ordering.
-        let slept = self.sleep_controller.sleep();
-        // If we actually slept, check the status again to see if it has
-        // changed. Otherwise assume it hasn't.
-        if slept {
-            self.state.load(Ordering::Relaxed) == SIGNAL
-        } else {
-            false
-        }
+        self.sleep_controller.sleep();
     }
 
     /// Activates the latch, potentially unblocking the owning thread.
@@ -126,10 +119,12 @@ impl Latch {
 // Sleeper
 
 /// Used, in combination with a latch to park and unpark threads.
+#[cfg(not(feature = "shuttle"))]
 pub struct SleepController {
     state: AtomicU32,
 }
 
+#[cfg(not(feature = "shuttle"))]
 impl Default for SleepController {
     fn default() -> SleepController {
         SleepController {
@@ -138,12 +133,14 @@ impl Default for SleepController {
     }
 }
 
+#[cfg(not(feature = "shuttle"))]
 impl SleepController {
     // Attempt to wake the thread to which this belongs.
     //
     // Returns true if this allows the thread to make progress (by waking it up
     // or catching it before it goes to sleep) and false if the thread was
     // running.
+    #[inline(always)]
     pub fn wake(&self) -> bool {
         // Set set the state to SIGNAL and read the current state, which must be
         // either LOCKED or ASLEEP.
@@ -171,18 +168,18 @@ impl SleepController {
     //
     // Returns true if this thread makes a syscall to suspend the thread, and
     // false if the thread was already woken (letting us skip the syscall).
-    pub fn sleep(&self) -> bool {
+    #[cold]
+    pub fn sleep(&self) {
         // Set the state to ASLEEP and read the current state, which must be
         // either LOCKED or SIGNAL.
         let state = self.state.swap(ASLEEP, Ordering::Relaxed);
         // If the state is LOCKED, then we have not yet received a signal, and
         // we should try to put the thread to sleep. Otherwise we should return
         // early.
-        let sleep = state == LOCKED;
-        if sleep {
+        if state == LOCKED {
             // If we have received a signal since entering the sleep state
             // (meaning the state is not longer set to ASLEEP) then this will
-            // return emediately.
+            // return immediately.
             //
             // If the state is still ASLEEP, then the next call to `wake` will
             // register that and call `wake_on`.
@@ -193,7 +190,47 @@ impl SleepController {
         // Set the state back to LOCKED so that we are ready to receive new
         // signals.
         self.state.store(LOCKED, Ordering::Relaxed);
-        sleep
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Shuttle sleeper fallback
+
+/// This is a fallback implementation because the futex api is not available on
+/// shuttle.
+#[cfg(feature = "shuttle")]
+pub struct SleepController {
+    state: Mutex<u32>,
+    condvar: Condvar,
+}
+
+#[cfg(feature = "shuttle")]
+impl Default for SleepController {
+    fn default() -> SleepController {
+        SleepController {
+            state: Mutex::new(LOCKED),
+            condvar: Condvar::new(),
+        }
+    }
+}
+
+#[cfg(feature = "shuttle")]
+impl SleepController {
+    pub fn wake(&self) -> bool {
+        let state = core::mem::replace(&mut *self.state.lock().unwrap(), SIGNAL);
+        let asleep = state == ASLEEP;
+        if asleep {
+            self.condvar.notify_one();
+        }
+        asleep
+    }
+
+    pub fn sleep(&self) {
+        let mut state = self.state.lock().unwrap();
+        if *state == LOCKED {
+            *state = ASLEEP;
+            self.condvar.wait(state).unwrap();
+        }
     }
 }
 
