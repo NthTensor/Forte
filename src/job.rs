@@ -1,5 +1,5 @@
 //! This module defines an executable unit of work called a [`Job`]. Jobs are what
-//! get scheduled on the thread-pool. There are two core job types: [`StackJob`]
+//! get scheduled on the thread pool. There are two core job types: [`StackJob`]
 //! and [`HeapJob`].
 //!
 //! After a job is allocated, we typically refer to it by a [`JobRef`]. Job refs
@@ -87,8 +87,8 @@ impl JobRef {
     /// Returns an opaque handle that can be saved and compared, without making
     /// `JobRef` itself `Copy + Eq`.
     #[inline(always)]
-    pub fn id(&self) -> impl Eq + use<> {
-        (self.job_pointer, self.execute_fn)
+    pub fn id(&self) -> (usize, usize) {
+        (self.job_pointer.as_ptr() as usize, self.execute_fn as usize)
     }
 
     /// Executes the `JobRef` by passing the execute function on the job pointer.
@@ -117,7 +117,7 @@ impl JobQueue {
     }
 
     #[inline(always)]
-    pub fn push_back(&self, job_ref: JobRef) -> Option<JobRef> {
+    pub fn push(&self, job_ref: JobRef) -> Option<JobRef> {
         // SAFETY: The queue itself is only access mutably within `push_back`,
         // `pop_back` and `pop_front`. Since these functions never call each
         // other, we must have exclusive access to the queue.
@@ -130,7 +130,7 @@ impl JobQueue {
     }
 
     #[inline(always)]
-    pub fn pop_back(&self) -> Option<JobRef> {
+    pub fn pop_newest(&self) -> Option<JobRef> {
         // SAFETY: The queue itself is only access mutably within `push_back`,
         // `pop_back` and `pop_front`. Since these functions never call each
         // other, we must have exclusive access to the queue.
@@ -138,8 +138,23 @@ impl JobQueue {
         job_refs.pop_back()
     }
 
+    // Attempt to remove the given job-ref from the back of the queue.
     #[inline(always)]
-    pub fn pop_front(&self) -> Option<JobRef> {
+    pub fn recover_just_pushed(&self, id: (usize, usize)) -> bool {
+        // SAFETY: The queue itself is only access mutably within `push_back`,
+        // `pop_back` and `pop_front`. Since these functions never call each
+        // other, we must have exclusive access to the queue.
+        let job_refs = unsafe { &mut *self.job_refs.get() };
+        if job_refs.back().map(JobRef::id) == Some(id) {
+            let _ = job_refs.pop_back();
+            true
+        } else {
+            false
+        }
+    }
+
+    #[cold]
+    pub fn pop_oldest(&self) -> Option<JobRef> {
         // SAFETY: The queue itself is only access mutably within `push_back`,
         // `pop_back` and `pop_front`. Since these functions never call each
         // other, we must have exclusive access to the queue.
@@ -151,10 +166,7 @@ impl JobQueue {
 // -----------------------------------------------------------------------------
 // Stack allocated work function
 
-/// A [`StackJob`] is a job that's allocated on the stack. It's efficient, but
-/// relies on us preventing the stack frame from being dropped. Stack jobs are
-/// used mainly for `join` and other blocking thread pool operations. They
-/// also support explicit return values, transmitted via an attached signal.
+/// A [`StackJob`] is a job that's allocated on the stack.
 ///
 /// This is analogous to the chili type `JobStack` and the rayon type `StackJob`.
 pub struct StackJob<F, T> {
@@ -203,6 +215,13 @@ where
         unsafe { JobRef::new_raw(job_pointer, Self::execute) }
     }
 
+    /// Returns a reference to the latch embedded in this stack job. After this
+    /// latch is set, it becomes safe to call `StackJob::return_value`.
+    #[inline(always)]
+    pub fn completion_latch(&self) -> &Latch {
+        &self.completed
+    }
+
     /// Unwraps the stack job back into a closure. This allows the closure to be
     /// executed without indirection in situations where the one still has
     /// direct access.
@@ -211,27 +230,20 @@ where
     ///
     /// This may only be called before the job is executed.
     #[inline(always)]
-    pub unsafe fn unwrap(mut self) -> F {
+    pub unsafe fn unwrap(&mut self) -> F {
         // SAFETY: This will not be used again. Given that `execute` has not
         // already been, it will never be used twice.
         unsafe { ManuallyDrop::take(self.f.get_mut()) }
-    }
-
-    /// Returns a reference to the signal embedded in this stack job. The
-    /// closure's return value is sent over this signal after the job is
-    /// executed.
-    #[inline(always)]
-    pub fn completion_latch(&self) -> &Latch {
-        &self.completed
     }
 
     /// Unwraps the job into it's return value.
     ///
     /// # Safety
     ///
-    /// This may only be called after the job has finished executing.
+    /// This may only be called after the job has finished executing, and it's
+    /// latch has been set.
     #[inline(always)]
-    pub unsafe fn return_value(mut self) -> ThreadResult<T> {
+    pub unsafe fn return_value(&mut self) -> ThreadResult<T> {
         // Synchronize with the fence in `StackJob::execute`.
         fence(Ordering::Acquire);
         // Get a ref to the result.
@@ -315,11 +327,11 @@ where
     /// Converts the heap job into an "owning" `JobRef`. The job will be
     /// automatically dropped when the `JobRef` is executed.
     ///
-    /// # Safety
-    ///
     /// This will leak memory if the `JobRef` is not executed, so the caller
     /// must ensure that it is eventually executed (unless the process is
     /// exiting).
+    ///
+    /// # Safety
     ///
     /// If the `JobRef` is executed, the caller must ensure that it has not
     /// outlived the data it closes over. In other words, if the closure

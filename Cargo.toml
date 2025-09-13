@@ -68,10 +68,6 @@ missing_docs = "warn"
 unsafe_op_in_unsafe_fn = "warn"
 unused_qualifications = "warn"
 
-[[test]]
-name = "integration"
-path = "tests/tests.rs"
-
 [[bench]]
 name = "fork_join"
 harness = false
