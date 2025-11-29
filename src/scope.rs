@@ -135,7 +135,7 @@ impl<'scope, 'env> Scope<'scope, 'env> {
         let job_ref = unsafe { job.into_job_ref() };
 
         // Send the job to a queue to be executed.
-        worker.queue.push_back(job_ref);
+        worker.enqueue(job_ref);
     }
 
     /// Spawns a future onto the scope. This future will be asynchronously
@@ -198,7 +198,7 @@ impl<'scope, 'env> Scope<'scope, 'env> {
             // same thread instead of jumping around randomly. This is also
             // faster than injecting into the global queue.
             thread_pool.with_worker(|worker| {
-                worker.queue.push_back(job_ref);
+                worker.enqueue(job_ref);
             });
         };
 
