@@ -50,7 +50,6 @@ mod overhead {
         for i in 0..80 {
             black_box(i);
         }
-        // std::thread::sleep(Duration::from_nanos(100));
         black_box(value);
     }
 
@@ -97,7 +96,7 @@ mod overhead {
 
         bencher.bench_local(|| {
             THREAD_POOL.with_worker(|worker| {
-                forte_chunks::<100, _, _>(worker, &mut vec, &|c| {
+                forte_chunks::<8, _, _>(worker, &mut vec, &|c| {
                     c.iter_mut().for_each(work);
                 });
             })
