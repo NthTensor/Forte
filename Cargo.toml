@@ -8,7 +8,7 @@ repository = "https://github.com/NthTensor/Forte"
 
 [workspace]
 resolver = "2"
-members = ["ci", "rayon-compat"]
+members = ["ci"]
 
 [dependencies]
 arraydeque = "0.5.1"
@@ -67,10 +67,6 @@ alloc_instead_of_core = "warn"
 missing_docs = "warn"
 unsafe_op_in_unsafe_fn = "warn"
 unused_qualifications = "warn"
-
-[[test]]
-name = "integration"
-path = "tests/tests.rs"
 
 [[bench]]
 name = "fork_join"

@@ -1,7 +1,6 @@
 //! A benchmark for fork-join workloads adapted from `chili`.
 
 use chili::Scope;
-use criterion::black_box;
 use divan::Bencher;
 use forte::Worker;
 use tracing::info;
@@ -78,14 +77,8 @@ static COMPUTE: forte::ThreadPool = forte::ThreadPool::new();
 fn forte(bencher: Bencher, nodes: (usize, usize)) {
     fn sum(node: &Node, worker: &Worker) -> u64 {
         let (left, right) = worker.join(
-            |w| {
-                let sum = node.left.as_deref().map(|n| sum(n, w)).unwrap_or_default();
-                sum
-            },
-            |w| {
-                let sum = node.right.as_deref().map(|n| sum(n, w)).unwrap_or_default();
-                sum
-            },
+            |w| node.left.as_deref().map(|n| sum(n, w)).unwrap_or_default(),
+            |w| node.right.as_deref().map(|n| sum(n, w)).unwrap_or_default(),
         );
 
         node.val + left + right

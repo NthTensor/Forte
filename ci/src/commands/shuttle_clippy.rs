@@ -7,7 +7,7 @@ use crate::PreparedCommand;
 
 /// Checks for clippy warnings and errors in the loom test suite.
 #[derive(FromArgs, Default)]
-#[argh(subcommand, name = "loom-clippy")]
+#[argh(subcommand, name = "shuttle-clippy")]
 pub struct ShuttleClippyCommand {}
 
 impl Prepare for ShuttleClippyCommand {
