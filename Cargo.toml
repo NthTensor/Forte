@@ -26,6 +26,8 @@ divan = "0.1.17"
 rayon = "1.10.0"
 chili = "0.2"
 bevy_tasks = { version = "0.16.1", features = [ "multi_threaded" ] }
+# Used for some benchmarks
+dashmap = "6.1.0"
 # Used for A/B perf testing
 criterion = { version = "0.5" }
 
@@ -36,7 +38,7 @@ shuttle = ["dep:shuttle"]
 debug = true
 
 [profile.bench]
-debug = true
+opt-level = 3
 
 # Custom profile for shuttle tests: enable release optimizations so that the shuttle
 # tests are less slow, but don't disable debug assertions.
@@ -74,4 +76,12 @@ harness = false
 
 [[bench]]
 name = "bevy_tasks"
+harness = false
+
+[[bench]]
+name = "flood_fill"
+harness = false
+
+[[bench]]
+name = "flat_scope"
 harness = false
