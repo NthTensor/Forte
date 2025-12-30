@@ -85,11 +85,14 @@ mod overhead {
 
         THREAD_POOL.resize_to_available();
 
+        #[inline(always)]
+        fn handle_chunk(chunk: &mut [usize]) {
+            chunk.iter_mut().for_each(work);
+        }
+
         bencher.bench_local(|| {
             THREAD_POOL.with_worker(|worker| {
-                forte_chunks::<8, _, _>(worker, &mut vec, &|c| {
-                    c.iter_mut().for_each(work);
-                });
+                forte_chunks::<8, _, _>(worker, &mut vec, &handle_chunk);
             })
         });
     }

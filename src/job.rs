@@ -166,13 +166,17 @@ impl JobQueue {
 // -----------------------------------------------------------------------------
 // Stack allocated work function
 
+union StackJobData<F, T> {
+    func: ManuallyDrop<F>,
+    result: ManuallyDrop<ThreadResult<T>>,
+}
+
 /// A [`StackJob`] is a job that's allocated on the stack.
 ///
 /// This is analogous to the chili type `JobStack` and the rayon type `StackJob`.
 pub struct StackJob<F, T> {
-    f: UnsafeCell<ManuallyDrop<F>>,
     completed: Latch,
-    return_value: UnsafeCell<MaybeUninit<ThreadResult<T>>>,
+    data: StackJobData<F, T>,
 }
 
 impl<F, T> StackJob<F, T>
@@ -182,11 +186,12 @@ where
 {
     /// Creates a new `StackJob` owned by the current worker.
     #[inline(always)]
-    pub fn new(f: F, worker: &Worker) -> StackJob<F, T> {
+    pub fn new(func: F, worker: &Worker) -> StackJob<F, T> {
         StackJob {
-            f: UnsafeCell::new(ManuallyDrop::new(f)),
             completed: worker.new_latch(),
-            return_value: UnsafeCell::new(MaybeUninit::uninit()),
+            data: StackJobData {
+                func: ManuallyDrop::new(func),
+            },
         }
     }
 
@@ -231,9 +236,11 @@ where
     /// This may only be called before the job is executed.
     #[inline(always)]
     pub unsafe fn unwrap(&mut self) -> F {
+        // SAFETY: TODO
+        let func = unsafe { &mut self.data.func };
         // SAFETY: This will not be used again. Given that `execute` has not
         // already been, it will never be used twice.
-        unsafe { ManuallyDrop::take(self.f.get_mut()) }
+        unsafe { ManuallyDrop::take(func) }
     }
 
     /// Unwraps the job into it's return value.
@@ -246,12 +253,10 @@ where
     pub unsafe fn return_value(&mut self) -> ThreadResult<T> {
         // Synchronize with the fence in `StackJob::execute`.
         fence(Ordering::Acquire);
-        // Get a ref to the result.
-        let result_ref = self.return_value.get_mut();
-        // SAFETY: The job has completed, which means the return value must have
-        // been initialized. This consumes the job, so there's no chance of this
-        // accidentally duplicating data.
-        unsafe { result_ref.assume_init_read() }
+        // SAFETY: TODO
+        let result = unsafe { &mut self.data.result };
+        // SAFETY: TODO
+        unsafe { ManuallyDrop::take(result) }
     }
 }
 
@@ -273,7 +278,7 @@ where
     unsafe fn execute(this: NonNull<()>, worker: &Worker) {
         // SAFETY: The caller ensures `this` can be converted into an immutable
         // reference until we set the latch, and the latch has not yet been set.
-        let this = unsafe { this.cast::<Self>().as_ref() };
+        let this = unsafe { this.cast::<Self>().as_mut() };
         // Create an abort guard. If the closure panics, this will convert the
         // panic into an abort. Doing so prevents use-after-free for other elements of the stack.
         let abort_guard = unwind::AbortOnDrop;
@@ -281,18 +286,11 @@ where
         // `unwrap`. The latter cannot have been called because it consumes the
         // stack job. And since this function is called only once, we can
         // guarantee that we have exclusive access.
-        let f_ref = unsafe { &mut *this.f.get() };
-        // SAFETY: The caller ensures this function is called only once.
+        let f_ref = unsafe { &mut this.data.func };
+        // SAFETY: TODO
         let f = unsafe { ManuallyDrop::take(f_ref) };
         // Run the job. If the job panics, we propagate the panic back to the main thread.
-        let result = unwind::halt_unwinding(|| f(worker));
-        // Get the uninitialized memory where we should put the return value.
-        let return_value = this.return_value.get();
-        // SAFETY: The return value is only accessed here and in
-        // `StackJob::return_value`. Since the other method consumes the stack
-        // job, it's not possible for it to run concurrently. Therefore, we must
-        // have exclusive access to the return value.
-        unsafe { (*return_value).write(result) };
+        this.data.result = ManuallyDrop::new(unwind::halt_unwinding(|| f(worker)));
         // Latches do not participate in memory ordering, so we need to do this manually.
         fence(Ordering::Release);
         // SAFETY: The caller ensures the job is valid until the latch is set.
