@@ -69,6 +69,9 @@ pub struct ThreadPool {
     shared_jobs: SegQueue<JobRef>,
     /// A condvar that is used to signal a new worker taking a lease on a seat.
     start_heartbeat: Condvar,
+    /// Tracks the number of currently sleeping workers. Incremented when a
+    /// worker goes to sleep, decremented when a worker is woken.
+    num_sleeping: AtomicU32,
 }
 
 /// The internal state of a thread pool.
@@ -105,7 +108,7 @@ impl ThreadPoolState {
         let seat_data = Box::leak(Box::new(SeatData {
             #[cfg(not(feature = "shuttle"))]
             heartbeat: AtomicBool::new(true).into(),
-            sleep_controller: SleepController::default(),
+            sleep_controller: SleepController::new(&thread_pool.num_sleeping),
         }));
         let seat = Seat {
             occupied: true,
@@ -147,7 +150,7 @@ impl ThreadPoolState {
             let seat_data = Box::leak(Box::new(SeatData {
                 #[cfg(not(feature = "shuttle"))]
                 heartbeat: AtomicBool::new(true).into(),
-                sleep_controller: SleepController::default(),
+                sleep_controller: SleepController::new(&thread_pool.num_sleeping),
             }));
             let seat = Seat {
                 occupied: true,
@@ -242,6 +245,7 @@ impl ThreadPool {
             }),
             shared_jobs: SegQueue::new(),
             start_heartbeat: Condvar::new(),
+            num_sleeping: AtomicU32::new(0),
         }
     }
 
@@ -556,6 +560,7 @@ where
         if let Some(worker) = worker {
             worker.enqueue(job_ref);
         } else {
+            // Push the work into the share queue and wake a worker
             thread_pool.shared_jobs.push(job_ref);
         }
     }
@@ -849,11 +854,12 @@ impl Worker {
     #[inline(always)]
     pub fn enqueue(&self, job_ref: JobRef) {
         if let Some(job_ref) = self.queue.push(job_ref) {
+            // push the work to the shared queue
             self.lease.thread_pool.shared_jobs.push(job_ref);
         }
     }
 
-    // Try to promote the oldest task in the queue.
+    /// Try to promote the oldest task in the queue.
     #[inline(always)]
     fn promote(&self) {
         // Check for a heartbeat, potentially promoting the job we just pushed
@@ -874,16 +880,22 @@ impl Worker {
         }
     }
 
-    /// Tries to promote the oldest job in the local stack to a shared job. If
-    /// the local job queue is empty, or if the shared queue is full, this does
-    /// nothing. If the promotion is successful, it tries to wake another
-    /// thread to accept the shared work. This is lock free.
+    /// Pushes work onto the shared queue and wakes another worker.
     #[cold]
     fn promote_cold(&self, job_ref: JobRef) {
         // Push the job onto the shared queue.
         self.lease.thread_pool.shared_jobs.push(job_ref);
 
+        // Fetch the number of sleeping workers and pending shared tasks
+        let num_sleeping = self.lease.thread_pool.num_sleeping.load(Ordering::Relaxed);
+
+        if num_sleeping == 0 {
+            return;
+        }
+
         // Try to wake a worker to work on it.
+        //
+        // Note: This operation is extremely expensive, and should be avoided if possible.
         let seats = self.lease.thread_pool.state.lock().unwrap().seats.clone();
         let num_seats = seats.len();
         let offset = self.rng.next_usize(num_seats);
@@ -981,6 +993,9 @@ impl Worker {
     /// [`Worker::yield_local`] instead.
     #[inline(always)]
     pub fn yield_now(&self) -> Yield {
+        // Try to promote an item from the queue
+        self.promote();
+
         match self.find_work() {
             Some((job_ref, migrated)) => {
                 self.execute(job_ref, migrated);

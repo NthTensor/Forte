@@ -1,4 +1,10 @@
-//! A core concept in Rayon is the *latch*.
+//! A core concept in Rayon is the *latch*. Forte has borrowed this, in a
+//! somewhat simplified form.
+//!
+//! Every forte worker thread is has a single "sleep controller" that it uses to
+//! park and unpark itself. Latches build on this to create a simple boolean
+//! switch, which allows the owning thread to sleep until the latch becomes set
+//! by another thread.
 
 use core::{
     pin::Pin,
@@ -122,19 +128,20 @@ impl Latch {
 #[cfg(not(feature = "shuttle"))]
 pub struct SleepController {
     state: AtomicU32,
-}
-
-#[cfg(not(feature = "shuttle"))]
-impl Default for SleepController {
-    fn default() -> SleepController {
-        SleepController {
-            state: AtomicU32::new(LOCKED),
-        }
-    }
+    num_sleeping: &'static AtomicU32,
 }
 
 #[cfg(not(feature = "shuttle"))]
 impl SleepController {
+    /// Creates a new latch. Expects to be passed an atomic used for tracking
+    /// the number of sleeping workers.
+    pub fn new(num_sleeping: &'static AtomicU32) -> Self {
+        SleepController {
+            state: AtomicU32::new(LOCKED),
+            num_sleeping,
+        }
+    }
+
     // Attempt to wake the thread to which this belongs.
     //
     // Returns true if this allows the thread to make progress (by waking it up
@@ -143,10 +150,12 @@ impl SleepController {
     #[inline(always)]
     pub fn wake(&self) -> bool {
         // Set set the state to SIGNAL and read the current state, which must be
-        // either LOCKED or ASLEEP.
+        // either LOCKED, ASLEEP or SIGNAL.
         let sleep_state = self.state.swap(SIGNAL, Ordering::Relaxed);
         let asleep = sleep_state == ASLEEP;
         if asleep {
+            // Decrement the sleeping counter by one.
+            self.num_sleeping.fetch_sub(1, Ordering::Relaxed);
             // If the state was ASLEEP, the thread is either asleep or about to
             // go to sleep.
             //
@@ -160,6 +169,7 @@ impl SleepController {
             // Either way, after this call the other thread must make progress.
             atomic_wait::wake_one(&self.state);
         }
+        // Return true if the other thread was asleep
         asleep
     }
 
@@ -177,6 +187,8 @@ impl SleepController {
         // we should try to put the thread to sleep. Otherwise we should return
         // early.
         if state == LOCKED {
+            // Increase the sleeping count by one.
+            self.num_sleeping.fetch_add(1, Ordering::Relaxed);
             // If we have received a signal since entering the sleep state
             // (meaning the state is not longer set to ASLEEP) then this will
             // return immediately.
