@@ -17,7 +17,7 @@ atomic-wait = "1.1.0"
 crossbeam-queue = "0.3.12"
 crossbeam-utils = "0.8.21"
 shuttle = { version = "0.8.0", optional = true }
-tracing = { version = "0.1.41", features = ["release_max_level_off"] }
+tracing = "0.1.41"
 tracing-subscriber = "0.3.19"
 
 [dev-dependencies]
@@ -32,7 +32,9 @@ dashmap = "6.1.0"
 criterion = { version = "0.5" }
 
 [features]
+default = ["tracing_max_level_off"]
 shuttle = ["dep:shuttle"]
+tracing_max_level_off = ["tracing/release_max_level_off"]
 
 [profile.release]
 debug = true
