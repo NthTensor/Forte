@@ -23,3 +23,18 @@ Support for futures is based on an approach sketched out by members of the `rayo
 Forte is distributed under the terms of both the MIT license and the Apache License (Version 2.0).
 See LICENSE-APACHE and LICENSE-MIT for details.
 Opening a pull request is assumed to signal agreement with these licensing terms.
+
+## Shutdown semantics
+
+Heap-allocated jobs created via `HeapJob::into_job_ref` are owned by the
+job reference and will be dropped when executed. If a `JobRef` is placed
+into the shared injector but never executed (for example, if the pool is
+shut down before the job is drained) the allocation may be leaked. This is
+an intentional tradeoff to avoid adding complex bookkeeping to the fast
+path of job scheduling.
+
+If you need to ensure that all remaining shared jobs are executed (and thus
+freed) before shutdown, call `ThreadPool::drain_execute()` which will run
+remaining shared jobs on the calling thread. Note this drains only the
+shared injector queue; work that remains in other workers' local deques may
+not be reachable by this call.
