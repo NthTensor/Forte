@@ -647,6 +647,22 @@ impl ThreadPool {
         work.spawn(self, None)
     }
 
+    /// Drain and execute any remaining shared jobs on the calling thread.
+    ///
+    /// This is useful during shutdown if you want to ensure that heap-allocated
+    /// jobs are actually executed (and therefore dropped) rather than being
+    /// leaked in the shared queue. This will claim a temporary worker for the
+    /// current thread and execute items from the shared queue until it is
+    /// empty. Note that this only drains the shared injector queue; jobs that
+    /// remain in other workers' local deques cannot be accessed here.
+    pub fn drain_execute(&'static self) {
+        self.with_worker(|worker| {
+            while let Some(job_ref) = self.shared_jobs.pop() {
+                worker.execute(job_ref, true);
+            }
+        })
+    }
+
     /// Blocks the thread waiting for a future to complete.
     ///
     /// See also: [`Worker::block_on`] and [`block_on`].
