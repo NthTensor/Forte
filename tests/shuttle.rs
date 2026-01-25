@@ -48,13 +48,9 @@ where
         let thread_pool = Box::new(ThreadPool::new());
         let thread_pool_ptr = Box::into_raw(thread_pool);
 
-        // SAFETY: TODO
+        // SAFETY: This thread pool is never dropped.
         let thread_pool_ref = unsafe { &*thread_pool_ptr };
         f(thread_pool_ref);
-
-        // SAFETY: TODO
-        let thread_pool = unsafe { Box::from_raw(&mut *thread_pool_ptr) };
-        drop(thread_pool);
     }
 }
 

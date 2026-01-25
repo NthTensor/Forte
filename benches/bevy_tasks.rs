@@ -40,12 +40,11 @@ mod overhead {
         for i in 0..80 {
             black_box(i);
         }
-        // std::thread::sleep(Duration::from_nanos(100));
         black_box(value);
     }
 
     #[divan::bench(args = LEN)]
-    fn serial(bencher: Bencher, len: usize) {
+    fn baseline(bencher: Bencher, len: usize) {
         let mut vec: Vec<_> = (0..len).collect();
         bencher.bench_local(|| vec.iter_mut().for_each(work));
     }
@@ -83,11 +82,9 @@ mod overhead {
 
         let mut vec: Vec<_> = (0..len).collect();
 
-        THREAD_POOL.resize_to_available();
-
         bencher.bench_local(|| {
             THREAD_POOL.with_worker(|worker| {
-                forte_chunks::<8, _, _>(worker, &mut vec, &|c| {
+                forte_chunks::<64, _, _>(worker, &mut vec, &|c| {
                     c.iter_mut().for_each(work);
                 });
             })
@@ -96,5 +93,7 @@ mod overhead {
 }
 
 fn main() {
+    THREAD_POOL.resize_to_available();
+
     divan::main();
 }

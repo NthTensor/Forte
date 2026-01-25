@@ -12,7 +12,7 @@
 //! (c) Each job reference is executed exactly once.
 
 use alloc::boxed::Box;
-use arraydeque::ArrayDeque;
+use alloc::collections::VecDeque;
 use core::cell::UnsafeCell;
 use core::mem::{ManuallyDrop, MaybeUninit};
 use core::ptr::NonNull;
@@ -106,13 +106,13 @@ unsafe impl Send for JobRef {}
 // Job queue
 
 pub struct JobQueue {
-    job_refs: UnsafeCell<ArrayDeque<JobRef, 64>>,
+    job_refs: UnsafeCell<VecDeque<JobRef>>,
 }
 
 impl JobQueue {
     pub fn new() -> JobQueue {
         JobQueue {
-            job_refs: UnsafeCell::new(ArrayDeque::new()),
+            job_refs: UnsafeCell::new(VecDeque::new()),
         }
     }
 
@@ -122,11 +122,8 @@ impl JobQueue {
         // `pop_back` and `pop_front`. Since these functions never call each
         // other, we must have exclusive access to the queue.
         let job_refs = unsafe { &mut *self.job_refs.get() };
-        if let Err(full) = job_refs.push_back(job_ref) {
-            Some(full.element)
-        } else {
-            None
-        }
+        job_refs.push_back(job_ref);
+        None
     }
 
     #[inline(always)]

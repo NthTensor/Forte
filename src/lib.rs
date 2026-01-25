@@ -274,7 +274,6 @@ mod platform {
     pub use core::sync::atomic::AtomicU32;
     pub use core::sync::atomic::Ordering;
     pub use std::sync::Barrier;
-    pub use std::sync::Condvar;
     pub use std::sync::Mutex;
     pub use std::thread::Builder as ThreadBuilder;
     pub use std::thread::JoinHandle;
@@ -289,7 +288,6 @@ mod platform {
 
     pub use shuttle::sync::Arc;
     pub use shuttle::sync::Barrier;
-    pub use shuttle::sync::Condvar;
     pub use shuttle::sync::Mutex;
     pub use shuttle::sync::Weak;
     pub use shuttle::sync::atomic::AtomicBool;
