@@ -86,9 +86,29 @@ fn forte(bencher: Bencher, nodes: (usize, usize)) {
 
     let tree = Node::tree(nodes.0);
 
-    COMPUTE.with_worker(|worker| {
+    COMPUTE.expect_worker(|worker| {
         info!("Staring Benchmark");
         bencher.bench_local(move || {
+            assert_eq!(sum(&tree, worker), nodes.1 as u64);
+        });
+    });
+}
+
+#[divan::bench(args = nodes())]
+fn throughput_forte(bencher: Bencher, nodes: (usize, usize)) {
+    fn sum(node: &Node, worker: &Worker) -> u64 {
+        let (left, right) = worker.join(
+            |w| node.left.as_deref().map(|n| sum(n, w)).unwrap_or_default(),
+            |w| node.right.as_deref().map(|n| sum(n, w)).unwrap_or_default(),
+        );
+
+        node.val + left + right
+    }
+
+    info!("Staring Benchmark");
+    bencher.bench(|| {
+        COMPUTE.expect_worker(|worker| {
+            let tree = Node::tree(nodes.0);
             assert_eq!(sum(&tree, worker), nodes.1 as u64);
         });
     });
@@ -114,6 +134,24 @@ fn chili(bencher: Bencher, nodes: (usize, usize)) {
 }
 
 #[divan::bench(args = nodes())]
+fn thrughput_chili(bencher: Bencher, nodes: (usize, usize)) {
+    fn sum(node: &Node, scope: &mut Scope<'_>) -> u64 {
+        let (left, right) = scope.join(
+            |s| node.left.as_deref().map(|n| sum(n, s)).unwrap_or_default(),
+            |s| node.right.as_deref().map(|n| sum(n, s)).unwrap_or_default(),
+        );
+
+        node.val + left + right
+    }
+
+    bencher.bench(move || {
+        let tree = Node::tree(nodes.0);
+        let mut scope = Scope::global();
+        assert_eq!(sum(&tree, &mut scope), nodes.1 as u64);
+    });
+}
+
+#[divan::bench(args = nodes())]
 fn rayon(bencher: Bencher, nodes: (usize, usize)) {
     fn sum(node: &Node) -> u64 {
         let (left, right) = rayon::join(
@@ -127,6 +165,23 @@ fn rayon(bencher: Bencher, nodes: (usize, usize)) {
     let tree = Node::tree(nodes.0);
 
     bencher.bench_local(move || {
+        assert_eq!(sum(&tree), nodes.1 as u64);
+    });
+}
+
+#[divan::bench(args = nodes())]
+fn throughput_rayon(bencher: Bencher, nodes: (usize, usize)) {
+    fn sum(node: &Node) -> u64 {
+        let (left, right) = rayon::join(
+            || node.left.as_deref().map(sum).unwrap_or_default(),
+            || node.right.as_deref().map(sum).unwrap_or_default(),
+        );
+
+        node.val + left + right
+    }
+
+    bencher.bench(move || {
+        let tree = Node::tree(nodes.0);
         assert_eq!(sum(&tree), nodes.1 as u64);
     });
 }

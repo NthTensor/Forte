@@ -1,6 +1,8 @@
 //! A benchmark for fork-join workloads adapted from `chili`.
 
-use std::hash::{DefaultHasher, Hash, Hasher};
+use std::hash::DefaultHasher;
+use std::hash::Hash;
+use std::hash::Hasher;
 
 use criterion::black_box;
 use divan::Bencher;
@@ -37,7 +39,7 @@ static COMPUTE: forte::ThreadPool = forte::ThreadPool::new();
 fn forte(bencher: Bencher, size: usize) {
     use forte::Worker;
 
-    COMPUTE.with_worker(|worker| {
+    COMPUTE.expect_worker(|worker| {
         bencher.bench_local(|| {
             worker.scope(|scope| {
                 for i in 0..size {

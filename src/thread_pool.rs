@@ -2,11 +2,13 @@
 
 use alloc::boxed::Box;
 use alloc::format;
-use alloc::string::ToString;
 use alloc::vec::Vec;
+use core::array;
+use core::borrow::Borrow;
 use core::cell::Cell;
 use core::cmp;
 use core::future::Future;
+use core::hint::cold_path;
 use core::marker::PhantomData;
 use core::num::NonZero;
 use core::pin::pin;
@@ -14,16 +16,20 @@ use core::ptr;
 use core::ptr::NonNull;
 use core::task::Context;
 use core::task::Poll;
-use crossbeam_queue::SegQueue;
-use crossbeam_utils::CachePadded;
 
 use async_task::Runnable;
+use crossbeam_queue::SegQueue;
+use crossbeam_utils::CachePadded;
+use st3::StealError;
+use st3::lifo::Stealer;
+use st3::lifo::Worker as Sharer;
 use tracing::debug;
 use tracing::trace;
 use tracing::trace_span;
 
 use crate::FnOnceMarker;
 use crate::FutureMarker;
+use crate::job::ExternalJob;
 use crate::job::HeapJob;
 use crate::job::JobQueue;
 use crate::job::JobRef;
@@ -49,7 +55,8 @@ use crate::util::XorShift64Star;
 /// # use forte::Worker;
 /// static THREAD_POOL: ThreadPool = ThreadPool::new();
 /// ```
-/// Thread pools are empty when created, and must be explicitly resized at runtime.
+/// Thread pools are empty when created, and must be explicitly resized at
+/// runtime.
 /// ```
 /// # use forte::ThreadPool;
 /// # use forte::Worker;
@@ -60,144 +67,58 @@ use crate::util::XorShift64Star;
 /// [`spawn`][ThreadPool::spawn], [`block_on`][ThreadPool::block_on],
 /// [`join`][ThreadPool::join], or [`scope`][ThreadPool::scope].
 pub struct ThreadPool {
-    /// The internal state of the thread pool
-    ///
-    /// This should only be locked infrequently for short periods of time in
-    /// cold functions.
-    state: Mutex<ThreadPoolState>,
-    /// A queue used for cooperatively sharing jobs between workers.
+    /// A bit-set that tracks which seats are occupied.
+    occupied: CachePadded<AtomicU32>,
+    /// A bit-set that tracks which seats are sleeping.
+    sleeping: CachePadded<AtomicU32>,
+    /// Holds shared data for each thread participating in the pool.
+    seats: OnceLock<Box<Seats>>,
+    /// Holds controls for threads spawned and managed by the pool. Initalized
+    /// on first call to `occupy`, to allow for some non-static constructors.
+    managed_threads: Mutex<ManagedThreads>,
+    /// Used to inject external work into the thread pool. This is generally
+    /// treated as a fallback, for when the thread-pool is at capacity and
+    /// threads can't register themselves as workers.
     shared_jobs: SegQueue<JobRef>,
-    /// A condvar that is used to signal a new worker taking a lease on a seat.
-    start_heartbeat: Condvar,
-    /// Tracks the number of currently sleeping workers. Incremented when a
-    /// worker goes to sleep, decremented when a worker is woken.
-    num_sleeping: AtomicU32,
 }
 
-/// The internal state of a thread pool.
-struct ThreadPoolState {
-    /// The registry of seats. These seats may be "leased out" to different
-    /// threads temporarily, and will be re-used. The seats themselves are
-    /// leaked, and will never move or be deallocated.
-    seats: Vec<Seat>,
-    /// Threads managed directly by this thread pool.
-    managed_threads: ManagedThreads,
+/// A public interface that can be temporarily claimed and used by a thread.
+/// Claiming a seat allows a thread to participate in the thread pool as a
+/// worker.
+pub(crate) struct Seats {
+    /// The sharing side of each seat's work-stealing queue. These should only
+    /// ever be accessed by the thread that currently owns the lease for this
+    /// seat (to ensure the `!Sync` bound is respected).
+    sharers: [Sharer<JobRef>; 32],
+    /// The stealing side of each seat's work-stealing queue.
+    stealers: [Stealer<JobRef>; 32],
+    /// The sleep/wake controller for each seat.
+    sleep_controllers: [SleepController; 32],
 }
 
-impl ThreadPoolState {
-    /// Claims a lease on the thread pool. A lease can be passed to
-    /// [`Worker::occupy`] to enter a worker context for the thread pool.
-    ///
-    /// There are a finite number of leases available on each pool. If they are
-    /// already claimed, this returns `None`.
-    fn claim_lease(&mut self, thread_pool: &'static ThreadPool) -> Lease {
-        // First try to claim an unoccupied seat.
-        for (index, seat) in self.seats.iter_mut().enumerate() {
-            if !seat.occupied {
-                seat.occupied = true;
-                return Lease {
-                    thread_pool,
-                    index,
-                    seat_data: seat.data,
-                };
-            }
-        }
-
-        // If none are available, add a new seat.
-        let index = self.seats.len();
-        let seat_data = Box::leak(Box::new(SeatData {
-            #[cfg(not(feature = "shuttle"))]
-            heartbeat: AtomicBool::new(true).into(),
-            sleep_controller: SleepController::new(&thread_pool.num_sleeping),
-        }));
-        let seat = Seat {
-            occupied: true,
-            data: seat_data,
-        };
-        self.seats.push(seat);
-        Lease {
-            thread_pool,
-            index,
-            seat_data,
-        }
-    }
-
-    /// Attempts to claim several leases at once. See
-    /// [`ThreadPool::claim_lease`] for more information. If no leases are
-    /// available, this returns an empty vector.
-    fn claim_leases(&mut self, thread_pool: &'static ThreadPool, num: usize) -> Vec<Lease> {
-        let mut leases = Vec::with_capacity(num);
-
-        // First try to claim unoccupied seats.
-        for (index, seat) in self.seats.iter_mut().enumerate() {
-            if leases.len() == num {
-                return leases;
-            }
-
-            if !seat.occupied {
-                seat.occupied = true;
-                leases.push(Lease {
-                    thread_pool,
-                    index,
-                    seat_data: seat.data,
-                });
-            }
-        }
-
-        // Then create new seats as needed.
-        while leases.len() != num {
-            let index = self.seats.len();
-            let seat_data = Box::leak(Box::new(SeatData {
-                #[cfg(not(feature = "shuttle"))]
-                heartbeat: AtomicBool::new(true).into(),
-                sleep_controller: SleepController::new(&thread_pool.num_sleeping),
-            }));
-            let seat = Seat {
-                occupied: true,
-                data: seat_data,
-            };
-            self.seats.push(seat);
-            leases.push(Lease {
-                thread_pool,
-                index,
-                seat_data,
-            });
-        }
-
-        leases
-    }
-}
-
-#[derive(Clone)]
-struct Seat {
-    occupied: bool,
-    data: &'static SeatData,
-}
-
-/// A public interface that can be claimed and used by a worker.
-struct SeatData {
-    /// The heartbeat signal sent to the worker.
-    #[cfg(not(feature = "shuttle"))]
-    heartbeat: CachePadded<AtomicBool>,
-    /// Allows other threads to wake the worker.
-    sleep_controller: SleepController,
-}
+// SAFETY: `stealers` are `Send + Sync` by their own bounds. `workers[i]` is
+// only ever accessed by the single thread holding seat `i`'s occupancy lease;
+// the `occupied` bitmask in `ThreadPool` enforces that exclusivity.
+unsafe impl Sync for Seats {}
 
 /// A lease represents ownership of one of a "seats" in a thread pool, and
 /// allows the owning thread to participate in that pool as a worker.
 pub struct Lease {
     /// The thread pool against which this lease is held.
     thread_pool: &'static ThreadPool,
-    /// The index of the claimed seat.
-    index: usize,
-    /// The seat being claimed by this lease.
-    seat_data: &'static SeatData,
+    /// The index of the seat in the data list
+    seat_number: usize,
+    /// A reference to the pre-initalized seat data (to avoid repeated hits of
+    /// the `OnceLock`).
+    seats: &'static Seats,
 }
 
 impl Drop for Lease {
     fn drop(&mut self) {
-        let mut state = self.thread_pool.state.lock().unwrap();
-        state.seats[self.index].occupied = false;
+        // Unset the occupied bit for this seat
+        self.thread_pool
+            .occupied
+            .fetch_and(!(1 << self.seat_number), Ordering::Relaxed);
     }
 }
 
@@ -205,16 +126,13 @@ impl Drop for Lease {
 struct ManagedThreads {
     /// Stores thread controls for workers spawned by the pool.
     workers: Vec<ManagedWorker>,
-    /// Stores thread controls for the heartbeat thread.
-    #[cfg(not(feature = "shuttle"))]
-    heartbeat: Option<ThreadControl>,
 }
 
 /// Represents a worker thread that is managed by the pool, as opposed to
 /// external threads which temporarily participate in the pool.
 struct ManagedWorker {
     /// The index of this worker in the public worker info list.
-    index: usize,
+    seat_number: usize,
     /// Controls used to manage the lifecycle of the worker.
     control: ThreadControl,
 }
@@ -234,28 +152,114 @@ struct ThreadControl {
 impl ThreadPool {
     /// Creates a new thread pool.
     pub const fn new() -> ThreadPool {
+        // Create the pool itself.
         ThreadPool {
-            state: Mutex::new(ThreadPoolState {
-                seats: Vec::new(),
-                managed_threads: ManagedThreads {
-                    workers: Vec::new(),
-                    #[cfg(not(feature = "shuttle"))]
-                    heartbeat: None,
-                },
+            seats: OnceLock::new(),
+            occupied: CachePadded::new(AtomicU32::new(0)),
+            sleeping: CachePadded::new(AtomicU32::new(0)),
+            managed_threads: Mutex::new(ManagedThreads {
+                workers: Vec::new(),
             }),
             shared_jobs: SegQueue::new(),
-            start_heartbeat: Condvar::new(),
-            num_sleeping: AtomicU32::new(0),
         }
+    }
+
+    /// Returns the pre-allocated steal queues, initializing them on the first call.
+    fn get_seats(&'static self) -> &'static Seats {
+        self.seats.get_or_init(|| {
+            let sharers: [Sharer<JobRef>; 32] =
+                array::from_fn(|_| Sharer::new(Worker::STEAL_QUEUE_CAPACITY));
+            let stealers: [Stealer<JobRef>; 32] = array::from_fn(|i| sharers[i].stealer());
+            let sleep_controllers = array::from_fn(|_| SleepController::new());
+            Box::new(Seats {
+                sharers,
+                stealers,
+                sleep_controllers,
+            })
+        })
+    }
+
+    /// Adds a job ref to the shared queue.
+    pub fn queue_shared_job(&'static self, job_ref: JobRef) {
+        self.shared_jobs.push(job_ref);
     }
 
     /// Claims a lease on the thread pool which can be occupied by a worker
     /// (using [`Worker::occupy`]), allowing a thread to participate in the pool.
+    ///
+    /// Returns none if all seats are occupied.
     #[cold]
-    pub fn claim_lease(&'static self) -> Lease {
-        self.start_heartbeat.notify_one();
-        let mut state = self.state.lock().unwrap();
-        state.claim_lease(self)
+    pub fn claim_lease(&'static self) -> Option<Lease> {
+        loop {
+            let occupied = self.occupied.load(Ordering::Relaxed);
+            if occupied == u32::MAX {
+                return None;
+            }
+            let seat_number = occupied.trailing_ones() as usize;
+            let mask = 1 << seat_number;
+            if self.occupied.fetch_or(mask, Ordering::Relaxed) & mask == 0 {
+                // At this point we have acquired the lease on the seat
+                return Some(Lease {
+                    thread_pool: self,
+                    seat_number,
+                    seats: self.get_seats(),
+                });
+            }
+        }
+    }
+
+    /// Claims up to `n` leases at once in a single atomic transaction.
+    ///
+    /// Finds up to `n` free seats, then atomically claims all of them with a
+    /// single `compare_exchange`. Either every selected seat is claimed together
+    /// or none are (and the loop retries). Returns between 0 and `n` leases;
+    /// returns an empty `Vec` when `n` is 0 or the pool is full.
+    #[cold]
+    pub fn claim_leases(&'static self, n: usize) -> Vec<Lease> {
+        if n == 0 {
+            return Vec::new();
+        }
+        let seats = self.get_seats();
+        loop {
+            let occupied = self.occupied.load(Ordering::Relaxed);
+            if occupied == u32::MAX {
+                return Vec::new();
+            }
+
+            // Build a mask of up to `n` free seats by walking the complement.
+            let mut claimed_seats = 0;
+            let mut free_seats = !occupied;
+            for _ in 0..n {
+                if free_seats == 0 {
+                    break;
+                }
+                let seat_bit = free_seats & free_seats.wrapping_neg(); // isolate lowest set bit
+                claimed_seats |= seat_bit;
+                free_seats &= !seat_bit;
+            }
+
+            // Attempt to claim all selected seats in one atomic step.
+            match self.occupied.compare_exchange(
+                occupied,
+                occupied | claimed_seats,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    return (0..32)
+                        .filter(|&i| claimed_seats & (1 << i) != 0)
+                        .map(|seat_number| Lease {
+                            thread_pool: self,
+                            seat_number: seat_number as usize,
+                            seats,
+                        })
+                        .collect();
+                }
+                Err(_) => {
+                    // Another thread modified `occupied`; retry.
+                }
+            }
+        }
     }
 
     /// Returns an opaque identifier for this thread pool.
@@ -268,40 +272,7 @@ impl ThreadPool {
     /// Returns the number of workers participating in this thread pool.
     #[inline(always)]
     pub fn num_workers(&self) -> usize {
-        todo!()
-    }
-
-    /// Tries to ensure the calling thread is a member of the thread pool, and
-    /// then executes the provided closure. If the thread is already a member of
-    /// the pool, the closure is called directly. Otherwise, the thread will
-    /// attempt to temporarily register itself with the pool (which can be
-    /// slightly slower). If registration fails (because the pool is full to
-    /// capacity) the closure is passed `None` instead of a worker instance.
-    ///
-    /// The provided closure is never sent to another thread.
-    #[inline(always)]
-    pub fn with_worker<F, R>(&'static self, f: F) -> R
-    where
-        F: FnOnce(&Worker) -> R,
-    {
-        Worker::with_current(|worker| match worker {
-            Some(worker) if worker.lease.thread_pool.id() == self.id() => f(worker),
-            _ => self.with_worker_cold(f),
-        })
-    }
-
-    /// Tries to register the calling thread on the thread pool, and pass a
-    /// worker instance to the provided closure.
-    ///
-    /// This is the slow fallback for `with_worker` covering "external calls"
-    /// from outside the pool. Never call this directly.
-    #[cold]
-    fn with_worker_cold<F, R>(&'static self, f: F) -> R
-    where
-        F: FnOnce(&Worker) -> R,
-    {
-        let lease = self.state.lock().unwrap().claim_lease(self);
-        Worker::occupy(lease, f)
+        self.occupied.load(Ordering::Relaxed).count_ones() as usize
     }
 }
 
@@ -315,8 +286,8 @@ impl ThreadPool {
     ///
     /// See [`ThreadPool::resize`] for more information about resizing.
     pub fn resize_to_available(&'static self) -> usize {
-        let available = available_parallelism().map(NonZero::get).unwrap_or(1);
-        let available = available.saturating_sub(2);
+        let mut available = available_parallelism().map(NonZero::get).unwrap_or(1);
+        available = available.saturating_sub(1);
         self.resize_to(available)
     }
 
@@ -369,7 +340,7 @@ impl ThreadPool {
 
     /// Resizes the pool, and returns the new size.
     ///
-    /// Not that the new size may be different from the size requested.
+    /// Note that the new size may be different from the size requested.
     #[cold]
     pub fn resize<F>(&'static self, get_size: F) -> usize
     where
@@ -380,14 +351,13 @@ impl ThreadPool {
         // Resizing a pool is a critical section; only one thread can resize the
         // pool at a time. This is implemented using a mutex on the thread manager.
         trace!("locking state");
-        let mut state = self.state.lock().unwrap();
+        let mut managed_threads = self.managed_threads.lock().unwrap();
 
         // Compute the new size of the pool, given the current size.
-        let current_size = state.managed_threads.workers.len();
+        let current_size = managed_threads.workers.len();
 
-        // You are only allowed to spawn managed threads for up to half the total number of workers,
-        // to leave room for non-managed threads. By default, this means at most 16 workers can be managed.
-        let mut new_size = get_size(current_size);
+        // Calculate the new size of the pool (counting only managed workers).
+        let new_size = get_size(current_size);
 
         trace!(
             "attempting to resize thread pool from {} to {} thread(s)",
@@ -401,97 +371,55 @@ impl ThreadPool {
             }
             // The size increased
             cmp::Ordering::Greater => {
-                // Acquire leases for the new threads.
-                trace!("locking worker leases");
-                let new_leases = state.claim_leases(self, new_size - current_size);
-                new_size = current_size + new_leases.len(); // Scale back the new size to what we can actually spawn.
-                trace!("acquired leases for {} new threads", new_size);
-
-                // When not in shuttle, start the heartbeat thread if scaling up from zero.
-                #[cfg(not(feature = "shuttle"))]
-                if new_size > 0 && current_size == 0 {
-                    debug!("spawning heartbeat runner");
-                    let halt = Arc::new(AtomicBool::new(false));
-                    let heartbeat_halt = halt.clone();
-                    let handle = ThreadBuilder::new()
-                        .name("heartbeat".to_string())
-                        .spawn(move || {
-                            heartbeat_loop(self, heartbeat_halt);
-                        })
-                        .unwrap();
-                    let control = ThreadControl { halt, handle };
-                    state.managed_threads.heartbeat = Some(control);
-                }
-
-                let barrier = Arc::new(Barrier::new(new_leases.len() + 1));
-
                 // Spawn the new workers.
-                for lease in new_leases {
-                    let index = lease.index;
-                    debug!("spawning managed worker with index {}", index);
+                let leases = self.claim_leases(new_size - current_size);
+                for lease in leases {
+                    let seat_number = lease.seat_number;
+                    debug!("spawning managed worker for seat number {}", seat_number);
                     let halt = Arc::new(AtomicBool::new(false));
                     let worker_halt = halt.clone();
-                    let worker_barrier = barrier.clone();
                     let handle = ThreadBuilder::new()
-                        .name(format!("worker {index}"))
+                        .name(format!("worker {seat_number}"))
                         .spawn(move || {
-                            managed_worker(lease, worker_halt, worker_barrier);
+                            managed_worker(lease, worker_halt);
                         })
                         .unwrap();
                     let control = ThreadControl { halt, handle };
-                    state
-                        .managed_threads
-                        .workers
-                        .push(ManagedWorker { index, control });
+                    managed_threads.workers.push(ManagedWorker {
+                        seat_number,
+                        control,
+                    });
                 }
 
-                drop(state);
-
-                // Wait for the threads to start.
-                barrier.wait();
+                drop(managed_threads);
             }
             // The size decreased
             cmp::Ordering::Less => {
                 // Pull the workers we intend to halt out of the thread manager.
-                let terminating_workers = state.managed_threads.workers.split_off(new_size);
-
-                // Halt the heartbeat thread when scaling to zero.
-                #[cfg(not(feature = "shuttle"))]
-                let heartbeat_control = if new_size == 0 {
-                    state.managed_threads.heartbeat.take()
-                } else {
-                    None
-                };
+                let terminating_workers = managed_threads.workers.split_off(new_size);
 
                 // Terminate and wake the workers.
+                let seats = self.get_seats();
                 for worker in &terminating_workers {
                     // Tell the worker to halt.
                     worker.control.halt.store(true, Ordering::Relaxed);
                     // Wake the worker up.
-                    state.seats[worker.index].data.sleep_controller.wake();
+                    seats.sleep_controllers[worker.seat_number].wake();
                 }
 
                 // Drop the lock on the state so as not to block the workers or heartbeat.
-                drop(state);
+                drop(managed_threads);
 
                 // Determine our seat index.
-                let own_seat = Worker::map_current(|worker| worker.lease.index);
+                let own_seat_number = Worker::map_current(|worker| worker.lease.seat_number);
 
                 // Wait for the other workers to fully halt.
                 for worker in terminating_workers {
                     // It's possible we may be trying to terminate ourselves, in
                     // which case we can skip the thread-join.
-                    if Some(worker.index) != own_seat {
+                    if Some(worker.seat_number) != own_seat_number {
                         let _ = worker.control.handle.join();
                     }
-                }
-
-                // If we took control of the heartbeat, halt it after the workers.
-                #[cfg(not(feature = "shuttle"))]
-                if let Some(control) = heartbeat_control {
-                    control.halt.store(true, Ordering::Relaxed);
-                    self.start_heartbeat.notify_one();
-                    let _ = control.handle.join();
                 }
             }
         }
@@ -502,13 +430,125 @@ impl ThreadPool {
 }
 
 // -----------------------------------------------------------------------------
+// Thread pool worker access
+
+impl ThreadPool {
+    /// Runs the closure on a thread-pool worker.
+    ///
+    /// If this thread is not a worker, it will try to register itself as one.
+    /// If the thread pool is full, the closure is sent to another worker as a
+    /// job, and this thread is parked.
+    ///
+    /// If your closure is `!Send`, use [`with_worker`][ThreadPool::with_worker]
+    /// instead.
+    #[inline(always)]
+    pub fn on_worker<F, R>(&'static self, f: F) -> R
+    where
+        F: FnOnce(&Worker) -> R + Send,
+        R: Send,
+    {
+        self.with_worker(|worker| match worker {
+            Some(worker) => f(worker),
+            None => {
+                let mut job = ExternalJob::new(f);
+                // SAFETY: `ExternalJob::as_job_ref` requires:
+                //
+                // * The `ExternalJob` must not move or be deallocated until the
+                //   `JobRef` is executed.
+                //
+                // * The `JobRef` does not outlive any data the `ExternalJob` closes over.
+                //
+                // * `as_job_ref` is not called again while `JobRef` lives.
+                //
+                // The `ExternalJob` is a stack-allocated variable. After
+                // calling `as_job_ref`, we never move `job`, and we wait for
+                // the job to execute by calling `job.wait_for_value`. Only
+                // after that returns do we allow the `job` to be dropped. This
+                // also means that any data closed over by the `ExternalJob`
+                // must outlive the `JobRef`.
+                //
+                // Also, `as_job_ref` is plainly called only once.
+                let job_ref = unsafe { job.as_job_ref() };
+                self.queue_shared_job(job_ref);
+                // SAFETY: `wait_for_value` must be called at most once. This is
+                // the only call site for this particular `job`, which is a
+                // stack-local variable.
+                let result = unsafe { job.wait_for_value() };
+                match result {
+                    Ok(value) => value,
+                    Err(error) => unwind::resume_unwinding(error),
+                }
+            }
+        })
+    }
+
+    /// Runs the closure on a thread-pool worker.
+    ///
+    /// If this thread is not a worker, it will try to register itself as one.
+    /// If the thread pool is full, this panics.
+    ///
+    /// If you don't want to panic, use [`on_worker`][ThreadPool::on_worker] or
+    /// [`with_worker`][ThreadPool::with_worker] instead.
+    #[inline(always)]
+    #[track_caller]
+    pub fn expect_worker<F, R>(&'static self, f: F) -> R
+    where
+        F: FnOnce(&Worker) -> R,
+    {
+        self.with_worker(|worker| match worker {
+            Some(worker) => f(worker),
+            None => panic!("thread pool full; not able to access worker"),
+        })
+    }
+
+    /// Runs the closure on a thread-pool worker.
+    ///
+    /// If this thread is currently acting as a worker for the thread-pool, this
+    /// just looks that worker up. If this is not registered as a worker, or the
+    /// thread's worker is registered with different thread pool, the thread
+    /// will try to register itself with the correct pool. If the thread pool is
+    /// full, it passes the closure `None`.
+    ///
+    /// The provided closure is never sent to another thread. If your closure is
+    /// `Send`, consider using [`on_worker`][ThreadPool::on_worker] instead.
+    #[inline(always)]
+    pub fn with_worker<F, R>(&'static self, f: F) -> R
+    where
+        F: FnOnce(Option<&Worker>) -> R,
+    {
+        Worker::with_current(|worker| match worker {
+            Some(worker) if worker.lease.thread_pool.id() == self.id() => f(Some(worker)),
+            _ => self.with_worker_cold(f),
+        })
+    }
+
+    /// Tries to register the calling thread on the thread pool, and pass a
+    /// worker instance to the provided closure.
+    ///
+    /// This is the slow fallback for `with_worker` covering "external calls"
+    /// from outside the pool. Never call this directly.
+    #[cold]
+    fn with_worker_cold<F, R>(&'static self, f: F) -> R
+    where
+        F: FnOnce(Option<&Worker>) -> R,
+    {
+        match self.claim_lease() {
+            Some(lease) => Worker::occupy(lease, |worker| f(Some(worker))),
+            None => f(None),
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
 // Generalized spawn trait
 
-/// A trait for types that can be spawned onto a [`ThreadPool`]. It is implemented for:
+/// A trait for types that can be spawned onto a [`ThreadPool`].
 ///
-/// + Closures that satisfy `for<'worker> FnOnce(&'worker Worker) + Send + 'static`.
+/// It is implemented for:
 ///
-/// + Futures that satisfy `Future<Output = T> + Send + 'static` where `T: Send + 'static`.
+/// * Closures that satisfy `for<'worker> FnOnce(&'worker Worker) + Send + 'static`.
+///
+/// * Futures that satisfy `Future<Output = T> + Send + 'static` where `T: Send + 'static`.
 ///
 /// Due to a bug in rustc, you may be given errors when using closures
 /// with inferred types. If you encounter the following:
@@ -518,7 +558,7 @@ impl ThreadPool {
 /// # use forte::Worker;
 /// # static THREAD_POOL: ThreadPool = ThreadPool::new();
 /// THREAD_POOL.spawn(|_| { });
-/// //                ^^^^^^^ the trait `Spawn<'_, _>` is not implemented for closure ...
+/// //                ^^^^^^^ ERROR: the trait `Spawn<'_, _>` is not implemented for closure ...
 /// ```
 /// Try adding a type hint to the closure's parameters, like so:
 /// ```
@@ -558,7 +598,7 @@ where
 
         // Queue the job for evaluation
         if let Some(worker) = worker {
-            worker.enqueue(job_ref);
+            worker.fifo_queue.push_new(job_ref);
         } else {
             // Push the work into the share queue and wake a worker
             thread_pool.shared_jobs.push(job_ref);
@@ -568,11 +608,11 @@ where
 
 pub type Task<T> = async_task::Task<T, &'static ThreadPool>;
 
-// Schedules a runnable future as a job.
-//
-// Async-task prefers that this is a static function, rather than a closure,
-// which is why this is a separate function that pulls the thread pool from the
-// runnable metadata.
+/// Schedules a runnable future as a job.
+///
+/// Async-task prefers that this is a static function, rather than a closure,
+/// which is why this is a separate function that pulls the thread pool from the
+/// runnable metadata.
 fn schedule_runnable(runnable: Runnable<&'static ThreadPool>) {
     // Get a ref to the thread pool from the runnable.
     let thread_pool = *runnable.metadata();
@@ -588,16 +628,19 @@ fn schedule_runnable(runnable: Runnable<&'static ThreadPool>) {
     let job_ref = unsafe { JobRef::new_raw(job_pointer, execute_runnable) };
 
     // Send this job off to be executed.
-    thread_pool.with_worker(|worker| {
-        worker.enqueue(job_ref);
+    thread_pool.with_worker(|worker| match worker {
+        Some(worker) => worker.fifo_queue.push_new(job_ref),
+        None => thread_pool.shared_jobs.push(job_ref),
     });
 }
 
-// Executes a raw pointer to a runnable future.
+/// Executes a raw pointer to a runnable future.
 #[inline(always)]
 fn execute_runnable(this: NonNull<()>, _worker: &Worker) {
-    // SAFETY: This pointer was created by the call to `Runnable::into_raw` just above.
-    let runnable = unsafe { Runnable::<()>::from_raw(this) };
+    // SAFETY: This pointer was created by `Runnable::into_raw` in
+    // `schedule_runnable` with type parameter `&'static ThreadPool`, and
+    // `from_raw` is called at most once.
+    let runnable = unsafe { Runnable::<&'static ThreadPool>::from_raw(this) };
     // Poll the task. This will drop the future if the task is
     // canceled or the future completes.
     runnable.run();
@@ -656,11 +699,10 @@ impl ThreadPool {
         F: Future<Output = T> + Send,
         T: Send,
     {
-        self.with_worker(|worker| worker.block_on(future))
+        self.on_worker(|worker| worker.block_on(future))
     }
 
-    /// Executes the two closures, possibly in parallel, and returns the
-    /// results.
+    /// Executes the two closures, possibly in parallel.
     ///
     /// See also: [`Worker::join`] and [`join`].
     #[inline(always)]
@@ -671,7 +713,7 @@ impl ThreadPool {
         RA: Send,
         RB: Send,
     {
-        self.with_worker(|worker| worker.join(a, b))
+        self.on_worker(|worker| worker.join(a, b))
     }
 
     /// Creates a scope onto which non-static work can be spawned.
@@ -681,9 +723,10 @@ impl ThreadPool {
     #[inline(always)]
     pub fn scope<'env, F, T>(&'static self, f: F) -> T
     where
-        F: for<'scope> FnOnce(&'scope Scope<'scope, 'env>) -> T,
+        F: for<'scope> FnOnce(&'scope Scope<'scope, 'env>) -> T + Send,
+        T: Send,
     {
-        self.with_worker(|worker| worker.scope(f))
+        self.on_worker(|worker| worker.scope(f))
     }
 }
 
@@ -694,12 +737,10 @@ thread_local! {
     static WORKER_PTR: Cell<*const Worker> = const { Cell::new(ptr::null()) };
 }
 
-/// Holds the local context for a thread pool member, which allows queuing,
-/// executing, and sharing jobs on the pool.
+/// Represents membership in a thread pool.
 ///
-/// Workers are the recommended way to interface with a thread pool. To get
-/// access to worker for a given thread pool, users should call
-/// [`ThreadPool::with_worker`].
+/// To get access to worker for a given thread pool, users should call
+/// [`ThreadPool::with_worker`], [`ThreadPool::on_worker`], [`ThreadPool::expect_worker`]
 ///
 /// Every thread has at most one worker at a time. If a worker has already been
 /// set up, it may be accessed at any time by calling [`Worker::with_current`].
@@ -716,9 +757,22 @@ thread_local! {
 pub struct Worker {
     migrated: Cell<bool>,
     lease: Lease,
-    queue: JobQueue,
+    /// A sequence of jobs waiting to be executed. Newer jobs are executed
+    /// before older ones, allowing efficient depth-first execution. During
+    /// promotion, the oldest job is shared. Populated by `join()`.
+    ///
+    /// Jobs in this queue take precedence over those in the fifo queue.
+    lifo_queue: JobQueue,
+    /// A sequence of jobs waiting to be executed. Older jobs are executed
+    /// before newer ones, providing reliably low latency. During promotion,
+    /// this queue is partitioned into chunks and the chunks are shared.
+    /// Populated by `spawn()`.
+    ///
+    /// Jobs in this queue are executed only when the lifo queue is empty.
+    pub(crate) fifo_queue: JobQueue,
     rng: XorShift64Star,
-    // Make non-send
+    last_promote_tick: Cell<u64>,
+    // Make non-send.
     _phantom: PhantomData<*const ()>,
 }
 
@@ -746,17 +800,19 @@ impl Worker {
     {
         trace!("occupying lease");
 
-        let span = trace_span!("occupy", lease = lease.index);
+        let span = trace_span!("occupy", seat_number = lease.seat_number);
         let _enter = span.enter();
 
         // Create a new worker to occupy the lease. Note: It's potentially a
         // problem that the same thread can occupy multiple workers on the same
-        // thread. We many eventually need to design something to prevent this.
+        // thread. We may eventually need to design something to prevent this.
         let worker = Worker {
             migrated: Cell::new(false),
             lease,
-            queue: JobQueue::new(),
+            fifo_queue: JobQueue::new(),
+            lifo_queue: JobQueue::new(),
             rng: XorShift64Star::new(),
+            last_promote_tick: Cell::new(0),
             _phantom: PhantomData,
         };
 
@@ -767,9 +823,8 @@ impl Worker {
         // and pass in a worker reference directly.
         let result = f(&worker);
 
-        // Execute the work queue until it's empty. This happens to be pulled in
-        // LIFO order, but it's fairly arbitrary.
-        while let Some(job_ref) = worker.queue.pop_newest() {
+        // Finish executing local work before shutting down.
+        while let Some(job_ref) = worker.find_local_work() {
             worker.execute(job_ref, false);
         }
 
@@ -783,6 +838,13 @@ impl Worker {
         result
     }
 
+    /// Returns a reference to the push-side `Sharer` queue for this
+    /// worker's seat.
+    #[inline(always)]
+    fn sharer(&self) -> &Sharer<JobRef> {
+        &self.lease.seats.sharers[self.lease.seat_number]
+    }
+
     /// Calls the provided closure on the thread's worker instance, if it has one.
     ///
     /// Rust's thread locals are fairly costly, so this function is expensive.
@@ -794,16 +856,20 @@ impl Worker {
     {
         let worker_ptr = WORKER_PTR.with(Cell::get);
         if !worker_ptr.is_null() {
-            // SAFETY: The `WORKER` static is only set by `occupy`, and it's
-            // always set to a stack-allocated `Worker` which is never moved and
-            // is only accessed through shared references. Therefore, if the
-            // pointer is non-null, it must be safe to dereference.
+            // SAFETY: `WORKER_PTR` is a thread-local `Cell` holding a raw
+            // pointer to a `Worker`. It is only written to by `Worker::occupy`,
+            // which stores the address of a `Worker` allocated within it's own
+            // stack frame. Before it returns, `occupy` restores the previous
+            // value of `WORKER_PTR`, so that it is always either null or points
+            // to a live, immovable `Worker` on the current thread's call stack
+            // (but is never left dangling).
             //
-            // This creates a reference with an unbounded lifetime. To avoid
-            // turning it into a `'static`, we pass it in to a closure. This
-            // restricts its lifetime to the closure body, and prevents callers
-            // from keeping around references to Workers that will be
-            // deallocated when `occupy` returns.
+            // If the pointer is non-null, it is therefore valid to dereference
+            // as a shared reference. Forming a `'static` reference is avoided
+            // by passing the value into a closure, which bounds the reference's
+            // lifetime to the closure body and prevents callers from retaining
+            // it past the point where `occupy` returns and the `Worker` is
+            // freed.
             Some(f(unsafe { &*worker_ptr }))
         } else {
             None
@@ -828,7 +894,7 @@ impl Worker {
             //
             // This creates a reference with an unbounded lifetime. To avoid
             // turning it into a `'static`, we pass it in to a closure. This
-            // restricts it's lifetime to the closure body, and prevents callers
+            // restricts its lifetime to the closure body, and prevents callers
             // from keeping around references to Workers that will be
             // deallocated when `occupy` returns.
             f(Some(unsafe { &*worker_ptr }))
@@ -839,8 +905,8 @@ impl Worker {
 
     /// Returns the index of the worker in the leases list.
     #[inline(always)]
-    pub fn index(&self) -> usize {
-        self.lease.index
+    pub fn seat_number(&self) -> usize {
+        self.lease.seat_number
     }
 
     /// Returns the index of the thread pool of the worker.
@@ -849,66 +915,105 @@ impl Worker {
         self.lease.thread_pool
     }
 
-    /// Pushes a job onto the local queue, overflowing to the shared queue when
-    /// full.
-    #[inline(always)]
-    pub fn enqueue(&self, job_ref: JobRef) {
-        if let Some(job_ref) = self.queue.push(job_ref) {
-            // push the work to the shared queue
-            self.lease.thread_pool.shared_jobs.push(job_ref);
-        }
-    }
+    /// Capacity of the per-worker work-stealing queue. This is the maximum
+    /// amount a worker can make available for stealing at once.
+    const STEAL_QUEUE_CAPACITY: usize = 32;
+
+    /// The minimum number of CPU ticks between calls to [`Worker::promote_cold`].
+    /// Approximately 5μs at 3 GHz.
+    const PROMOTE_TICK_INTERVAL: u64 = 15_000;
 
     /// Try to promote the oldest task in the queue.
     #[inline(always)]
     fn promote(&self) {
-        // Check for a heartbeat, potentially promoting the job we just pushed
-        // to a shared job.
-        #[cfg(not(feature = "shuttle"))]
-        let heartbeat = self.lease.seat_data.heartbeat.load(Ordering::Relaxed);
-
-        #[cfg(feature = "shuttle")]
-        let heartbeat = true; // thread_rng().gen_bool(0.5);
-
-        if heartbeat && let Some(job_ref) = self.queue.pop_oldest() {
-            self.promote_cold(job_ref);
-            #[cfg(not(feature = "shuttle"))]
-            self.lease
-                .seat_data
-                .heartbeat
-                .store(false, Ordering::Relaxed);
+        // Promotions are fairly costly, so we limit their frequency using the
+        // cpu's instruction counter. Promote is called at a high frequency, and
+        // actually doing the promotion is probably a cold path.
+        let current_tick = tick_counter::start();
+        if current_tick.wrapping_sub(self.last_promote_tick.get()) >= Self::PROMOTE_TICK_INTERVAL {
+            // This should ideally become a conditional jump.
+            self.promote_cold(current_tick);
         }
     }
 
-    /// Pushes work onto the shared queue and wakes another worker.
+    /// The actual work-promotion implementation. Must be called infrequently.
     #[cold]
-    fn promote_cold(&self, job_ref: JobRef) {
-        // Push the job onto the shared queue.
-        self.lease.thread_pool.shared_jobs.push(job_ref);
+    fn promote_cold(&self, current_tick: u64) {
+        // Update the promote tick so that `promote` won't call this again soon.
+        self.last_promote_tick.set(current_tick);
 
-        // Fetch the number of sleeping workers and pending shared tasks
-        let num_sleeping = self.lease.thread_pool.num_sleeping.load(Ordering::Relaxed);
-
-        if num_sleeping == 0 {
+        // Early out if it seems like all workers are already awake.
+        let sleeping = self.lease.thread_pool.sleeping.load(Ordering::Relaxed);
+        if sleeping == 0 {
             return;
         }
+        cold_path();
 
-        // Try to wake a worker to work on it.
-        //
-        // Note: This operation is extremely expensive, and should be avoided if possible.
-        let seats = self.lease.thread_pool.state.lock().unwrap().seats.clone();
-        let num_seats = seats.len();
-        let offset = self.rng.next_usize(num_seats);
-        for i in 0..num_seats {
-            let i = (i + offset) % num_seats;
-            if i == self.lease.index {
-                continue;
+        // Track if we actually managed to share work.
+        let mut shared_job = false;
+
+        // Share work from the lifo queue. This is shared bit-by-bit, with old
+        // (and therefore theoretically "large") tasks shared first.
+        if let Some(job_ref) = self.lifo_queue.pop_oldest() {
+            // Push into our own steal queue so siblings can steal it.
+            if let Err(job_ref) = self.sharer().push(job_ref) {
+                // If the queue is full, that indicates that the pool is
+                // probably under high-load and we should continue local-first
+                // operation.
+                self.lifo_queue.push_old(job_ref);
+            } else {
+                shared_job = true;
             }
-            if seats[i].occupied {
-                let ready = seats[i].data.sleep_controller.wake();
-                if ready {
-                    return;
-                }
+        }
+
+        // Share work from the fifo queue. Offload the newest jobs in a series of
+        // small chunks.
+        for job_refs in self.fifo_queue.split() {
+            // Create a new job that will insert a chunk of jobs into the
+            // runner's fifo queue when executed.
+            //
+            // This reduces the cost of sharing a large number of small jobs.
+            let batch_job = HeapJob::new(move |worker| {
+                worker.fifo_queue.append(job_refs);
+            });
+            // SAFETY: `into_job_ref` requires that the data closed over by the
+            // `HeapJob` outlive the `JobRef`.
+            //
+            // Here, the closure captures `job_refs` (a `VecDequeue<JobRef>`) by
+            // value, and so trivially outlives the newly created `JobRef`.
+            let batch_job_ref = unsafe { batch_job.into_job_ref() };
+            // Push the batch job into the steal queue so siblings can steal it.
+            if let Err(job_ref) = self.sharer().push(batch_job_ref) {
+                // If the queue is full, that indicates that the pool is
+                // probably under high-load and we should continue local-first
+                // operation.
+                //
+                // This just adds the jobs back to the local queue.
+                self.execute(job_ref, false);
+            } else {
+                shared_job = true;
+            }
+        }
+
+        // If we added work to the steal queue, wake a random sibling to steal
+        // it from us, while we do other work.
+        if shared_job {
+            self.wake_random(sleeping);
+        }
+    }
+
+    /// Tries to wake a random sleeping worker. Expects to be given a bitset of
+    /// sleeping workers.
+    #[inline(always)]
+    fn wake_random(&self, sleeping: u32) {
+        let offset = self.rng.next_usize(32) as u32;
+        let mut randomized_sleeping = sleeping.rotate_right(offset);
+        while randomized_sleeping != 0 {
+            let index = (randomized_sleeping.trailing_zeros() + offset) % 32;
+            randomized_sleeping &= randomized_sleeping - 1; // Clear the lowest bit
+            let woken = self.lease.seats.sleep_controllers[index as usize].wake();
+            if woken {
+                return;
             }
         }
     }
@@ -916,7 +1021,11 @@ impl Worker {
     /// Create a new latch owned by the worker.
     #[inline(always)]
     pub fn new_latch(&self) -> Latch {
-        Latch::new(&self.lease.seat_data.sleep_controller)
+        Latch::new(
+            self.lease.seat_number,
+            &self.lease.thread_pool.sleeping,
+            &self.lease.seats.sleep_controllers[self.lease.seat_number],
+        )
     }
 
     /// Runs jobs until the provided latch is set.
@@ -926,40 +1035,67 @@ impl Worker {
     #[inline(always)]
     pub fn wait_for(&self, latch: &Latch) {
         while !latch.check() {
-            #[cfg(feature = "shuttle")]
-            shuttle::hint::spin_loop();
-
             if self.yield_now() == Yield::Idle {
                 latch.wait();
             }
         }
     }
 
-    /// Tries to find a job to execute, either in the local queue or shared on
-    /// the thread pool.
-    ///
-    /// The second value is true if the job was shared, or false if it was spawned locally.
+    /// Finds a job to work on. This function is entirely local, and does no
+    /// synchronization with the queue.
+    #[inline(always)]
+    fn find_local_work(&self) -> Option<JobRef> {
+        self.lifo_queue
+            .pop_newest()
+            .or_else(|| self.fifo_queue.pop_oldest())
+            .or_else(|| self.sharer().pop())
+    }
+
+    /// Finds a job to work on. This tries
+    /// [`find_local_work`][Worker::find_local_work] first, then falls back to
+    /// pulling shared work from the thread pool.
     #[inline(always)]
     fn find_work(&self) -> Option<(JobRef, bool)> {
-        // We give preference first to things in our local deque, then in other
-        // workers deques, and finally to injected jobs from the outside. The
-        // idea is to finish what we started before we take on something new.
-        //
-        // We pull from the local queue in LIFO order, which means are popping
-        // from the *back* of the queue (the most recently added jobs). This is
-        // because `yield_now` (and by extension `wait_for` which uses it) is
-        // often called directly after pushing work onto the queue (as in `join`
-        // and `scope`). Pulling from the back of the queue potentially can
-        // allow these blocking operations to complete faster. In the cast when
-        // scopes/joins are deeply nested, this also causes work to be executed
-        // *depth-first*, which is often desirable.
-        self.queue
-            .pop_newest()
+        self.find_local_work()
             .map(|job| (job, false))
+            .or_else(|| self.steal_from_siblings().map(|job| (job, true)))
             .or_else(|| self.claim_shared_job().map(|job| (job, true)))
     }
 
-    /// Claims a shared job from the thread pool.
+    /// Attempts to steal a job from another worker's work-stealing queue.
+    ///
+    /// Iterates over occupied seats in a random order to avoid always hitting
+    /// the same victim. Because stealers are pre-allocated and permanent, no
+    /// lock or atomic load is needed to access them.
+    fn steal_from_siblings(&self) -> Option<JobRef> {
+        let stealers = &self.lease.seats.stealers;
+        let occupied = self.lease.thread_pool.occupied.load(Ordering::Relaxed);
+        let my_seat = self.lease.seat_number as u32;
+
+        // Randomise the starting position so all workers get a fair shot as victims.
+        let offset = self.rng.next_usize(32) as u32;
+        let mut bits = (occupied & !(1u32 << my_seat)).rotate_right(offset);
+
+        while bits != 0 {
+            let shifted_idx = bits.trailing_zeros();
+            let idx = (shifted_idx + offset) % 32;
+            bits &= bits - 1;
+            // The stealer is a permanent reference — no lock or atomic load needed.
+            let stealer = &stealers[idx as usize];
+            // `steal_and_pop` returns one job directly and moves up to half the
+            // remaining items into our steal queue for later use.
+            loop {
+                match stealer.steal_and_pop(self.sharer(), |n| n / 2) {
+                    Ok((job, _)) => return Some(job),
+                    Err(StealError::Busy) => {} // transient; retry
+                    Err(StealError::Empty) => break,
+                }
+            }
+        }
+        None
+    }
+
+    /// Claims a job from the global injector queue.
     #[inline(always)]
     fn claim_shared_job(&self) -> Option<JobRef> {
         self.lease.thread_pool.shared_jobs.pop()
@@ -974,7 +1110,7 @@ impl Worker {
     pub fn yield_local(&self) -> Yield {
         // We use LIFO order here, pulling the newest work from the queue. This
         // is just for consistency with yield_now/find_work.
-        match self.queue.pop_newest() {
+        match self.find_local_work() {
             Some(job_ref) => {
                 self.execute(job_ref, false);
                 Yield::Executed
@@ -993,9 +1129,7 @@ impl Worker {
     /// [`Worker::yield_local`] instead.
     #[inline(always)]
     pub fn yield_now(&self) -> Yield {
-        // Try to promote an item from the queue
         self.promote();
-
         match self.find_work() {
             Some((job_ref, migrated)) => {
                 self.execute(job_ref, migrated);
@@ -1062,14 +1196,13 @@ impl Worker {
         T: Send,
     {
         // Create a new latch to block the thread until the future completes.
-        let latch = pin!(self.new_latch());
-        let latch = latch.into_ref();
-        // Convert the blocker into an async waker.
         //
-        // SAFETY: The blocker lasts for the duration of this function, and
-        // since the waker is only used within this function, it must outlive
-        // the waker.
-        let waker = unsafe { latch.as_waker() };
+        // This is allocated on the heap, even though the worker is allocated on
+        // the stack, because we can't prevent futures from keeping wakers
+        // around for arbitrary amounts of time or issuing wakeups for futures
+        // that have completed.
+        let latch = Arc::new(self.new_latch());
+        let waker = latch.clone().into();
         // Put the waker into an async context that can be used to poll futures.
         let mut ctx = Context::from_waker(&waker);
         // Pin the future, promising not to move it while it's being polled.
@@ -1080,14 +1213,14 @@ impl Worker {
                 // While the future is incomplete, run other tasks or sleep.
                 Poll::Pending => {
                     // This will not return until the latch is set.
-                    self.wait_for(latch.get_ref());
+                    self.wait_for(latch.borrow());
                     // We want to keep using the same latch every time we wait
                     // for the future to become ready, so we have to reset it
                     // here.
                     //
-                    // SAFETY: The latch must be in the set state because we
-                    // just waited for it.
-                    unsafe { latch.reset() };
+                    // The latch must be in the set state because we just waited
+                    // for it.
+                    latch.reset();
                 }
                 // When it is complete, pull out the result and return it.
                 Poll::Ready(res) => return res,
@@ -1095,8 +1228,7 @@ impl Worker {
         }
     }
 
-    /// Takes two closures and *potentially* runs them in parallel, then returns
-    /// the results.
+    /// Executes the two closures, possibly in parallel.
     ///
     /// If you do not have access to a [`Worker`], you may call
     /// [`ThreadPool::join`] or simply [`join`].
@@ -1127,7 +1259,7 @@ impl Worker {
         let job_ref_id = job_ref.id();
 
         // Push the job onto the queue.
-        self.enqueue(job_ref);
+        self.lifo_queue.push_new(job_ref);
 
         // If we have received a heartbeat, we remove the oldest item in the
         // local queue and push it into the shared queue. This causes work to be
@@ -1141,7 +1273,7 @@ impl Worker {
 
         // Attempt to recover the job from the queue. It should still be there
         // if we didn't share it.
-        if self.queue.recover_just_pushed(job_ref_id) {
+        if self.lifo_queue.recover_newest(job_ref_id) {
             // SAFETY: Because the ids match, the JobRef we just popped from
             // the queue must point to `stack_job`, implying that
             // `stack_job` cannot have been executed yet.
@@ -1178,9 +1310,12 @@ impl Worker {
 // -----------------------------------------------------------------------------
 // Thread local scheduling api
 
-/// Spawns a thread onto the current thread pool.
+/// Runs the provided closure in the background.
 ///
-/// If there is no current thread pool, this panics.
+/// <div class="warning">
+/// <strong>Note:</strong>
+/// This function panics if the current thread is not registered as a worker.
+/// </div>
 ///
 /// See also: [`Worker::spawn`] and [`ThreadPool::spawn`].
 pub fn spawn<M, S: Spawn<M>>(work: S) -> S::Output {
@@ -1191,9 +1326,12 @@ pub fn spawn<M, S: Spawn<M>>(work: S) -> S::Output {
     })
 }
 
-/// Blocks the thread waiting for a future to complete.
+/// Waits for a future to complete.
 ///
-/// If there is no current thread pool, this panics.
+/// <div class="warning">
+/// <strong>Note:</strong>
+/// This function panics if the current thread is not registered as a worker.
+/// </div>
 ///
 /// See also: [`Worker::block_on`] and [`ThreadPool::block_on`].
 pub fn block_on<F, T>(future: F) -> T
@@ -1208,10 +1346,12 @@ where
     })
 }
 
-/// Takes two closures and *potentially* runs them in parallel. It
-/// returns a pair of the results from those closures.
+/// Executes the two closures, possibly in parallel.
 ///
-/// If there is no current thread pool, this panics.
+/// <div class="warning">
+/// <strong>Note:</strong>
+/// This function panics if the current thread is not registered as a worker.
+/// </div>
 ///
 /// See also: [`Worker::join`] and [`ThreadPool::join`].
 pub fn join<A, B, RA, RB>(a: A, b: B) -> (RA, RB)
@@ -1228,15 +1368,17 @@ where
     })
 }
 
-/// Creates a "fork-join" scope and invokes the closure with a reference to
-/// it. Work spawned onto this scope does not have to have a `'static`
+/// Creates a new scope for spawning non-static work.
+///
+/// Work spawned onto the new scope does not have to have a `'static`
 /// lifetime, and can borrow local variables. Local borrowing is possible
 /// because this function will not return until all work spawned on the
 /// scope has completed, this ensuring the stack frame is kept alive for the
 /// duration.
 ///
 /// <div class="warning">
-/// <strong>Note:</strong> This function panics if the current thread is not registered as a worker.
+/// <strong>Note:</strong>
+/// This function panics if the current thread is not registered as a worker.
 /// </div>
 ///
 /// # Alternatives
@@ -1263,7 +1405,7 @@ where
 /// # use forte::Worker;
 /// # static THREAD_POOL: ThreadPool = ThreadPool::new();
 /// # THREAD_POOL.populate();
-/// # THREAD_POOL.with_worker(|worker| {
+/// # THREAD_POOL.expect_worker(|worker| {
 /// let ok: Vec<i32> = vec![1, 2, 3];
 /// forte::scope(|scope| {
 ///     let bad: Vec<i32> = vec![4, 5, 6];
@@ -1290,7 +1432,7 @@ where
 /// # use forte::Worker;
 /// # static THREAD_POOL: ThreadPool = ThreadPool::new();
 /// # THREAD_POOL.populate();
-/// # THREAD_POOL.with_worker(|worker| {
+/// # THREAD_POOL.expect_worker(|worker| {
 /// let ok: Vec<i32> = vec![1, 2, 3];
 /// forte::scope(|scope| {
 ///     let bad: Vec<i32> = vec![4, 5, 6];
@@ -1316,7 +1458,7 @@ where
 /// # use forte::Worker;
 /// # static THREAD_POOL: ThreadPool = ThreadPool::new();
 /// # THREAD_POOL.populate();
-/// # THREAD_POOL.with_worker(|worker| {
+/// # THREAD_POOL.expect_worker(|worker| {
 /// let ok: Vec<i32> = vec![1, 2, 3];
 /// forte::scope(|scope| {
 ///     let bad: Vec<i32> = vec![4, 5, 6];
@@ -1343,7 +1485,7 @@ where
 /// # use forte::Worker;
 /// # static THREAD_POOL: ThreadPool = ThreadPool::new();
 /// # THREAD_POOL.populate();
-/// # THREAD_POOL.with_worker(|worker| {
+/// # THREAD_POOL.expect_worker(|worker| {
 /// let ok: Vec<i32> = vec![1, 2, 3];
 /// forte::scope(|scope| {
 ///     let bad: Vec<i32> = vec![4, 5, 6];
@@ -1370,10 +1512,10 @@ where
 /// # use forte::Worker;
 /// # static THREAD_POOL: ThreadPool = ThreadPool::new();
 /// # THREAD_POOL.populate();
-/// # THREAD_POOL.with_worker(|worker| {
+/// # THREAD_POOL.expect_worker(|worker| {
 /// let mut leak = None;
 /// forte::scope(|scope| {
-///     leak = Some(scope); // <-- scope would be leaked here
+///     leak = Some(scope); // <-- ERROR: scope would be leaked here
 /// });
 /// drop(leak);
 /// # });
@@ -1387,7 +1529,7 @@ where
 /// # use forte::Worker;
 /// # static THREAD_POOL: ThreadPool = ThreadPool::new();
 /// # THREAD_POOL.populate();
-/// # THREAD_POOL.with_worker(|worker| {
+/// # THREAD_POOL.expect_worker(|worker| {
 /// let mut counter = 0;
 /// let counter_ref = &mut counter;
 /// forte::scope(|scope| {
@@ -1415,12 +1557,13 @@ where
 /// THREAD_POOL.with_worker(|worker| {
 ///     worker.scope(|scope| {
 ///         worker.spawn(|worker: &Worker| {
-///             // ^^^^^ This creates a *non-static* job on the worker,
+///             // ^^^^^ ERROR: This creates a *static* job on the worker,
 ///             //       which may outlive the scope.
 ///             
 ///             scope.spawn_on(worker, |_: &Worker| { });
-///             // ^^^^^ This requires borrowing the scope within the
-///             //       unscoped job, which isn't allowed by the compiler.
+///             // ^^^^^ ERROR: This requires borrowing the scope within the
+///             //       unscoped job, which isn't allowed by the compiler
+///             //       because 'scope would have to to outlive 'static.
 ///         });
 ///     });
 /// });
@@ -1439,9 +1582,6 @@ where
 /// once a task is spawned using `scope.spawn(),` it will execute, even if the
 /// spawning task should later panic. The scope returns once all work is
 /// complete, and panics are propagated at that point.
-///
-/// Note: Panics in futures are instead propagated to their
-/// [`Task`][async_task::Task], and will not cause the scope to panic.
 pub fn scope<'env, F, T>(f: F) -> T
 where
     F: for<'scope> FnOnce(&'scope Scope<'scope, 'env>) -> T,
@@ -1460,10 +1600,8 @@ where
 /// Operating on the principle that you should finish what you start before
 /// starting something new, workers will first execute their queue, then execute
 /// shared jobs, then pull new jobs from the injector.
-fn managed_worker(lease: Lease, halt: Arc<AtomicBool>, barrier: Arc<Barrier>) {
+fn managed_worker(lease: Lease, halt: Arc<AtomicBool>) {
     trace!("starting managed worker");
-
-    barrier.wait();
 
     // Register as the indicated worker, and work until we are told to halt.
     Worker::occupy(lease, |worker| {
@@ -1474,7 +1612,8 @@ fn managed_worker(lease: Lease, halt: Arc<AtomicBool>, barrier: Arc<Barrier>) {
             if let Some((job, migrated)) = worker.find_work() {
                 worker.execute(job, migrated);
             } else {
-                worker.lease.seat_data.sleep_controller.sleep();
+                worker.lease.seats.sleep_controllers[worker.lease.seat_number]
+                    .sleep(worker.lease.seat_number, &worker.lease.thread_pool.sleeping);
             }
         }
     });
@@ -1483,56 +1622,13 @@ fn managed_worker(lease: Lease, halt: Arc<AtomicBool>, barrier: Arc<Barrier>) {
 }
 
 // -----------------------------------------------------------------------------
-// Heartbeat sender loop
-
-/// This is the main loop for the heartbeat thread. It's in charge of
-/// periodically sending a "heartbeat" signal to each worker. By default, each
-/// worker receives a heartbeat about once every 100 μs.
-///
-/// Workers use the heartbeat signal to amortize the cost of promoting local
-/// jobs to shared jobs (which allows other works to claim them) and to reduce
-/// lock contention.
-///
-/// This is never runs when testing in shuttle.
-#[cfg(not(feature = "shuttle"))]
-fn heartbeat_loop(thread_pool: &'static ThreadPool, halt: Arc<AtomicBool>) {
-    trace!("starting managed heartbeat thread");
-
-    let mut seats = thread_pool.state.lock().unwrap().seats.clone();
-    let mut index = 0;
-
-    while !halt.load(Ordering::Relaxed) {
-        let num_seats = seats.len();
-        let (back, front) = seats.split_at(index);
-        if let Some((offset, seat)) = Iterator::chain(front.iter(), back.iter())
-            .enumerate()
-            .find(|(_, seat)| seat.occupied)
-        {
-            index = (index + offset + 1) % num_seats;
-            seat.data.heartbeat.store(true, Ordering::Relaxed);
-            std::thread::yield_now();
-            seats = thread_pool.state.lock().unwrap().seats.clone();
-        } else {
-            let state = thread_pool.state.lock().unwrap();
-            seats = thread_pool
-                .start_heartbeat
-                .wait(state)
-                .unwrap()
-                .seats
-                .clone();
-        }
-    }
-}
-
-// -----------------------------------------------------------------------------
 // Tests
 
 #[cfg(all(test, not(feature = "shuttle")))]
 mod tests {
 
-    use std::sync::mpsc::channel;
-
     use alloc::vec;
+    use std::sync::mpsc::channel;
 
     use super::*;
 
@@ -1596,7 +1692,7 @@ mod tests {
         THREAD_POOL.resize_to_available();
 
         let mut vals = [0; 1_024];
-        THREAD_POOL.with_worker(|worker| increment(worker, &mut vals));
+        THREAD_POOL.on_worker(|worker| increment(worker, &mut vals));
         assert_eq!(vals, [1; 1_024]);
 
         THREAD_POOL.depopulate();
@@ -1625,7 +1721,7 @@ mod tests {
         THREAD_POOL.resize_to_available();
 
         let mut vals = vec![0; 512 * 512];
-        THREAD_POOL.with_worker(|worker| increment(worker, &mut vals));
+        THREAD_POOL.on_worker(|worker| increment(worker, &mut vals));
         assert_eq!(vals, vec![1; 512 * 512]);
 
         THREAD_POOL.depopulate();

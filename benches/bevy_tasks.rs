@@ -40,20 +40,20 @@ mod overhead {
         for i in 0..80 {
             black_box(i);
         }
-        // std::thread::sleep(Duration::from_nanos(100));
         black_box(value);
     }
 
     #[divan::bench(args = LEN)]
-    fn serial(bencher: Bencher, len: usize) {
+    fn baseline(bencher: Bencher, len: usize) {
         let mut vec: Vec<_> = (0..len).collect();
         bencher.bench_local(|| vec.iter_mut().for_each(work));
     }
 
     #[divan::bench(args = LEN)]
     fn bevy_tasks(bencher: Bencher, len: usize) {
-        use crate::BevyParChunksMut;
         use bevy_tasks::ParallelIterator;
+
+        use crate::BevyParChunksMut;
 
         let mut vec: Vec<_> = (0..len).collect();
         let pool = bevy_tasks::TaskPoolBuilder::new()
@@ -83,18 +83,18 @@ mod overhead {
 
         let mut vec: Vec<_> = (0..len).collect();
 
-        THREAD_POOL.resize_to_available();
-
-        bencher.bench_local(|| {
-            THREAD_POOL.with_worker(|worker| {
-                forte_chunks::<8, _, _>(worker, &mut vec, &|c| {
+        THREAD_POOL.expect_worker(|worker| {
+            bencher.bench_local(|| {
+                forte_chunks::<64, _, _>(worker, &mut vec, &|c| {
                     c.iter_mut().for_each(work);
                 });
-            })
+            });
         });
     }
 }
 
 fn main() {
+    THREAD_POOL.resize_to_available();
+
     divan::main();
 }
