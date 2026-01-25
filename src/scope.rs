@@ -5,6 +5,7 @@ use alloc::boxed::Box;
 use core::any::Any;
 use core::cell::UnsafeCell;
 use core::future::Future;
+use core::hint::cold_path;
 use core::marker::PhantomData;
 use core::mem::ManuallyDrop;
 use core::pin::Pin;
@@ -61,15 +62,16 @@ use crate::unwind::AbortOnDrop;
 pub struct Scope<'scope, 'env: 'scope> {
     /// Number of active references to the scope (including the owning
     /// allocation). This is incremented each time a new `ScopePtr` is created,
-    /// and decremented when a `ScopePtr` is dropped or the owning thead is done
-    /// using it.
+    /// and decremented when a `ScopePtr` is dropped or the owning thread is
+    /// done using it.
     count: AtomicU32,
     /// A latch used to communicate when the scope has been completed.
     completed: Latch,
     /// If any job panics, we store the result here to propagate it.
     panic: AtomicPtr<Box<dyn Any + Send + 'static>>,
-    /// This adds invariance over 'scope, to make sure 'scope cannot shrink,
-    /// which is necessary for soundness.
+    /// This adds invariance over 'scope. In other words, it ensures 'scope
+    /// cannot shrink or grow. This keeps the lifetime properly bound to the
+    /// closure.
     ///
     /// Without invariance, this would compile fine but be unsound:
     ///
@@ -87,13 +89,18 @@ pub struct Scope<'scope, 'env: 'scope> {
     /// # });
     /// ```
     _scope: PhantomData<&'scope mut &'scope ()>,
-    /// This adds covariance over 'env.
+    /// This adds invariance over 'env. In other words, it ensures 'env cannot
+    /// shrink or grow.
+    ///
+    /// This is not strictly necessary for correctness, and could probably be
+    /// covariant instead. Invariance was chosen to follow the precedent set by
+    /// `std::thread::scope`.
     _env: PhantomData<&'env mut &'env ()>,
 }
 
 /// Executes a new scope on a worker. [`Worker::scope`],
-/// [`ThreadPool::scope`][crate::ThreadPool::scope] and [`scope`][crate::scope()] are all just
-/// an aliases for this function.
+/// [`ThreadPool::scope`][crate::ThreadPool::scope] and
+/// [`scope`][crate::scope()] are all just aliases for this function.
 ///
 /// For details about the `'scope` and `'env` lifetimes see [`Scope`].
 #[inline]
@@ -102,10 +109,21 @@ where
     F: for<'scope> FnOnce(&'scope Scope<'scope, 'env>) -> T,
 {
     let abort_guard = AbortOnDrop;
-    // SAFETY: The scope is never moved or mutably referenced. The scope is only
-    // dropped at the end of this function, after the call to `complete`. The
-    // abort guard above prevents the stack from being dropped early during a
-    // panic unwind.
+    // SAFETY: `Scope::new` requires:
+    //
+    // 1. The `Scope` is never moved after initialization.
+    //
+    // 2. `complete` is called exactly once before the `Scope` is dropped.
+    //
+    // The scope is not moved in this function, and since no `&mut Scope`
+    // reference is allowed to escape, the caller cannot safely cause the scope
+    // to move either.
+    //
+    // `Scope::complete` is called unconditionally on the line bellow, before
+    // the implicit drop of `scope`. If the closure `f` panics, it is caught and
+    // re-emitted after `complete` finishes. In the event of an uncaught panic,
+    // we cannot ensure `complete` runs properly before the scope is dropped, so
+    // we force an abort via an `AbortOnDrop` guard.
     let scope = unsafe { Scope::new(worker) };
     // Panics that occur within the closure should be caught and propagated once
     // all spawned work is complete. This is not a safety requirement, it's just
@@ -138,9 +156,18 @@ impl<'scope, 'env> Scope<'scope, 'env> {
     ///
     /// # Safety
     ///
-    /// The caller must promise not to move or mutably reference this scope
-    /// until it is dropped, and must not allow the scope to be dropped until
-    /// after `Scope::complete` is run and returns.
+    /// The caller must ensure:
+    ///
+    /// * The `Scope` is never moved after creation. `ScopePtr::new` captures a
+    ///   raw `*const Scope` pointer, and spawned jobs hold onto these pointers
+    ///   until they complete. Moving the scope would invalidate these pointers
+    ///   and cause UB when any `ScopePtr` is dropped or used for scope access.
+    ///
+    /// * `complete` is called exactly once before the `Scope` is dropped, after
+    ///   which no `ScopePtr` may be created for this scope. `complete` blocks
+    ///   until the reference count ticks down to zero, ensuring that the scope
+    ///   outlives all `ScopePtr` references. Failing to call `complete` may
+    ///   result in dangling `ScopePtr` and produce use-after-free.
     unsafe fn new(worker: &Worker) -> Scope<'scope, 'env> {
         Scope {
             count: AtomicU32::new(1),
@@ -154,9 +181,9 @@ impl<'scope, 'env> Scope<'scope, 'env> {
     /// Runs a closure or future sometime before the scope completes. Valid
     /// inputs to this method are:
     ///
-    /// + A `for<'worker> FnOnce(&'worker Worker)` closure, with no return type.
+    /// * A `for<'worker> FnOnce(&'worker Worker)` closure, with no return type.
     ///
-    /// + A `Future<Output = ()>` future, with no return type.
+    /// * A `Future<Output = ()>` future, with no return type.
     ///
     /// # Panics
     ///
@@ -168,9 +195,9 @@ impl<'scope, 'env> Scope<'scope, 'env> {
     /// Runs a closure or future sometime before the scope completes. Valid
     /// inputs to this method are:
     ///
-    /// + A `for<'worker> FnOnce(&'worker Worker)` closure, with no return type.
+    /// * A `for<'worker> FnOnce(&'worker Worker)` closure, with no return type.
     ///
-    /// + A `Future<Output = ()>` future, with no return type.
+    /// * A `Future<Output = ()>` future, with no return type.
     ///
     /// Unlike [`Scope::spawn`], this accepts the current worker as a parameter.
     pub fn spawn_on<M, S: ScopedSpawn<'scope, M>>(&'scope self, worker: &Worker, scoped_work: S) {
@@ -183,7 +210,7 @@ impl<'scope, 'env> Scope<'scope, 'env> {
     /// `Scope::remove_reference`, or the scope will block forever on
     /// completion.
     fn add_reference(&self) {
-        let counter = self.count.fetch_add(1, Ordering::Release);
+        let counter = self.count.fetch_add(1, Ordering::Relaxed);
         tracing::trace!("scope reference counter increased to {}", counter + 1);
     }
 
@@ -191,11 +218,16 @@ impl<'scope, 'env> Scope<'scope, 'env> {
     ///
     /// # Safety
     ///
-    /// The caller must ensure that there is exactly one a matching call to
-    /// `add_reference` for every call to this function, unless used within
-    /// `Scope::complete`.
+    /// The caller must ensure that each call to `remove_reference` corresponds
+    /// to exactly one prior call to `add_reference` (or the implicit initial
+    /// count of 1 provided by `Scope::new`, in the case of `Scope::complete`).
+    ///
+    /// If `remove_reference` is called without a matching `add_reference`, the
+    /// scope latch will be set prematurely, potentially allowing the scope to
+    /// be freed while a `ScopePtr` still holds a pointer to it. Uses of the
+    /// `ScopePtr` thereafter may produce use-after-free.
     unsafe fn remove_reference(&self) {
-        let counter = self.count.fetch_sub(1, Ordering::Acquire);
+        let counter = self.count.fetch_sub(1, Ordering::Relaxed);
         tracing::trace!("scope reference counter decreased to {}", counter - 1);
         if counter == 1 {
             // Alerts the owning thread that the scope has completed.
@@ -204,8 +236,11 @@ impl<'scope, 'env> Scope<'scope, 'env> {
             // once, when the scope has been dropped and all work has been
             // completed.
             //
-            // SAFETY: The latch is passed as a reference, and is live for the
-            // duration of the function.
+            // SAFETY: The owning thread must call `Scope::complete` before
+            // dropping any `Scope`, and `Scope::complete` does not return until
+            // the latch is set, which happens only here, after the count
+            // reaches zero. Therefore, the `completed` field of this `Scope`
+            // must still be a live latch.
             unsafe { Latch::set(&self.completed) };
         }
     }
@@ -215,9 +250,24 @@ impl<'scope, 'env> Scope<'scope, 'env> {
     /// remainder are dropped.
     #[cold]
     fn store_panic(&self, err: Box<dyn Any + Send + 'static>) {
+        // Check if the panic pointer has already been set. This lets us avoid
+        // allocating a second time, and means we can immediately drop the panic
+        // we have just been passed.
+        //
+        // Dropping this panic may itself trigger a pnaic, but this will simply
+        // trigger the scope's abort guard, causing an abort rather than UB.
         if self.panic.load(Ordering::Relaxed).is_null() {
             let nil = ptr::null_mut();
             let err_ptr = Box::into_raw(Box::new(err));
+            // Try to atomically swap the panic pointer from null to the newly
+            // allocated error slot. If this succeeds, the write occurs with
+            // `Release` ordering, which establishes a happens-before
+            // relationship with the fence in `maybe_propagate_panic`, so that
+            // the heap-allocated error will be visible to the reader.
+            //
+            // If the write fails, another panic must have already occurred, and
+            // we don't need to synchronize memory (the previous call to
+            // `store_panic` handles the syncrhonization for it's panic data).
             if self
                 .panic
                 .compare_exchange(nil, err_ptr, Ordering::Release, Ordering::Relaxed)
@@ -238,8 +288,18 @@ impl<'scope, 'env> Scope<'scope, 'env> {
 
     /// Propagates any panic captured while the scope was executing.
     fn maybe_propagate_panic(&self) {
+        // Swap out the panic pointer. This gives us exclusive read access to
+        // whatever it points to.
         let panic = self.panic.swap(ptr::null_mut(), Ordering::Relaxed);
         if !panic.is_null() {
+            // We generally don't expect pancis to happen.
+            cold_path();
+            // If the panic pointer is not null, emit an `Acquire` fence to
+            // establish a happens-after relationship with the `Release` branch
+            // of the `compare_exchange` call in `store_panic`, so that the
+            // error stored at the memory location pointed to by the atomic
+            // pointer will be visible on the following line.
+            fence(Ordering::Acquire);
             // SAFETY: This was created by `Box::into_raw` in `store_panic` and,
             // because of the atomic swap just above, is only called once for
             // each box.
@@ -264,6 +324,7 @@ impl<'scope, 'env> Scope<'scope, 'env> {
         // causing the latch to become set and allowing this function to
         // return.
         unsafe { self.remove_reference() };
+
         // Wait for the remaining work to complete.
         worker.wait_for(&self.completed);
     }
@@ -272,11 +333,13 @@ impl<'scope, 'env> Scope<'scope, 'env> {
 // -----------------------------------------------------------------------------
 // Generalized scoped spawn trait
 
-/// A trait for types that can be spawned onto a [`Scope`]. It is implemented for:
+/// A trait for types that can be spawned onto a [`Scope`].
 ///
-/// + Closures that satisfy `for<'worker> FnOnce(&'worker Worker) + Send + 'scope`.
+/// It is implemented for:
 ///
-/// + Futures that satisfy `Future<Output = ()> + Send + 'scope`.
+/// * Closures that satisfy `for<'worker> FnOnce(&'worker Worker) + Send + 'scope`.
+///
+/// * Futures that satisfy `Future<Output = ()> + Send + 'scope`.
 ///
 /// Due to a bug in rustc, you may be given errors when using closures
 /// with inferred types. If you encounter the following:
@@ -332,7 +395,7 @@ where
         let job_ref = unsafe { job.into_job_ref() };
 
         // Send the job to a queue to be executed.
-        worker.enqueue(job_ref);
+        worker.fifo_queue.push_new(job_ref);
     }
 }
 
@@ -344,7 +407,7 @@ where
     fn spawn_on<'env, 'worker>(self, worker: &'worker Worker, scope: &'scope Scope<'scope, 'env>) {
         let poll_job = ScopeFutureJob::new(worker.thread_pool(), scope, self);
         let job_ref = poll_job.into_job_ref();
-        worker.enqueue(job_ref);
+        worker.fifo_queue.push_new(job_ref);
     }
 }
 
@@ -360,14 +423,14 @@ const READY: u32 = 0;
 /// This value is used for the state of future-jobs that have already been
 /// woken. Jobs in this state may be in one of the three following categories:
 ///
-/// + A pending job that has been (or is about to be) pushed to the queue
+/// * A pending job that has been (or is about to be) pushed to the queue
 ///   so that it can be polled.
 ///
-/// + A pending job that is currently being polled (or has just finished) and
+/// * A pending job that is currently being polled (or has just finished) and
 ///   which was *not* queued after it was woken, because it was woken while
 ///   running.
 ///
-/// + A job that was woken after it completed or panicked. These jobs will stay
+/// * A job that was woken after it completed or panicked. These jobs will stay
 ///   in the WOKEN state forever, and will never be queued or polled again.
 ///
 /// When a WOKEN future-job is executed by a worker, it switches into the LOCKED
@@ -382,7 +445,7 @@ const WOKEN: u32 = 1;
 /// are either executing, completed, or have been canceled due to a panic. They
 /// may switch to the WOKEN state at any time, but are not queued to the pool
 /// when this happens (they are instead queued when the future is done being
-/// polled, assuming it has not pancaked or been completed).
+/// polled, assuming it has not panicked or been completed).
 ///
 /// When a job finished executing and has not been WOKEN, it switches back to
 /// the READY state.
@@ -426,7 +489,7 @@ impl<'scope, 'env, Fut> ScopeFutureJob<'scope, 'env, Fut>
 where
     Fut: Future<Output = ()> + Send + 'scope,
 {
-    /// This vtable is part of what allows a `ScopedFutureJob` to act as an
+    /// This vtable is part of what allows a `ScopeFutureJob` to act as an
     /// async task waker.
     const VTABLE: RawWakerVTable = RawWakerVTable::new(
         Self::clone_as_waker,
@@ -453,7 +516,7 @@ where
         })
     }
 
-    /// Converts an `Arc<ScpedFutureJob>` into a job ref that can be queued on a
+    /// Converts an `Arc<ScopeFutureJob>` into a job ref that can be queued on a
     /// thread pool. The ref-count is not decremented, ensuring that the job
     /// remains alive while this job ref exists.
     ///
@@ -462,8 +525,26 @@ where
         // SAFETY: Pointers created by `Arc::into_raw` are never null.
         let job_pointer = unsafe { NonNull::new_unchecked(Arc::into_raw(self).cast_mut().cast()) };
 
-        // SAFETY: This pointer is an erased `Arc<Self>` which is what
-        // `Self::poll` expects to receive.
+        // SAFETY: `JobRef::new_raw` requires that:
+        //
+        // * `job_pointer` and `Self::poll` be "matched".
+        //
+        //   `Self::poll` expects a pointer created by calling `Arc::into_raw`
+        //   on an `Arc<Self>`, which is exactly what `job_pointer` is.
+        //
+        // * `job_pointer` points to an initialized and aligned value which is
+        //   neither moved nor dropped until it is executed.
+        //
+        //   The Arc reference count must be least 1. `Arc::into_raw` transfers
+        //   ownership of the strong count from `self` into the `JobRef`, and
+        //   that count is only released in `poll`, after the arc produced by
+        //   `Arc::from_raw` is dropped. The data is therefore guaranteed to
+        //   remain live until `poll` is called.
+        //
+        // * If `poll` has additional safety requirements, `job_pointer` upholds
+        //   them.
+        //
+        //   In this case, `poll` does not have any additional requirements.
         unsafe { JobRef::new_raw(job_pointer, Self::poll) }
     }
 
@@ -521,12 +602,32 @@ where
             abort();
         }
 
-        // At this point, we have acquired exclusive ownership of the future.
-
-        // SAFETY: The arc never moves, and the future cannot be aliased mutably
-        // elsewhere because this is the only place we access it, and no other
-        // threads can have gotten past the memory swap above without causing an
-        // abort.
+        // SAFETY: The following line requires that:
+        //
+        // 1. No other mutable references to the future exist.
+        //
+        // 2. The future will not move.
+        //
+        // Access to the future is protected by the `state` field, which acts
+        // as a mutex. Just above, we executed
+        //
+        //     state.swap(LOCKED, Ordering::Acquire)
+        //
+        // which transitions us from the `WOKEN` into the `LOCKED` state. Any
+        // concurrent caller that also tries to execute `poll` will fail this
+        // swap, and cause an abort. Exclusive access is therefore guaranteed.
+        //
+        // In the event that `poll` has been called previously, the `Acquire`
+        // ordering synchronizes with the call to
+        //
+        //     state.compare_exchange(LOCKED, READY, Ordering::Release, Ordering::Release)
+        //
+        // later in this function. This ensures that all writes to the future
+        // performed by previous invocations are visible to us before we form
+        // the mutable reference.
+        //
+        // The future does not move, because it is stored in a field within an
+        // `Arc`, which has a stable heap-allocated address.
         let future = unsafe { Pin::new_unchecked(&mut *this.future.get()) };
 
         // Create a new context from the waker, and poll the future.
@@ -542,10 +643,6 @@ where
             }
             // The job is still pending, and has not yet panicked.
             Ok(Poll::Pending) => {
-                // The fence here ensures that our changes to the future become
-                // visible to the next thread to execute the job and poll the
-                // future.
-                fence(Ordering::Release);
                 // Try to set the state back back idle so other threads can
                 // schedule it again. This will only fail if the job was woken
                 // while running, and is already in the WOKEN state.
@@ -556,15 +653,28 @@ where
                     .state
                     .compare_exchange(LOCKED, READY, Ordering::Relaxed, Ordering::Relaxed)
                     .is_err();
+                // Emit a fence here, which synchronizes with the `Acquire` swap
+                // at the start of this function to ensure that the next thread
+                // to poll this future will observe the most recent version of
+                // it.
+                //
+                // A fence is required here because the write to `state` that
+                // establishes the happens-before relationship may be caused by
+                // either (a) the `compare_exchange` call above, or (b) the
+                // `swap` call in `wake`.
+                //
+                // This fence lets `wake` use `Relaxed` ordering, and upgrades
+                // it to `Release` only when necessary.
+                fence(Ordering::Release);
                 // If the job was woken while running, it should be queued
                 // immediately. Conveniently, we know the state will already be
-                // QUEUED, so we can leave it as it is.
+                // WOKEN, so we can leave it as it is.
                 if rescheduled {
                     // This converts the local `Arc<Self>` into a job ref,
                     // preventing it from being dropped and potentially
                     // extending the job's lifetime.
                     let job_ref = this.into_job_ref();
-                    worker.enqueue(job_ref);
+                    worker.fifo_queue.push_new(job_ref);
                 }
             }
             // The job panicked. Store the panic in the scope so it can be
@@ -589,7 +699,7 @@ where
     /// instance of `Arc<Self>` that is still alive.
     unsafe fn clone_as_waker(this: *const ()) -> RawWaker {
         // SAFETY: This is called on a pointer created by `Arc::into_raw` on an
-        // instance on of `Arc<Self`.
+        // instance of `Arc<Self>`.
         unsafe { Arc::increment_strong_count(this.cast::<Self>()) };
         RawWaker::new(this, &Self::VTABLE)
     }
@@ -602,14 +712,16 @@ where
     /// instance of `Arc<Self>` that is still alive.
     unsafe fn wake(this: *const ()) {
         // SAFETY: This is called on a pointer created by `Arc::into_raw` on an
-        // instance on of `Arc<Self`.
+        // instance of `Arc<Self>`.
         let this = unsafe { Arc::from_raw(this.cast::<Self>()) };
 
         if this.state.swap(WOKEN, Ordering::Relaxed) == READY {
-            this.thread_pool.with_worker(|worker| {
-                // Convert the waker into a job ref and queue it.
-                let job_ref = this.into_job_ref();
-                worker.enqueue(job_ref);
+            // Convert the waker into a job ref and queue it.
+            let thread_pool = this.thread_pool;
+            let job_ref = this.into_job_ref();
+            thread_pool.with_worker(|worker| match worker {
+                Some(worker) => worker.fifo_queue.push_new(job_ref),
+                None => thread_pool.queue_shared_job(job_ref),
             });
         }
     }
@@ -620,20 +732,23 @@ where
     ///
     /// Must be called with a pointer created by calling `Arc::into_raw` on an
     /// instance of `Arc<Self>` that is still alive.
-    fn wake_by_ref(this: *const ()) {
+    unsafe fn wake_by_ref(this: *const ()) {
         // We use manually drop here to prevent us from consuming the arc on
         // drop. This functions like an `&Arc<Self>` rather than an `Arc<Self>`.
         //
         // SAFETY: This is called on a pointer created by `Arc::into_raw` on an
-        // instance on of `Arc<Self`.
+        // instance of `Arc<Self>`.
         let this = unsafe { ManuallyDrop::new(Arc::from_raw(this.cast::<Self>())) };
 
         if this.state.swap(WOKEN, Ordering::Relaxed) == READY {
-            this.thread_pool.with_worker(|worker| {
-                // Clone the waker, convert it into a job-ref and queue it.
-                let this = ManuallyDrop::into_inner(this.clone());
-                let job_ref = this.into_job_ref();
-                worker.enqueue(job_ref);
+            // Clone the waker, convert it into a job-ref and queue it.
+            let this = ManuallyDrop::into_inner(this.clone());
+            let thread_pool = this.thread_pool;
+            let job_ref = this.into_job_ref();
+
+            thread_pool.with_worker(|worker| match worker {
+                Some(worker) => worker.fifo_queue.push_new(job_ref),
+                None => thread_pool.queue_shared_job(job_ref),
             });
         }
     }
@@ -644,12 +759,12 @@ where
     ///
     /// Must be called with a pointer created by calling `Arc::into_raw` on an
     /// instance of `Arc<Self>` that is still alive.
-    fn drop_as_waker(this: *const ()) {
+    unsafe fn drop_as_waker(this: *const ()) {
         // Rather than converting back into an arc, we can just decrement the
         // counter here.
         //
         // SAFETY: This is called on a pointer created by `Arc::into_raw` on an
-        // instance on of `Arc<Self`.
+        // instance of `Arc<Self>`.
         unsafe { Arc::decrement_strong_count(this.cast::<Self>()) };
     }
 }
@@ -670,10 +785,16 @@ mod scope_ptr {
     /// reference scope from being deallocated.
     pub struct ScopePtr<'scope, 'env>(*const Scope<'scope, 'env>);
 
-    // SAFETY: !Send for raw pointers is not for safety, just as a lint.
+    // SAFETY: This is safe because (a) scope-pointer is only used to call
+    // `add_reference`, `remove_reference`, and `store_panic`, all of which are
+    // designed to be thread-safe; and (b) the `Scope` cannot be deallocated
+    // while any `ScopePtr` still points to it (due to reference counting).
     unsafe impl Send for ScopePtr<'_, '_> {}
 
-    // SAFETY: !Sync for raw pointers is not for safety, just as a lint.
+    // SAFETY: This is safe because (a) scope-pointer is only used to call
+    // `add_reference`, `remove_reference`, and `store_panic`, all of which are
+    // designed to be thread-safe; and (b) the `Scope` cannot be deallocated
+    // while any `ScopePtr` still points to it (due to reference counting).
     unsafe impl Sync for ScopePtr<'_, '_> {}
 
     impl<'scope, 'env> ScopePtr<'scope, 'env> {
@@ -730,13 +851,12 @@ mod tests {
     use std::vec;
     use std::vec::Vec;
 
+    use super::Scope;
     use crate::ThreadPool;
     use crate::Worker;
     use crate::scope;
     use crate::unwind;
     use crate::util::XorShift64Star;
-
-    use super::Scope;
 
     /// Tests that empty scopes return properly.
     #[test]
@@ -833,7 +953,7 @@ mod tests {
         THREAD_POOL.depopulate();
     }
 
-    /// Tests that we can spawn futures onto the thraed pool and that they can
+    /// Tests that we can spawn futures onto the thread pool and that they can
     /// borrow data as expected.
     #[test]
     fn scope_future() {
@@ -924,7 +1044,7 @@ mod tests {
         let a = AtomicU8::new(0);
         let b = AtomicU8::new(0);
 
-        THREAD_POOL.with_worker(|worker| {
+        THREAD_POOL.on_worker(|worker| {
             scope(|scope| {
                 for _ in 0..NUM_JOBS {
                     scope.spawn_on(worker, |_: &Worker| {
@@ -973,12 +1093,12 @@ mod tests {
 
         let mut completed = false;
 
-        THREAD_POOL.with_worker(|worker| {
+        THREAD_POOL.on_worker(|worker| {
             worker.scope(|scope| {
                 scope.spawn_on(worker, |_: &Worker| {
                     // Creating a new worker instead of reusing the old one is
                     // bad form, but we may as well test it.
-                    THREAD_POOL.with_worker(|worker| {
+                    THREAD_POOL.on_worker(|worker| {
                         worker.scope(|scope| {
                             scope.spawn_on(worker, |_: &Worker| {
                                 completed = true;
@@ -1002,7 +1122,7 @@ mod tests {
         THREAD_POOL.resize_to_available();
 
         let counter_p = &AtomicUsize::new(0);
-        THREAD_POOL.with_worker(|worker| {
+        THREAD_POOL.on_worker(|worker| {
             worker.scope(|scope| {
                 scope.spawn(move |worker: &Worker| {
                     divide_and_conquer(worker, scope, counter_p, 1024)
@@ -1055,7 +1175,7 @@ mod tests {
         static THREAD_POOL: ThreadPool = ThreadPool::new();
         THREAD_POOL.resize_to_available();
 
-        THREAD_POOL.with_worker(|_| {
+        THREAD_POOL.on_worker(|_| {
             let mut tree = random_tree(10, 1337);
             let values: Vec<_> = tree.iter().cloned().collect();
             tree.update(|v| *v += 1);
@@ -1143,7 +1263,7 @@ mod tests {
         static THREAD_POOL: ThreadPool = ThreadPool::new();
         THREAD_POOL.resize_to_available();
 
-        THREAD_POOL.with_worker(|_| {
+        THREAD_POOL.on_worker(|_| {
             let mut max_diff = Mutex::new(0);
             let bottom_of_stack = 0;
             scope(|s| the_final_countdown(s, &bottom_of_stack, &max_diff, 5));

@@ -1,15 +1,13 @@
 //! A core concept in Rayon is the *latch*. Forte has borrowed this, in a
 //! somewhat simplified form.
 //!
-//! Every forte worker thread is has a single "sleep controller" that it uses to
+//! Every forte worker thread has a single "sleep controller" that it uses to
 //! park and unpark itself. Latches build on this to create a simple boolean
 //! switch, which allows the owning thread to sleep until the latch becomes set
 //! by another thread.
 
-use core::{
-    pin::Pin,
-    task::{RawWaker, RawWakerVTable, Waker},
-};
+use alloc::task::Wake;
+use core::borrow::Borrow;
 
 use crate::platform::*;
 
@@ -40,20 +38,36 @@ const ASLEEP: u32 = 0b10;
 /// The general idea and spirit for latches (as well as some of the
 /// documentation) is due to rayon. However the implementation is specific to
 /// forte.
+///
+/// ## Memory Ordering
+///
+/// Latches _do not synchronize memory_. They are only used for signaling. If
+/// the thread that sets a latch wishes to transmit a value to the thread
+/// waiting for that latch, explicit fences must be used.
 pub struct Latch {
     /// Holds the internal state of the latch. This tracks if the latch has been
     /// set or not.
     state: AtomicU32,
+    /// Tracks the number of sleeping threads in the pool.
+    sleeping: &'static AtomicU32,
     /// The sleep controller for the owning thread.
     sleep_controller: &'static SleepController,
+    /// The seat number that owns this latch
+    seat_number: usize,
 }
 
 impl Latch {
     /// Creates a new latch, owned by a specific thread.
-    pub fn new(sleep_controller: &'static SleepController) -> Latch {
+    pub fn new(
+        seat_number: usize,
+        sleeping: &'static AtomicU32,
+        sleep_controller: &'static SleepController,
+    ) -> Latch {
         Latch {
             state: AtomicU32::new(LOCKED),
+            sleeping,
             sleep_controller,
+            seat_number,
         }
     }
 
@@ -66,13 +80,22 @@ impl Latch {
     /// Waits for the latch to be set. In actuality, this may be woken.
     ///
     /// Returns true if the latch signal was received, and false otherwise.
+    ///
+    /// # Memory Ordering
+    ///
+    /// This does not synchronize memory. To synchronize memory with the thread
+    /// setting the latch, call `fence(Ordering::Acquire)` after this function.
+    /// The other thread must issue a corresponding `fence(Ordering::Release)`
+    /// call.
     #[cold]
     pub fn wait(&self) {
         // First, check if the latch has been set.
         //
         // In the event of a race with `set`:
-        // + If this happens before the store, then we will go to sleep.
-        // + If this happens after the store, then we notice and return.
+        //
+        // * If this happens before the store, then we will go to sleep.
+        //
+        // * If this happens after the store, then we notice and return.
         if self.state.load(Ordering::Relaxed) == SIGNAL {
             return;
         }
@@ -80,7 +103,7 @@ impl Latch {
         //
         // In the event of a race with `set`, the `wake` will always cause this
         // to return regardless of memory ordering.
-        self.sleep_controller.sleep();
+        self.sleep_controller.sleep(self.seat_number, self.sleeping);
     }
 
     /// Activates the latch, potentially unblocking the owning thread.
@@ -88,35 +111,46 @@ impl Latch {
     /// This takes a raw pointer because the latch may be de-allocated by a
     /// different thread while this function is executing.
     ///
+    /// # Memory Ordering
+    ///
+    /// This does not synchronize memory. To synchronize memory with the waiting
+    /// thread, call `fence(Ordering::Release)` before this function. The other
+    /// thread must issue a corresponding `fence(Ordering::Acquire)` call.
+    ///
     /// # Safety
     ///
-    /// The latch pointer must be valid when passed to this function, and must
-    /// not be allowed to become dangling until after the latch is set.
+    /// The latch pointer must be valid when passed to this function. After this
+    /// call, the latch pointer may become dangling and must not be dereferenced
+    /// unless it is known to still be valid.
     #[inline(always)]
     pub unsafe fn set(latch: *const Latch) {
-        // SAFETY: At this point, the latch must still be valid to dereference.
-        let sleep_controller = unsafe { (*latch).sleep_controller };
+        // SAFETY: The caller guarantees the latch remain alive until `set`
+        // returns.
+        let latch = unsafe { &*latch };
+        let sleep_controller = latch.sleep_controller;
         // First we set the state to true.
         //
         // In the event of a race with `wait`, this may cause `wait` to return.
         // Otherwise the other thread will sleep within `wait.
-        //
-        // SAFETY: At this point, the latch must still be valid to dereference.
-        unsafe { (*latch).state.store(SIGNAL, Ordering::Relaxed) };
+        latch.state.store(SIGNAL, Ordering::Relaxed);
         // We must try to wake the other thread, just in case it missed the
-        // notification and went to sleep. This garentees that the other thread
+        // notification and went to sleep. This guarantees that the other thread
         // will make progress.
         sleep_controller.wake();
     }
 
     /// Restores the latch to the default state.
     ///
-    /// # Safety
+    /// # Deadlocks
     ///
-    /// This may only be called when in the `SIGNAL` state, eg. after either `wait` or
-    /// `check` has returned `true`.
+    /// This may only be called by the thread that "owns" the latch, and only
+    /// after it has *observed* the latch entering the `SIGNAL` state, e.g.
+    /// after either `wait` or `check` has returned `true`.
+    ///
+    /// Calling `reset` from a different thread or before observing the signal
+    /// is likely to result in deadlocks.
     #[inline(always)]
-    pub unsafe fn reset(&self) {
+    pub fn reset(&self) {
         self.state.store(LOCKED, Ordering::Relaxed);
     }
 }
@@ -128,58 +162,52 @@ impl Latch {
 #[cfg(not(feature = "shuttle"))]
 pub struct SleepController {
     state: AtomicU32,
-    num_sleeping: &'static AtomicU32,
 }
 
 #[cfg(not(feature = "shuttle"))]
 impl SleepController {
-    /// Creates a new latch. Expects to be passed an atomic used for tracking
-    /// the number of sleeping workers.
-    pub fn new(num_sleeping: &'static AtomicU32) -> Self {
+    /// Creates a new sleep controller.
+    pub const fn new() -> Self {
         SleepController {
             state: AtomicU32::new(LOCKED),
-            num_sleeping,
         }
     }
 
-    // Attempt to wake the thread to which this belongs.
-    //
-    // Returns true if this allows the thread to make progress (by waking it up
-    // or catching it before it goes to sleep) and false if the thread was
-    // running.
+    /// Attempt to wake the thread to which this belongs.
+    ///
+    /// Returns true if this allows the thread to make progress (by waking it up
+    /// or catching it before it goes to sleep) and false if the thread was
+    /// running.
     #[inline(always)]
     pub fn wake(&self) -> bool {
-        // Set set the state to SIGNAL and read the current state, which must be
+        // Set the state to SIGNAL and read the current state, which must be
         // either LOCKED, ASLEEP or SIGNAL.
         let sleep_state = self.state.swap(SIGNAL, Ordering::Relaxed);
-        let asleep = sleep_state == ASLEEP;
-        if asleep {
-            // Decrement the sleeping counter by one.
-            self.num_sleeping.fetch_sub(1, Ordering::Relaxed);
+        if sleep_state == ASLEEP {
             // If the state was ASLEEP, the thread is either asleep or about to
             // go to sleep.
             //
-            // + If it is about to go to sleep (but has not yet called
+            // * If it is about to go to sleep (but has not yet called
             //   `atomic_wait::wait`) then setting the state to SIGNAL above
             //   should prevent it from going to sleep.
             //
-            // + If it is already waiting, the following notification will wake
+            // * If it is already waiting, the following notification will wake
             //   it up.
             //
             // Either way, after this call the other thread must make progress.
             atomic_wait::wake_one(&self.state);
         }
-        // Return true if the other thread was asleep
-        asleep
+        // Return true if the other thread was asleep and not already notified.
+        sleep_state == ASLEEP
     }
 
-    // Attempt to send the thread to sleep. This should only be called on a
-    // single thread, and we say that this controller "belongs" to that thread.
-    //
-    // Returns true if this thread makes a syscall to suspend the thread, and
-    // false if the thread was already woken (letting us skip the syscall).
+    /// Attempt to send the thread to sleep. This should only be called on a
+    /// single thread, and we say that this controller "belongs" to that thread.
+    ///
+    /// Returns true if this thread makes a syscall to suspend the thread, and
+    /// false if the thread was already woken (letting us skip the syscall).
     #[cold]
-    pub fn sleep(&self) {
+    pub fn sleep(&self, seat_number: usize, sleeping: &'static AtomicU32) {
         // Set the state to ASLEEP and read the current state, which must be
         // either LOCKED or SIGNAL.
         let state = self.state.swap(ASLEEP, Ordering::Relaxed);
@@ -187,10 +215,10 @@ impl SleepController {
         // we should try to put the thread to sleep. Otherwise we should return
         // early.
         if state == LOCKED {
-            // Increase the sleeping count by one.
-            self.num_sleeping.fetch_add(1, Ordering::Relaxed);
+            // Set the sleeping bit for this worker.
+            sleeping.fetch_or(1 << seat_number, Ordering::Relaxed);
             // If we have received a signal since entering the sleep state
-            // (meaning the state is not longer set to ASLEEP) then this will
+            // (meaning the state is no longer set to ASLEEP) then this will
             // return immediately.
             //
             // If the state is still ASLEEP, then the next call to `wake` will
@@ -198,6 +226,8 @@ impl SleepController {
             //
             // Either way, there is no way we can fail to receive a `wake`.
             atomic_wait::wait(&self.state, ASLEEP);
+            // Clear the sleeping bit for this worker.
+            sleeping.fetch_and(!(1 << seat_number), Ordering::Relaxed);
         }
         // Set the state back to LOCKED so that we are ready to receive new
         // signals.
@@ -217,17 +247,14 @@ pub struct SleepController {
 }
 
 #[cfg(feature = "shuttle")]
-impl Default for SleepController {
-    fn default() -> SleepController {
+impl SleepController {
+    pub fn new() -> Self {
         SleepController {
             state: Mutex::new(LOCKED),
             condvar: Condvar::new(),
         }
     }
-}
 
-#[cfg(feature = "shuttle")]
-impl SleepController {
     pub fn wake(&self) -> bool {
         let state = core::mem::replace(&mut *self.state.lock().unwrap(), SIGNAL);
         let asleep = state == ASLEEP;
@@ -237,43 +264,33 @@ impl SleepController {
         asleep
     }
 
-    pub fn sleep(&self) {
+    pub fn sleep(&self, seat_number: usize, sleeping: &'static AtomicU32) {
         let mut state = self.state.lock().unwrap();
         if *state == LOCKED {
             *state = ASLEEP;
-            self.condvar.wait(state).unwrap();
+            sleeping.fetch_or(1 << seat_number, Ordering::Relaxed);
+            while *state == ASLEEP {
+                state = self.condvar.wait(state).unwrap();
+            }
+            sleeping.fetch_and(!(1 << seat_number), Ordering::Relaxed);
         }
+        *state = LOCKED;
     }
 }
 
 // -----------------------------------------------------------------------------
-// Async waker
+// Async wakers
 
-impl Latch {
-    /// Creates an async waker from a reference to a latch.
-    ///
-    /// # Safety
-    ///
-    /// The latch must outlive the waker.
-    pub unsafe fn as_waker(self: Pin<&Self>) -> Waker {
-        let this: *const Self = Pin::get_ref(self);
-        let raw_waker = RawWaker::new(this.cast::<()>(), &RAW_WAKER_VTABLE);
-        // SAFETY: The RawWakerVTable api contract is upheald and these
-        // functions are all thread-safe.
-        unsafe { Waker::from_raw(raw_waker) }
+impl Wake for Latch {
+    fn wake(self: Arc<Self>) {
+        // SAFETY: The borrowed `Arc` is held for the duration of this call,
+        // keeping the `Latch` alive.
+        unsafe { Latch::set(self.borrow()) };
     }
-}
 
-const RAW_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
-    #[inline(always)]
-    |ptr| RawWaker::new(ptr, &RAW_WAKER_VTABLE),
-    wake,
-    wake,
-    |_| {},
-);
-
-fn wake(this: *const ()) {
-    let latch = this.cast::<Latch>();
-    // SAFETY: The latch must be valid for the duration
-    unsafe { Latch::set(latch) };
+    fn wake_by_ref(self: &Arc<Self>) {
+        // SAFETY: The borrowed `Arc` is held for the duration of this call,
+        // keeping the `Latch` alive.
+        unsafe { Latch::set(self.borrow()) };
+    }
 }

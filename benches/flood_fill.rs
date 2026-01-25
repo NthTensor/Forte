@@ -1,7 +1,10 @@
 //! A benchmark for fork-join workloads adapted from `chili`.
 
-use std::collections::{HashSet, VecDeque};
-use std::hash::{DefaultHasher, Hash, Hasher};
+use std::collections::HashSet;
+use std::collections::VecDeque;
+use std::hash::DefaultHasher;
+use std::hash::Hash;
+use std::hash::Hasher;
 
 use criterion::black_box;
 use dashmap::DashSet;
@@ -69,7 +72,8 @@ static COMPUTE: forte::ThreadPool = forte::ThreadPool::new();
 
 #[divan::bench(args = sizes(), threads = false)]
 fn forte(bencher: Bencher, size: usize) {
-    use forte::{Scope, Worker};
+    use forte::Scope;
+    use forte::Worker;
 
     fn visit<'scope, 'env>(
         size: usize,
@@ -122,7 +126,7 @@ fn forte(bencher: Bencher, size: usize) {
         }
     }
 
-    COMPUTE.with_worker(|worker| {
+    COMPUTE.expect_worker(|worker| {
         bencher.bench_local(|| {
             let visited = DashSet::new();
 
@@ -135,7 +139,8 @@ fn forte(bencher: Bencher, size: usize) {
 
 #[divan::bench(args = sizes(), threads = false)]
 fn rayon(bencher: Bencher, size: usize) {
-    use rayon::{Scope, scope};
+    use rayon::Scope;
+    use rayon::scope;
 
     fn visit<'scope>(
         size: usize,

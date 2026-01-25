@@ -1,8 +1,7 @@
-use core::{
-    cell::Cell,
-    hash::Hasher,
-    sync::atomic::{AtomicUsize, Ordering},
-};
+use core::cell::Cell;
+use core::hash::Hasher;
+use core::sync::atomic::AtomicUsize;
+use core::sync::atomic::Ordering;
 use std::hash::DefaultHasher;
 
 /// [xorshift*] is a fast pseudorandom number generator which will

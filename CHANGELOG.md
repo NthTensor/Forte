@@ -1,3 +1,4 @@
+
 # Changelog
 
 All notable changes to this project will be documented in this file.
@@ -12,6 +13,23 @@ This project is currently in early [pre-release], and there may be arbitrary bre
 [pre-release]: https://semver.org/spec/v2.0.0.html#spec-item-9
 
 ## [Unreleased]
+
+### Added 
+
+- `ThreadPool::num_workers` method which return the current number of workers
+- `ThreadPool::on_worker` variant of `with_worker` for `Send` closures.
+- `ThreadPool::expect_worker` variant of `with_worker` that panics.
+
+### Changed
+- Work sharing has been rewritten to improve performance.
+- Thread pools can now have a max of 32 workers at a time.
+- `spawn`, `Scope::spawn`, and `Worker::spawn` now accept closures and futures.
+- `ThreadPool::with_worker` now provides `Option<&Worker>` instead of `&Worker`.
+- `claim_lease` now returns `Option<Lease>` instead of `Lease`.
+- `Scope` now has two lifetimes instead of one, and is more flexible.
+
+### Removed
+- All versions of `spawn_future` and `spawn_async`; just use `spawn` instead.
 
 ## [1.0.0-alpha.4]
 

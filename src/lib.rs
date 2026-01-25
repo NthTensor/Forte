@@ -4,12 +4,18 @@
 //! `ForkJoinPool`.
 //!
 //! It features:
-//! + Statically defined and dynamically sized thread pools.
-//! + Fully stack-allocated and inlined fork/join parrellism.
-//! + The ability to execute both closures and futures on the same pool.
-//! + Hybrid scopes that can contain work distributed across multiple thread pools.
-//! + A primitive for awaiting async work in non-async contexts without spinning.
-//! + An exposed unsafe api, built for for low-level integration and customization.
+//!
+//! * Statically defined and dynamically sized thread pools.
+//!
+//! * Fully stack-allocated and inlined fork/join parallelism.
+//!
+//! * The ability to execute both closures and futures on the same pool.
+//!
+//! * Hybrid scopes that can contain work distributed across multiple thread pools.
+//!
+//! * A primitive for awaiting async work in non-async contexts without spinning.
+//!
+//! * An exposed unsafe api, built for low-level integration and customization.
 //!
 //! Here's an example of what it looks like:
 //!
@@ -24,7 +30,7 @@
 //!     THREAD_POOL.resize_to_available();
 //!
 //!     // Register this thread as a worker on the pool.
-//!     THREAD_POOL.with_worker(|worker| {
+//!     THREAD_POOL.expect_worker(|worker| {
 //!         // Spawn a job onto the pool. The closure also accepts a worker, because the
 //!         // job may be executed on a different thread. This will be the worker for whatever
 //!         // thread it executes on.
@@ -96,7 +102,7 @@
 //! external thread tries to use a pool of size zero (with no workers), it will
 //! still be able to do work, it just won't be done in parallel. And if multiple
 //! external threads use an empty pool at the same time, they will sometimes try
-//! to collaborate and help each-other out with work.
+//! to collaborate and help each other out with work.
 //!
 //! ```
 //! # use forte::ThreadPool;
@@ -113,7 +119,7 @@
 //! THREAD_POOL.depopulate();
 //!
 //! // Do the same work, but this time we know it will execute serially (because
-//! // there are no workers to parallelized it).
+//! // there are no workers to parallelize it).
 //! THREAD_POOL.join(|_| println!("world"), |_| println!("hello "));
 //!
 //! // This will always print "hello world" (because join happens execute things
@@ -125,22 +131,23 @@
 //! Thread pools are comprised of (and run on) workers, represented as instances
 //! of the [`Worker`] type. All work done on the pool is done in a "worker
 //! context" created by [`Worker::occupy`]. The recommended way to access a
-//! worker context for a specific pool is via [`ThreadPool::with_worker`].
+//! worker context for a specific pool is via [`ThreadPool::with_worker`],
+//! [`ThreadPool::on_worker`], or [`ThreadPool::expect_worker`].
 //!
 //! ```
 //! # use forte::ThreadPool;
 //! # static THREAD_POOL: ThreadPool = ThreadPool::new();
-//! THREAD_POOL.with_worker(|worker_1| {     // <-- Creates a worker on the pool.
-//!     THREAD_POOL.with_worker(|worker_2| { // <-- Returns a reference to the existing worker.
+//! THREAD_POOL.expect_worker(|worker_1| {     // <-- Sets up this thread as a worker.
+//!     THREAD_POOL.expect_worker(|worker_2| { // <-- Returns a reference to the existing worker.
 //!         // These pointers are identical.
 //!         assert!(std::ptr::eq(worker_1, worker_2));
-//!     });                                  // <-- Leaving this scope does nothing.
-//! });                                      // <-- Leaving this scope frees the worker.
+//!     });                                    // <-- Leaving this scope does nothing.
+//! });                                        // <-- Leaving this scope frees the worker.
 //! ```
 //!
 //! Every worker holds a local queue of tasks, as well as metadata that allows
 //! other workers on the pool to communicate with it and wake it from sleep.
-//! When existing outermost scope (where the worker was actually allocated), all
+//! When exiting the outermost scope (where the worker was actually allocated), all
 //! tasks left in the local queue are executed.
 //!
 //! You will only ever receive `&Worker` references, because the worker is not
@@ -149,7 +156,7 @@
 //!
 //! To access the current worker context, you can use [`Worker::map_current`] or
 //! [`Worker::with_current`]. These allow executing work on arbitrary pools, and
-//! can be used to write library code that works normally dispute not knowing
+//! can be used to write library code that works normally despite not knowing
 //! about the thread pool static defined by the application.
 //!
 //! ```rust
@@ -163,7 +170,6 @@
 //!         None => foo()
 //!     })
 //! }
-//!
 //! ```
 //!
 //! # Core Operations
@@ -175,7 +181,7 @@
 //! * *Block on.* Waits for a future to complete (outside of an async context).
 //!
 //! All of these with the exception of *Spawn* are blocking; they have a
-//! specific join-point where a thread must wait for the all the forks of the
+//! specific join-point where a thread must wait for all the forks of the
 //! parallel operation to complete before proceeding. While it is waiting,
 //! threads will attempt to do background work, or help each-other out with
 //! their assigned workload.
@@ -191,8 +197,8 @@
 //! | *Block on* | [`block_on()`] | [`ThreadPool::block_on()`] | [`Worker::block_on()`]
 //!
 //! * *Worker.* Uses the provided worker context.
-//! * *Thread pool.* Looks for an existing worker context, creates one if it dosn't find one.
-//! * *Headless.* Looks for an existing worker context, and panics if it dosn't find one.
+//! * *Thread pool.* Looks for an existing worker context, creates one if it doesn't find one.
+//! * *Headless.* Looks for an existing worker context, and panics if it doesn't find one.
 //!
 //! The headless and thread pool flavors are more or less just aliases for the
 //! worker flavor. Where possible, the worker flavor should be preferred to the
@@ -273,9 +279,8 @@ mod platform {
     pub use core::sync::atomic::AtomicPtr;
     pub use core::sync::atomic::AtomicU32;
     pub use core::sync::atomic::Ordering;
-    pub use std::sync::Barrier;
-    pub use std::sync::Condvar;
     pub use std::sync::Mutex;
+    pub use std::sync::OnceLock;
     pub use std::thread::Builder as ThreadBuilder;
     pub use std::thread::JoinHandle;
     pub use std::thread::available_parallelism;
@@ -287,8 +292,11 @@ mod platform {
 
     // Core exports
 
+    pub use std::sync::OnceLock; // shuttle has no OnceLock; std's version is fine here
+
+    pub use shuttle::rand::Rng;
+    pub use shuttle::rand::thread_rng;
     pub use shuttle::sync::Arc;
-    pub use shuttle::sync::Barrier;
     pub use shuttle::sync::Condvar;
     pub use shuttle::sync::Mutex;
     pub use shuttle::sync::Weak;
@@ -299,9 +307,6 @@ mod platform {
     pub use shuttle::thread::Builder as ThreadBuilder;
     pub use shuttle::thread::JoinHandle;
     pub use shuttle::thread_local;
-
-    pub use shuttle::rand::Rng;
-    pub use shuttle::rand::thread_rng;
 
     // Available parallelism
 

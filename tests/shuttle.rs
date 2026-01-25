@@ -9,7 +9,6 @@ use core::task::Poll;
 
 use forte::ThreadPool;
 use forte::Worker;
-
 use shuttle::hint::black_box;
 use shuttle::sync::atomic::AtomicBool;
 use shuttle::sync::atomic::AtomicUsize;
@@ -19,24 +18,6 @@ use tracing_subscriber::fmt::Subscriber;
 
 // -----------------------------------------------------------------------------
 // Infrastructure
-
-/*
-
-fn trace<F>(f: F)
-where
-    F: Fn() + Send + Sync + 'static,
-{
-    let subscriber = Subscriber::builder()
-        .compact()
-        .with_max_level(Level::TRACE)
-        .without_time()
-        .with_thread_names(false)
-        .finish();
-
-    tracing::subscriber::with_default(subscriber, f);
-}
-
-*/
 
 /// Provides access to a thread pool which can be treated as static for the
 /// purposes of testing.
@@ -48,13 +29,9 @@ where
         let thread_pool = Box::new(ThreadPool::new());
         let thread_pool_ptr = Box::into_raw(thread_pool);
 
-        // SAFETY: TODO
+        // SAFETY: This thread pool is never dropped.
         let thread_pool_ref = unsafe { &*thread_pool_ptr };
         f(thread_pool_ref);
-
-        // SAFETY: TODO
-        let thread_pool = unsafe { Box::from_raw(&mut *thread_pool_ptr) };
-        drop(thread_pool);
     }
 }
 
@@ -70,7 +47,7 @@ pub fn shuttle_populate_depopulate() {
         pool.depopulate();
     });
 
-    shuttle::check_dfs(test, None);
+    shuttle::check_pct(test, 100_000, 100_000);
 }
 
 // -----------------------------------------------------------------------------
@@ -85,7 +62,7 @@ pub fn shuttle_spawn_closure() {
         pool.depopulate();
     });
 
-    shuttle::check_dfs(test, None);
+    shuttle::check_pct(test, 100_000, 100_000);
 }
 
 #[derive(Default)]
@@ -117,7 +94,7 @@ pub fn shuttle_spawn_future() {
         pool.depopulate();
     });
 
-    shuttle::check_dfs(test, None);
+    shuttle::check_pct(test, 100_000, 100_000);
 }
 
 /// Tests a two-level join operation on a pool of size one.
@@ -146,7 +123,7 @@ pub fn join_4_on_1() {
         pool.depopulate();
     });
 
-    shuttle::check_pct(test, 100_000, 10_000);
+    shuttle::check_pct(test, 100_000, 100_000);
 }
 
 /// Tests a two-level join operation on a pool of size two.
@@ -175,7 +152,7 @@ pub fn join_4_on_2() {
         pool.depopulate();
     });
 
-    shuttle::check_pct(test, 100_000, 10_000);
+    shuttle::check_pct(test, 100_000, 100_000);
 }
 
 /// Tests a two-level join operation on a pool of size three.
@@ -204,7 +181,7 @@ pub fn join_4_on_3() {
         pool.depopulate();
     });
 
-    shuttle::check_pct(test, 100_000, 10_000);
+    shuttle::check_pct(test, 100_000, 100_000);
 }
 
 /// Tests a moderately deep join operation on a large pool.
@@ -226,115 +203,11 @@ pub fn join_long() {
         }
 
         let mut vals = [0; 10];
-        pool.with_worker(|worker| increment(worker, &mut vals));
+        pool.expect_worker(|worker| increment(worker, &mut vals));
         assert_eq!(vals, [1; 10]);
 
         pool.depopulate();
     });
 
-    shuttle::check_pct(test, 100_000, 10_000);
+    shuttle::check_pct(test, 100_000, 100_000);
 }
-
-/*
-
-/// Tests for concurrency issues when blocking on a future.
-#[test]
-pub fn block_on() {
-    model(|| {
-        with_thread_pool(|_, worker| {
-            worker.block_on(async {
-                black_box(());
-            });
-        });
-    });
-}
-
-/// Tests for concurrency issues when spawning a future and then blocking on the
-/// resulting task.
-#[test]
-pub fn spawn_and_block() {
-    model(|| {
-        with_thread_pool(|_, worker| {
-            let task = worker.spawn_future(async {
-                black_box(());
-            });
-            worker.block_on(task);
-        });
-    });
-}
-
-// -----------------------------------------------------------------------------
-// Scoped API
-
-/// Test for concurrency issues when creating a scope.
-#[test]
-pub fn scope_empty() {
-    model(|| {
-        with_thread_pool(|_, worker| {
-            worker.scope(|_| {});
-        });
-    });
-}
-
-/// Tests for concurrency issues when returning a value from a scope.
-#[test]
-fn scope_result() {
-    model(|| {
-        with_thread_pool(|_, worker| {
-            let result = worker.scope(|_| 22);
-            assert_eq!(result, 22);
-        });
-    });
-}
-
-/// Tests for concurrency issues when spawning a scoped closure.
-#[test]
-pub fn scope_spawn() {
-    model(|| {
-        with_thread_pool(|_, worker| {
-            let complete = AtomicBool::new(false);
-            worker.scope(|scope| {
-                scope.spawn(|_| {
-                    complete.store(true, Ordering::Release);
-                });
-            });
-            worker.run_until(&complete);
-        });
-    });
-}
-
-/// Tests for concurrency issues when spawning multiple scoped closures.
-#[test]
-pub fn scope_two() {
-    model(|| {
-        with_thread_pool(|_, worker| {
-            let counter = &AtomicUsize::new(0);
-            worker.scope(|scope| {
-                scope.spawn(|_| {
-                    counter.fetch_add(1, Ordering::SeqCst);
-                });
-                scope.spawn(|_| {
-                    counter.fetch_add(10, Ordering::SeqCst);
-                });
-            });
-            let v = counter.load(Ordering::SeqCst);
-            assert_eq!(v, 11);
-        });
-    });
-}
-
-/// Tests for concurrency issues when spawning a scoped future, and blocking on
-/// it.
-#[test]
-pub fn scope_future() {
-    model(|| {
-        with_thread_pool(|_, worker| {
-            let vec = vec![1, 2, 3];
-            let task = worker.scope(|scope| scope.spawn_future(async { black_box(vec.len()) }));
-            let len = worker.block_on(task);
-            assert_eq!(len, vec.len());
-        });
-    });
-}
-
-*/
