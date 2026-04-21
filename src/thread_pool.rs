@@ -585,6 +585,7 @@ pub struct Worker {
     lease: Lease,
     queue: JobQueue,
     rng: XorShift64Star,
+    last_promote_tick: Cell<u64>,
     // Make non-send
     _phantom: PhantomData<*const ()>,
 }
@@ -624,6 +625,7 @@ impl Worker {
             lease,
             queue: JobQueue::new(),
             rng: XorShift64Star::new(),
+            last_promote_tick: Cell::new(0),
             _phantom: PhantomData,
         };
 
@@ -723,9 +725,19 @@ impl Worker {
         self.queue.push(job_ref);
     }
 
+    /// The minimum number of CPU ticks between calls to [`Worker::promote_cold`].
+    /// Approximately 100μs at 3 GHz.
+    const PROMOTE_TICK_INTERVAL: u64 = 100_000;
+
     /// Try to promote the oldest task in the queue.
     #[inline(always)]
     fn promote(&self) {
+        let current_tick = tick_counter::start();
+        if current_tick.wrapping_sub(self.last_promote_tick.get()) < Self::PROMOTE_TICK_INTERVAL {
+            return;
+        }
+        self.last_promote_tick.set(current_tick);
+
         let sleeping = self.lease.thread_pool.sleeping.load(Ordering::Relaxed);
         if sleeping == 0 {
             return;
