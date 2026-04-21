@@ -45,9 +45,11 @@ pub struct Latch {
     /// set or not.
     state: AtomicU32,
     /// Tracks the number of sleeping threads in the pool.
-    num_sleeping: &'static AtomicU32,
+    sleeping: &'static AtomicU32,
     /// The sleep controller for the owning thread.
     sleep_controller: &'static SleepController,
+    /// The seat number that owns this latch
+    seat_number: usize,
 }
 
 impl Latch {
@@ -57,13 +59,15 @@ impl Latch {
     ///
     /// The sleep controller must outlive this latch.
     pub fn new(
-        num_sleeping: &'static AtomicU32,
+        seat_number: usize,
+        sleeping: &'static AtomicU32,
         sleep_controller: &'static SleepController,
     ) -> Latch {
         Latch {
             state: AtomicU32::new(LOCKED),
-            num_sleeping,
+            sleeping,
             sleep_controller,
+            seat_number,
         }
     }
 
@@ -90,7 +94,7 @@ impl Latch {
         //
         // In the event of a race with `set`, the `wake` will always cause this
         // to return regardless of memory ordering.
-        self.sleep_controller.sleep(self.num_sleeping);
+        self.sleep_controller.sleep(self.seat_number, self.sleeping);
     }
 
     /// Activates the latch, potentially unblocking the owning thread.
@@ -159,8 +163,7 @@ impl SleepController {
         // Set set the state to SIGNAL and read the current state, which must be
         // either LOCKED, ASLEEP or SIGNAL.
         let sleep_state = self.state.swap(SIGNAL, Ordering::Relaxed);
-        let asleep = sleep_state == ASLEEP;
-        if asleep {
+        if sleep_state == ASLEEP {
             // If the state was ASLEEP, the thread is either asleep or about to
             // go to sleep.
             //
@@ -172,10 +175,10 @@ impl SleepController {
             //   it up.
             //
             // Either way, after this call the other thread must make progress.
-            atomic_wait::wake_all(&self.state);
+            atomic_wait::wake_one(&self.state);
         }
-        // Return true if the other thread was asleep
-        asleep
+        // Return true if the other thread was asleep and not already notified
+        sleep_state == ASLEEP
     }
 
     // Attempt to send the thread to sleep. This should only be called on a
@@ -184,7 +187,7 @@ impl SleepController {
     // Returns true if this thread makes a syscall to suspend the thread, and
     // false if the thread was already woken (letting us skip the syscall).
     #[cold]
-    pub fn sleep(&self, num_sleeping: &'static AtomicU32) {
+    pub fn sleep(&self, seat_number: usize, sleeping: &'static AtomicU32) {
         // Set the state to ASLEEP and read the current state, which must be
         // either LOCKED or SIGNAL.
         let state = self.state.swap(ASLEEP, Ordering::Relaxed);
@@ -193,7 +196,7 @@ impl SleepController {
         // early.
         if state == LOCKED {
             // Increase the sleeping count by one.
-            num_sleeping.fetch_add(1, Ordering::Relaxed);
+            sleeping.fetch_or(1 << seat_number, Ordering::Relaxed);
             // If we have received a signal since entering the sleep state
             // (meaning the state is not longer set to ASLEEP) then this will
             // return immediately.
@@ -204,7 +207,7 @@ impl SleepController {
             // Either way, there is no way we can fail to receive a `wake`.
             atomic_wait::wait(&self.state, ASLEEP);
             // Decrement the sleeping counter by one.
-            num_sleeping.fetch_sub(1, Ordering::Relaxed);
+            sleeping.fetch_and(!(1 << seat_number), Ordering::Relaxed);
         }
         // Set the state back to LOCKED so that we are ready to receive new
         // signals.

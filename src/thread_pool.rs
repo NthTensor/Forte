@@ -17,8 +17,6 @@ use core::time::Duration;
 use crossbeam_queue::SegQueue;
 use crossbeam_utils::CachePadded;
 
-use seqlock::SeqLock;
-
 use async_task::Runnable;
 use tracing::debug;
 use tracing::trace;
@@ -62,48 +60,21 @@ use crate::util::XorShift64Star;
 /// [`spawn`][ThreadPool::spawn], [`block_on`][ThreadPool::block_on],
 /// [`join`][ThreadPool::join], or [`scope`][ThreadPool::scope].
 pub struct ThreadPool {
-    /// Used to track which seats are currently occupied by threads.
-    registry: CachePadded<SeqLock<Registry>>,
+    /// A bit-set that tracks which seats are occupied.
+    occupied: CachePadded<AtomicU32>,
+    /// A bit-set that tracks which seats are sleeping.
+    sleeping: CachePadded<AtomicU32>,
     /// Holds shared data for each thread participating in the pool.
     seats: [Seat; 32],
     /// Holds controls for threads spawned and managed by the pool.
     managed_threads: Mutex<ManagedThreads>,
     /// A queue used for cooperatively sharing jobs between workers.
     shared_jobs: SegQueue<JobRef>,
-    /// Tracks the number of currently sleeping workers. Incremented when a
-    /// worker goes to sleep, decremented when a worker is woken.
-    num_sleeping: CachePadded<AtomicU32>,
-    /// Counts the number of seats that are claimed by threads, excluding worker
-    /// threads managed by the pool. When this number is zero, the pool is
-    /// assumed to be idle, and does dormant to conserve resources.
-    num_clients: CachePadded<AtomicU32>,
-}
-
-/// The registry contains information about which seats (eg, items in the
-/// `ThreadPool::seat` list) are "occupied" by threads, and which are free to be
-/// claimed.
-#[derive(Copy, Clone)]
-struct Registry {
-    /// Count of the number of seats currently in use by threads.
-    num_occupied: usize,
-    /// This list contains the numbers 0 to 31, representing seat numbers. A
-    /// seat is considered "occupied" when it's seat number appears in the range
-    /// `0..num_occupied`. Seat numbers appearing in the range
-    /// `num_occupied..32` are considered "avalible".
-    ///
-    /// When a thread wishes to claim a seat it always gets the one currently
-    /// at `num_occupied`, and `num_occupied` is incremented. When a seat is
-    /// released, it `num_occupied` is decremented and the seat number for that
-    /// seat is rotated into the "avalible" portion of the list.
-    seat_numbers: [usize; 32],
 }
 
 /// A public interface that can be temporarally claimed and used by a thread.
 /// Claiming a seat allows a thread to partocipate in the thread pool as a worker.
 struct Seat {
-    /// The heartbeat signal sent to the worker.
-    #[cfg(not(feature = "shuttle"))]
-    heartbeat: CachePadded<AtomicBool>,
     /// Allows other threads to wake the worker.
     sleep_controller: CachePadded<SleepController>,
 }
@@ -117,27 +88,14 @@ pub struct Lease {
     seat_number: usize,
     /// The seat being claimed by this lease.
     seat: &'static Seat,
-    /// True if lease is a client, and will activeate the thread pool when
-    /// occupied.
-    is_client: bool,
 }
 
 impl Drop for Lease {
     fn drop(&mut self) {
-        let mut registry = self.thread_pool.registry.lock_write();
-
-        // This snippet moves the seat number claimed by this lease back into
-        // the "avalible" portion of the registry.
-        let num_occupied = registry.num_occupied;
-        for i in 0..num_occupied {
-            if registry.seat_numbers[i] == self.seat_number {
-                // Rotate the freed seat to the front of the seat queue
-                registry.seat_numbers[i..num_occupied].rotate_left(1);
-                // Reduce the number of occupied seats
-                registry.num_occupied -= 1;
-                return;
-            }
-        }
+        // Unset the occupied bit for this seat
+        self.thread_pool
+            .occupied
+            .fetch_and(!(1 << self.seat_number), Ordering::Relaxed);
     }
 }
 
@@ -145,9 +103,6 @@ impl Drop for Lease {
 struct ManagedThreads {
     /// Stores thread controls for workers spawned by the pool.
     workers: Vec<ManagedWorker>,
-    /// Stores thread controls for the heartbeat thread.
-    #[cfg(not(feature = "shuttle"))]
-    heartbeat: Option<ThreadControl>,
 }
 
 /// Represents a worker thread that is managed by the pool, as opposed to
@@ -174,33 +129,19 @@ struct ThreadControl {
 impl ThreadPool {
     /// Creates a new thread pool.
     pub const fn new() -> ThreadPool {
-        // Create a list containing every seat number.
-        let mut seat_numbers = [0; 32];
-        let mut i = 0;
-        while i < 32 {
-            seat_numbers[i] = i;
-            i += 1;
-        }
         // Create the pool itself.
         ThreadPool {
             seats: [const {
                 Seat {
-                    heartbeat: CachePadded::new(AtomicBool::new(false)),
                     sleep_controller: CachePadded::new(SleepController::new()),
                 }
             }; 32],
-            registry: CachePadded::new(SeqLock::new(Registry {
-                num_occupied: 0,
-                seat_numbers,
-            })),
+            occupied: CachePadded::new(AtomicU32::new(0)),
+            sleeping: CachePadded::new(AtomicU32::new(0)),
             managed_threads: Mutex::new(ManagedThreads {
                 workers: Vec::new(),
-                #[cfg(not(feature = "shuttle"))]
-                heartbeat: None,
             }),
             shared_jobs: SegQueue::new(),
-            num_sleeping: CachePadded::new(AtomicU32::new(0)),
-            num_clients: CachePadded::new(AtomicU32::new(0)),
         }
     }
 
@@ -208,42 +149,23 @@ impl ThreadPool {
     /// (using [`Worker::occupy`]), allowing a thread to participate in the pool.
     #[cold]
     pub fn claim_lease(&'static self) -> Lease {
-        let mut registry = self.registry.lock_write();
-        let num_occupied = registry.num_occupied;
-        if num_occupied < 32 {
-            let seat_number = registry.seat_numbers[num_occupied];
-            registry.num_occupied += 1;
-            return Lease {
-                thread_pool: self,
-                seat_number,
-                seat: &self.seats[seat_number],
-                is_client: true,
-            };
-        }
-
-        panic!("Thread pool full")
-    }
-
-    /// Claims multiple
-    pub fn claim_leases(&'static self, num_requested: usize) -> Vec<Lease> {
-        let mut registry = self.registry.lock_write();
-        let num_occupied = registry.num_occupied;
-        let num_claimed = num_requested.min(32 - num_occupied);
-        let mut leases = Vec::with_capacity(num_claimed);
-        if num_claimed > 0 {
-            for i in 0..num_claimed {
-                let seat_number = registry.seat_numbers[num_occupied + i];
-                leases.push(Lease {
-                    thread_pool: self,
-                    seat_number,
-                    seat: &self.seats[seat_number],
-                    is_client: true,
-                });
+        loop {
+            let occupied = self.occupied.load(Ordering::Relaxed);
+            if occupied == u32::MAX {
+                panic!("Thread pool full")
+            } else {
+                let seat_number = occupied.trailing_ones() as usize;
+                let mask = 1 << seat_number;
+                if self.occupied.fetch_or(mask, Ordering::Relaxed) & mask == 0 {
+                    // At this point we have aquired the lease on the seat
+                    return Lease {
+                        thread_pool: self,
+                        seat_number,
+                        seat: &self.seats[seat_number],
+                    };
+                }
             }
-            registry.num_occupied += num_claimed;
         }
-
-        leases
     }
 
     /// Returns an opaque identifier for this thread pool.
@@ -375,7 +297,7 @@ impl ThreadPool {
 
         // You are only allowed to spawn managed threads for up to half the total number of workers,
         // to leave room for non-managed threads. By default, this means at most 16 workers can be managed.
-        let mut new_size = get_size(current_size);
+        let new_size = get_size(current_size);
 
         trace!(
             "attempting to resize thread pool from {} to {} thread(s)",
@@ -389,41 +311,17 @@ impl ThreadPool {
             }
             // The size increased
             cmp::Ordering::Greater => {
-                // Acquire leases for the new threads.
-                trace!("locking worker leases");
-                let new_leases = self.claim_leases(new_size - current_size);
-                new_size = current_size + new_leases.len(); // Scale back the new size to what we can actually spawn.
-                trace!("acquired leases for {} new threads", new_size);
-
-                // When not in shuttle, start the heartbeat thread if scaling up from zero.
-                #[cfg(not(feature = "shuttle"))]
-                if new_size > 0 && current_size == 0 {
-                    debug!("spawning heartbeat runner");
-                    let halt = Arc::new(AtomicBool::new(false));
-                    let heartbeat_halt = halt.clone();
-                    let handle = ThreadBuilder::new()
-                        .name("heartbeat".to_string())
-                        .spawn(move || {
-                            heartbeat_loop(self, heartbeat_halt);
-                        })
-                        .unwrap();
-                    let control = ThreadControl { halt, handle };
-                    managed_threads.heartbeat = Some(control);
-                }
-
-                let barrier = Arc::new(Barrier::new(new_leases.len() + 1));
-
                 // Spawn the new workers.
-                for lease in new_leases {
+                for _ in current_size..new_size {
+                    let lease = self.claim_lease();
                     let seat_number = lease.seat_number;
                     debug!("spawning managed worker for seat number {}", seat_number);
                     let halt = Arc::new(AtomicBool::new(false));
                     let worker_halt = halt.clone();
-                    let worker_barrier = barrier.clone();
                     let handle = ThreadBuilder::new()
                         .name(format!("worker {seat_number}"))
                         .spawn(move || {
-                            managed_worker(lease, worker_halt, worker_barrier);
+                            managed_worker(lease, worker_halt);
                         })
                         .unwrap();
                     let control = ThreadControl { halt, handle };
@@ -434,22 +332,11 @@ impl ThreadPool {
                 }
 
                 drop(managed_threads);
-
-                // Wait for the threads to start.
-                barrier.wait();
             }
             // The size decreased
             cmp::Ordering::Less => {
                 // Pull the workers we intend to halt out of the thread manager.
                 let terminating_workers = managed_threads.workers.split_off(new_size);
-
-                // Halt the heartbeat thread when scaling to zero.
-                #[cfg(not(feature = "shuttle"))]
-                let heartbeat_control = if new_size == 0 {
-                    managed_threads.heartbeat.take()
-                } else {
-                    None
-                };
 
                 // Terminate and wake the workers.
                 for worker in &terminating_workers {
@@ -472,14 +359,6 @@ impl ThreadPool {
                     if Some(worker.seat_number) != own_seat_number {
                         let _ = worker.control.handle.join();
                     }
-                }
-
-                // If we took control of the heartbeat, halt it after the workers.
-                #[cfg(not(feature = "shuttle"))]
-                if let Some(control) = heartbeat_control {
-                    control.halt.store(true, Ordering::Relaxed);
-                    atomic_wait::wake_all(&*self.num_sleeping);
-                    let _ = control.handle.join();
                 }
             }
         }
@@ -737,17 +616,6 @@ impl Worker {
         let span = trace_span!("occupy", seat_number = lease.seat_number);
         let _enter = span.enter();
 
-        if lease.is_client {
-            let num_clients = lease
-                .thread_pool
-                .num_clients
-                .fetch_add(1, Ordering::Relaxed);
-            if num_clients == 0 {
-                // When the first client joins a pool, we must wake the heartbeat thread.
-                atomic_wait::wake_all(&*lease.thread_pool.num_clients);
-            }
-        }
-
         // Create a new worker to occupy the lease. Note: It's potentially a
         // problem that the same thread can occupy multiple workers on the same
         // thread. We many eventually need to design something to prevent this.
@@ -770,14 +638,6 @@ impl Worker {
         // LIFO order, but it's fairly arbitrary.
         while let Some(job_ref) = worker.queue.pop_newest() {
             worker.execute(job_ref, false);
-        }
-
-        if worker.lease.is_client {
-            worker
-                .lease
-                .thread_pool
-                .num_clients
-                .fetch_sub(1, Ordering::Relaxed);
         }
 
         // Swap back to pointing to the previous value (possibly null).
@@ -860,54 +720,38 @@ impl Worker {
     /// full.
     #[inline(always)]
     pub fn enqueue(&self, job_ref: JobRef) {
-        if let Some(job_ref) = self.queue.push(job_ref) {
-            // push the work to the shared queue
-            self.lease.thread_pool.shared_jobs.push(job_ref);
-        }
+        self.queue.push(job_ref);
     }
 
     /// Try to promote the oldest task in the queue.
     #[inline(always)]
     fn promote(&self) {
-        // Check for a heartbeat, potentially promoting the job we just pushed
-        // to a shared job.
-        #[cfg(not(feature = "shuttle"))]
-        let heartbeat = self.lease.seat.heartbeat.load(Ordering::Relaxed);
+        let sleeping = self.lease.thread_pool.sleeping.load(Ordering::Relaxed);
+        if sleeping == 0 {
+            return;
+        }
 
-        #[cfg(feature = "shuttle")]
-        let heartbeat = true; // thread_rng().gen_bool(0.5);
-
-        if heartbeat && let Some(job_ref) = self.queue.pop_oldest() {
-            self.promote_cold(job_ref);
-            #[cfg(not(feature = "shuttle"))]
-            self.lease.seat.heartbeat.store(false, Ordering::Relaxed);
+        if let Some(job_ref) = self.queue.pop_oldest() {
+            self.promote_cold(job_ref, sleeping);
         }
     }
 
     /// Pushes work onto the shared queue and wakes another worker.
     #[cold]
-    fn promote_cold(&self, job_ref: JobRef) {
+    fn promote_cold(&self, job_ref: JobRef, sleeping: u32) {
         // Push the job onto the shared queue.
         self.lease.thread_pool.shared_jobs.push(job_ref);
 
-        // Fetch the number of sleeping workers and pending shared tasks
-        let num_sleeping = self.lease.thread_pool.num_sleeping.load(Ordering::Relaxed);
-
-        if num_sleeping == 0 {
-            return;
-        }
-
-        // Try to wake a worker to work on it.
-        let registry = self.lease.thread_pool.registry.read();
-        let offset = self.rng.next_usize(32);
-        for i in 0..registry.num_occupied {
-            let i = (i + offset) % registry.num_occupied;
-            let seat_number = registry.seat_numbers[i];
-            if seat_number == self.lease.seat_number {
-                continue;
-            }
-            let ready = self.lease.thread_pool.seats[i].sleep_controller.wake();
-            if ready {
+        // Wake a random worker
+        let offset = self.rng.next_usize(32) as u32;
+        let mut randomized_sleeping = sleeping.rotate_right(offset);
+        while randomized_sleeping != 0 {
+            let index = (randomized_sleeping.trailing_zeros() + offset) % 32;
+            randomized_sleeping &= randomized_sleeping - 1; // Clear the lowest bit
+            let woken = self.lease.thread_pool.seats[index as usize]
+                .sleep_controller
+                .wake();
+            if woken {
                 return;
             }
         }
@@ -917,7 +761,8 @@ impl Worker {
     #[inline(always)]
     pub fn new_latch(&self) -> Latch {
         Latch::new(
-            &self.lease.thread_pool.num_sleeping,
+            self.lease.seat_number,
+            &self.lease.thread_pool.sleeping,
             &self.lease.seat.sleep_controller,
         )
     }
@@ -996,9 +841,7 @@ impl Worker {
     /// [`Worker::yield_local`] instead.
     #[inline(always)]
     pub fn yield_now(&self) -> Yield {
-        // Try to promote an item from the queue
         self.promote();
-
         match self.find_work() {
             Some((job_ref, migrated)) => {
                 self.execute(job_ref, migrated);
@@ -1463,12 +1306,8 @@ where
 /// Operating on the principle that you should finish what you start before
 /// starting something new, workers will first execute their queue, then execute
 /// shared jobs, then pull new jobs from the injector.
-fn managed_worker(mut lease: Lease, halt: Arc<AtomicBool>, barrier: Arc<Barrier>) {
+fn managed_worker(mut lease: Lease, halt: Arc<AtomicBool>) {
     trace!("starting managed worker");
-
-    lease.is_client = false;
-
-    barrier.wait();
 
     // Register as the indicated worker, and work until we are told to halt.
     Worker::occupy(lease, |worker| {
@@ -1483,58 +1322,12 @@ fn managed_worker(mut lease: Lease, halt: Arc<AtomicBool>, barrier: Arc<Barrier>
                     .lease
                     .seat
                     .sleep_controller
-                    .sleep(&worker.lease.thread_pool.num_sleeping);
+                    .sleep(worker.lease.seat_number, &worker.lease.thread_pool.sleeping);
             }
         }
     });
 
     trace!("exiting managed worker");
-}
-
-// -----------------------------------------------------------------------------
-// Heartbeat sender loop
-
-const HEARTBEAT_INTERVAL: Duration = Duration::from_micros(100);
-
-/// This is the main loop for the heartbeat thread. It's in charge of
-/// periodically sending a "heartbeat" signal to each worker. By default, each
-/// worker receives a heartbeat about once every 100 μs.
-///
-/// Workers use the heartbeat signal to amortize the cost of promoting local
-/// jobs to shared jobs (which allows other works to claim them) and to reduce
-/// lock contention.
-///
-/// This is never runs when testing in shuttle.
-#[cfg(not(feature = "shuttle"))]
-fn heartbeat_loop(thread_pool: &'static ThreadPool, halt: Arc<AtomicBool>) {
-    trace!("starting managed heartbeat thread");
-
-    let mut registry;
-
-    let mut clock = fast_time::Clock::new();
-    let mut last_heartbeat = [clock.now(); 32];
-
-    while !halt.load(Ordering::Relaxed) {
-        let num_clients = thread_pool.num_clients.load(Ordering::Relaxed);
-        if num_clients == 0 {
-            atomic_wait::wait(&thread_pool.num_clients, 0);
-        }
-
-        registry = thread_pool.registry.read();
-        let now = clock.now();
-
-        for i in 0..registry.num_occupied {
-            let seat_number = registry.seat_numbers[i];
-            if now.duration_since(last_heartbeat[seat_number]) >= HEARTBEAT_INTERVAL {
-                thread_pool.seats[seat_number]
-                    .heartbeat
-                    .store(true, Ordering::Relaxed);
-                last_heartbeat[seat_number] = now;
-            }
-        }
-
-        std::thread::sleep(Duration::from_micros(10));
-    }
 }
 
 // -----------------------------------------------------------------------------

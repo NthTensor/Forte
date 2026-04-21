@@ -117,13 +117,12 @@ impl JobQueue {
     }
 
     #[inline(always)]
-    pub fn push(&self, job_ref: JobRef) -> Option<JobRef> {
+    pub fn push(&self, job_ref: JobRef) {
         // SAFETY: The queue itself is only access mutably within `push_back`,
         // `pop_back` and `pop_front`. Since these functions never call each
         // other, we must have exclusive access to the queue.
         let job_refs = unsafe { &mut *self.job_refs.get() };
         job_refs.push_back(job_ref);
-        None
     }
 
     #[inline(always)]

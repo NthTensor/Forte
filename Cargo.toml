@@ -16,7 +16,6 @@ atomic-wait = "1.1.0"
 crossbeam-queue = "0.3.12"
 crossbeam-utils = "0.8.21"
 fast_time = "0.1.13"
-seqlock = "0.2.0"
 
 shuttle = { version = "0.8.0", optional = true }
 tracing = { version = "0.1.41", features = ["release_max_level_off"] }
