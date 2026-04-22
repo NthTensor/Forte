@@ -274,6 +274,7 @@ mod platform {
     pub use core::sync::atomic::AtomicU32;
     pub use core::sync::atomic::Ordering;
     pub use std::sync::Mutex;
+    pub use std::sync::OnceLock;
     pub use std::thread::Builder as ThreadBuilder;
     pub use std::thread::JoinHandle;
     pub use std::thread::available_parallelism;
@@ -288,6 +289,7 @@ mod platform {
     pub use shuttle::sync::Arc;
     pub use shuttle::sync::Mutex;
     pub use shuttle::sync::Weak;
+    pub use std::sync::OnceLock; // shuttle has no OnceLock; std's version is fine here
     pub use shuttle::sync::atomic::AtomicBool;
     pub use shuttle::sync::atomic::AtomicPtr;
     pub use shuttle::sync::atomic::AtomicU32;

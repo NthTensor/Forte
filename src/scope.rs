@@ -264,6 +264,9 @@ impl<'scope, 'env> Scope<'scope, 'env> {
         // causing the latch to become set and allowing this function to
         // return.
         unsafe { self.remove_reference() };
+
+
+        
         // Wait for the remaining work to complete.
         worker.wait_for(&self.completed);
     }
@@ -332,7 +335,7 @@ where
         let job_ref = unsafe { job.into_job_ref() };
 
         // Send the job to a queue to be executed.
-        worker.enqueue(job_ref);
+        worker.fifo_queue.push_new(job_ref);
     }
 }
 
@@ -344,7 +347,7 @@ where
     fn spawn_on<'env, 'worker>(self, worker: &'worker Worker, scope: &'scope Scope<'scope, 'env>) {
         let poll_job = ScopeFutureJob::new(worker.thread_pool(), scope, self);
         let job_ref = poll_job.into_job_ref();
-        worker.enqueue(job_ref);
+        worker.fifo_queue.push_new(job_ref);
     }
 }
 
@@ -564,7 +567,7 @@ where
                     // preventing it from being dropped and potentially
                     // extending the job's lifetime.
                     let job_ref = this.into_job_ref();
-                    worker.enqueue(job_ref);
+                    worker.fifo_queue.push_new(job_ref);
                 }
             }
             // The job panicked. Store the panic in the scope so it can be
@@ -609,7 +612,7 @@ where
             this.thread_pool.with_worker(|worker| {
                 // Convert the waker into a job ref and queue it.
                 let job_ref = this.into_job_ref();
-                worker.enqueue(job_ref);
+                worker.fifo_queue.push_new(job_ref);
             });
         }
     }
@@ -633,7 +636,7 @@ where
                 // Clone the waker, convert it into a job-ref and queue it.
                 let this = ManuallyDrop::into_inner(this.clone());
                 let job_ref = this.into_job_ref();
-                worker.enqueue(job_ref);
+                worker.fifo_queue.push_new(job_ref);
             });
         }
     }
@@ -649,7 +652,7 @@ where
         // counter here.
         //
         // SAFETY: This is called on a pointer created by `Arc::into_raw` on an
-        // instance on of `Arc<Self`.
+        // instance on of `Arc<Self>`.
         unsafe { Arc::decrement_strong_count(this.cast::<Self>()) };
     }
 }

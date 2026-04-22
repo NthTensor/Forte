@@ -117,12 +117,21 @@ impl JobQueue {
     }
 
     #[inline(always)]
-    pub fn push(&self, job_ref: JobRef) {
+    pub fn push_new(&self, job_ref: JobRef) {
         // SAFETY: The queue itself is only access mutably within `push_back`,
         // `pop_back` and `pop_front`. Since these functions never call each
         // other, we must have exclusive access to the queue.
         let job_refs = unsafe { &mut *self.job_refs.get() };
         job_refs.push_back(job_ref);
+    }
+
+    #[cold]
+    pub fn push_old(&self, job_ref: JobRef) {
+        // SAFETY: The queue itself is only access mutably within `push_back`,
+        // `pop_back` and `pop_front`. Since these functions never call each
+        // other, we must have exclusive access to the queue.
+        let job_refs = unsafe { &mut *self.job_refs.get() };
+        job_refs.push_front(job_ref);
     }
 
     #[inline(always)]
@@ -134,9 +143,18 @@ impl JobQueue {
         job_refs.pop_back()
     }
 
+    #[cold]
+    pub fn pop_oldest(&self) -> Option<JobRef> {
+        // SAFETY: The queue itself is only access mutably within `push_back`,
+        // `pop_back` and `pop_front`. Since these functions never call each
+        // other, we must have exclusive access to the queue.
+        let job_refs = unsafe { &mut *self.job_refs.get() };
+        job_refs.pop_front()
+    }
+
     // Attempt to remove the given job-ref from the back of the queue.
     #[inline(always)]
-    pub fn recover_just_pushed(&self, id: (usize, usize)) -> bool {
+    pub fn recover_newest(&self, id: (usize, usize)) -> bool {
         // SAFETY: The queue itself is only access mutably within `push_back`,
         // `pop_back` and `pop_front`. Since these functions never call each
         // other, we must have exclusive access to the queue.
@@ -149,13 +167,20 @@ impl JobQueue {
         }
     }
 
-    #[cold]
-    pub fn pop_oldest(&self) -> Option<JobRef> {
-        // SAFETY: The queue itself is only access mutably within `push_back`,
-        // `pop_back` and `pop_front`. Since these functions never call each
-        // other, we must have exclusive access to the queue.
+    // TODO
+    pub fn split(&self) -> Option<VecDeque<JobRef>> {
         let job_refs = unsafe { &mut *self.job_refs.get() };
-        job_refs.pop_front()
+        let len = job_refs.len();
+        if len > 4 {
+            Some(job_refs.split_off(len / 2))
+        } else {
+            None
+        }
+    }
+
+    pub fn append(&self, mut split_refs: VecDeque<JobRef>) {
+        let job_refs = unsafe { &mut *self.job_refs.get() };
+        job_refs.append(&mut split_refs);
     }
 }
 

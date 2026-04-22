@@ -1,9 +1,10 @@
 //! This module contains the api and worker logic for the Forte thread pool.
 
+use alloc::boxed::Box;
 use alloc::format;
-use alloc::string::ToString;
 use alloc::vec::Vec;
 use core::cell::Cell;
+use core::cell::UnsafeCell;
 use core::cmp;
 use core::future::Future;
 use core::marker::PhantomData;
@@ -13,9 +14,11 @@ use core::ptr;
 use core::ptr::NonNull;
 use core::task::Context;
 use core::task::Poll;
-use core::time::Duration;
 use crossbeam_queue::SegQueue;
 use crossbeam_utils::CachePadded;
+use st3::StealError;
+use st3::lifo::Stealer as StealStealer;
+use st3::lifo::Worker as StealWorker;
 
 use async_task::Runnable;
 use tracing::debug;
@@ -35,6 +38,25 @@ use crate::scope::Scope;
 use crate::scope::with_scope;
 use crate::unwind;
 use crate::util::XorShift64Star;
+
+// -----------------------------------------------------------------------------
+// Pre-allocated steal queues
+
+/// Pre-allocated work-stealing queues for all 32 seats. Initialized once on
+/// first use (via `OnceLock`) because `st3` lacks `const` constructors.
+struct SeatQueues {
+    /// Push-side queues, one per seat. `workers[i]` is used exclusively by the
+    /// thread that holds the occupancy lease on seat `i`.
+    workers: [UnsafeCell<StealWorker<JobRef>>; 32],
+    /// Steal-side handles, permanently valid. Any worker may read from these
+    /// without synchronization because they never change after initialization.
+    stealers: [StealStealer<JobRef>; 32],
+}
+
+// SAFETY: `stealers` are `Send + Sync` by their own bounds. `workers[i]` is
+// only ever accessed by the single thread holding seat `i`'s occupancy lease;
+// the `occupied` bitmask in `ThreadPool` enforces that exclusivity.
+unsafe impl Sync for SeatQueues {}
 
 // -----------------------------------------------------------------------------
 // Thread pool
@@ -63,27 +85,30 @@ pub struct ThreadPool {
     /// A bit-set that tracks which seats are occupied.
     occupied: CachePadded<AtomicU32>,
     /// A bit-set that tracks which seats are sleeping.
-    sleeping: CachePadded<AtomicU32>,
+    pub(crate) sleeping: CachePadded<AtomicU32>,
     /// Holds shared data for each thread participating in the pool.
-    seats: [Seat; 32],
+    pub(crate) seats: [Seat; 32],
     /// Holds controls for threads spawned and managed by the pool.
     managed_threads: Mutex<ManagedThreads>,
     /// A queue used for cooperatively sharing jobs between workers.
-    shared_jobs: SegQueue<JobRef>,
+    pub(crate) shared_jobs: SegQueue<JobRef>,
+    /// Pre-allocated work-stealing queues. Initialized lazily on first `occupy`
+    /// since `st3` has no `const` constructors; permanently valid thereafter.
+    steal_queues: OnceLock<Box<SeatQueues>>,
 }
 
 /// A public interface that can be temporarally claimed and used by a thread.
 /// Claiming a seat allows a thread to partocipate in the thread pool as a worker.
-struct Seat {
+pub(crate) struct Seat {
     /// Allows other threads to wake the worker.
-    sleep_controller: CachePadded<SleepController>,
+    pub(crate) sleep_controller: CachePadded<SleepController>,
 }
 
 /// A lease represents ownership of one of a "seats" in a thread pool, and
 /// allows the owning thread to participate in that pool as a worker.
 pub struct Lease {
     /// The thread pool against which this lease is held.
-    thread_pool: &'static ThreadPool,
+    pub(crate) thread_pool: &'static ThreadPool,
     /// The index of the seat in the data list
     seat_number: usize,
     /// The seat being claimed by this lease.
@@ -142,7 +167,23 @@ impl ThreadPool {
                 workers: Vec::new(),
             }),
             shared_jobs: SegQueue::new(),
+            steal_queues: OnceLock::new(),
         }
+    }
+
+    /// Returns the pre-allocated steal queues, initializing them on the first call.
+    fn get_steal_queues(&'static self) -> &'static SeatQueues {
+        self.steal_queues.get_or_init(|| {
+            // Create all workers first, then derive stealers from them.
+            let workers: [StealWorker<JobRef>; 32] =
+                core::array::from_fn(|_| StealWorker::new(Worker::STEAL_QUEUE_CAPACITY));
+            let stealers: [StealStealer<JobRef>; 32] =
+                core::array::from_fn(|i| workers[i].stealer());
+            Box::new(SeatQueues {
+                workers: workers.map(UnsafeCell::new),
+                stealers,
+            })
+        })
     }
 
     /// Claims a lease on the thread pool which can be occupied by a worker
@@ -425,7 +466,7 @@ where
 
         // Queue the job for evaluation
         if let Some(worker) = worker {
-            worker.enqueue(job_ref);
+            worker.fifo_queue.push_new(job_ref);
         } else {
             // Push the work into the share queue and wake a worker
             thread_pool.shared_jobs.push(job_ref);
@@ -456,7 +497,7 @@ fn schedule_runnable(runnable: Runnable<&'static ThreadPool>) {
 
     // Send this job off to be executed.
     thread_pool.with_worker(|worker| {
-        worker.enqueue(job_ref);
+        worker.fifo_queue.push_new(job_ref);
     });
 }
 
@@ -582,9 +623,24 @@ thread_local! {
 /// will eventually be executed.
 pub struct Worker {
     migrated: Cell<bool>,
-    lease: Lease,
-    queue: JobQueue,
-    rng: XorShift64Star,
+    pub(crate) lease: Lease,
+    /// A sequence of jobs waiting to be executed. Newer jobs are executed
+    /// before older ones, allowing efficent depth-first execution. During
+    /// promotion, the oldest job is shared. Populated by `join()`.
+    ///
+    /// Jobs in this queue take precidence over those in the fifo queue.
+    pub(crate) lifo_queue: JobQueue,
+    /// A sequence of jobs waiting to be executed. Older jobs are executed
+    /// before newer ones, providing reliably low latency. During promotion,
+    /// this queue is partitioned into chunks and the chunks are shared.
+    /// Populated by `spawn()`.
+    ///
+    /// Jobs in this queue are executed only when the lifo queue is empty.
+    pub(crate) fifo_queue: JobQueue,
+    /// Reference to the pool's pre-allocated steal queues. Stored here to
+    /// avoid re-loading the `OnceLock` on every access.
+    seat_queues: &'static SeatQueues,
+    pub(crate) rng: XorShift64Star,
     last_promote_tick: Cell<u64>,
     // Make non-send
     _phantom: PhantomData<*const ()>,
@@ -617,17 +673,27 @@ impl Worker {
         let span = trace_span!("occupy", seat_number = lease.seat_number);
         let _enter = span.enter();
 
+        let thread_pool = lease.thread_pool;
+
+        // Ensure the steal queues are initialized. No-op after the first call.
+        let seat_queues = thread_pool.get_steal_queues();
+
         // Create a new worker to occupy the lease. Note: It's potentially a
         // problem that the same thread can occupy multiple workers on the same
         // thread. We many eventually need to design something to prevent this.
         let worker = Worker {
             migrated: Cell::new(false),
+            seat_queues,
             lease,
-            queue: JobQueue::new(),
+            fifo_queue: JobQueue::new(),
+            lifo_queue: JobQueue::new(),
             rng: XorShift64Star::new(),
             last_promote_tick: Cell::new(0),
             _phantom: PhantomData,
         };
+
+        // No stealer registration needed: the stealer for this seat was
+        // pre-allocated in `seat_queues` and is permanently valid.
 
         // Swap the local pointer to point to the newly allocated worker.
         let outer_ptr = WORKER_PTR.with(|ptr| ptr.replace(&worker));
@@ -636,11 +702,20 @@ impl Worker {
         // and pass in a worker reference directly.
         let result = f(&worker);
 
-        // Execute the work queue until it's empty. This happens to be pulled in
-        // LIFO order, but it's fairly arbitrary.
-        while let Some(job_ref) = worker.queue.pop_newest() {
+        /* TODO: Use a single loop to drain all local queues.
+
+        // Drain the local lifo queue.
+        while let Some(job_ref) = worker.lifo_queue.pop_newest() {
             worker.execute(job_ref, false);
         }
+
+        // Drain the steal queue: any jobs that were promoted but not stolen by
+        // siblings should be executed rather than left for the next occupant.
+        while let Some(job_ref) = worker.steal_queue().pop() {
+            worker.execute(job_ref, false);
+        }
+
+        */
 
         // Swap back to pointing to the previous value (possibly null).
         WORKER_PTR.with(|ptr| ptr.set(outer_ptr));
@@ -650,6 +725,17 @@ impl Worker {
         // Return the intermediate values created while running the closure,
         // namely the result and any jobs still remaining on the local queue.
         result
+    }
+
+    /// Returns a reference to the pre-allocated steal queue for this worker's seat.
+    ///
+    /// # Safety
+    /// Safe because seat occupancy is exclusive: the `occupied` bitmask ensures
+    /// only this thread accesses `workers[seat_number]` while the lease is held.
+    #[inline(always)]
+    fn steal_queue(&self) -> &StealWorker<JobRef> {
+        // SAFETY: See above.
+        unsafe { &*self.seat_queues.workers[self.lease.seat_number].get() }
     }
 
     /// Calls the provided closure on the thread's worker instance, if it has one.
@@ -718,16 +804,13 @@ impl Worker {
         self.lease.thread_pool
     }
 
-    /// Pushes a job onto the local queue, overflowing to the shared queue when
-    /// full.
-    #[inline(always)]
-    pub fn enqueue(&self, job_ref: JobRef) {
-        self.queue.push(job_ref);
-    }
+    /// Capacity of the per-worker work-stealing queue. This is the maximum
+    /// amount a worker can make avalible for stealing at once.
+    const STEAL_QUEUE_CAPACITY: usize = 32;
 
     /// The minimum number of CPU ticks between calls to [`Worker::promote_cold`].
-    /// Approximately 100μs at 3 GHz.
-    const PROMOTE_TICK_INTERVAL: u64 = 100_000;
+    /// Approximately 5μs at 3 GHz.
+    const PROMOTE_TICK_INTERVAL: u64 = 15_000;
 
     /// Try to promote the oldest task in the queue.
     #[inline(always)]
@@ -743,18 +826,39 @@ impl Worker {
             return;
         }
 
-        if let Some(job_ref) = self.queue.pop_oldest() {
-            self.promote_cold(job_ref, sleeping);
+        let mut shared_job = false;
+
+        if let Some(job_ref) = self.lifo_queue.pop_oldest() {
+            // Push into our own steal queue so siblings can steal it.
+            // If the queue is full (high-load signal), keep the work local.
+            if let Err(job_ref) = self.steal_queue().push(job_ref) {
+                self.lifo_queue.push_old(job_ref);
+            } else {
+                shared_job = true;
+            }
+        }
+
+        if let Some(job_refs) = self.fifo_queue.split() {
+            let batch_job = HeapJob::new(move |worker| {
+                worker.fifo_queue.append(job_refs);
+            });
+            // SAFETY: TODO
+            let batch_job_ref = unsafe { batch_job.into_job_ref() };
+            if let Err(job_ref) = self.steal_queue().push(batch_job_ref) {
+                self.fifo_queue.push_new(job_ref);
+            } else {
+                shared_job = true;
+            }
+        }
+
+        if shared_job {
+            self.wake_random(sleeping);
         }
     }
 
-    /// Pushes work onto the shared queue and wakes another worker.
-    #[cold]
-    fn promote_cold(&self, job_ref: JobRef, sleeping: u32) {
-        // Push the job onto the shared queue.
-        self.lease.thread_pool.shared_jobs.push(job_ref);
-
-        // Wake a random worker
+    /// TODO
+    #[inline(always)]
+    pub fn wake_random(&self, sleeping: u32) {
         let offset = self.rng.next_usize(32) as u32;
         let mut randomized_sleeping = sleeping.rotate_right(offset);
         while randomized_sleeping != 0 {
@@ -795,31 +899,64 @@ impl Worker {
         }
     }
 
-    /// Tries to find a job to execute, either in the local queue or shared on
-    /// the thread pool.
-    ///
-    /// The second value is true if the job was shared, or false if it was spawned locally.
+    /// TODO
+    #[inline(always)]
+    fn find_local_work(&self) -> Option<JobRef> {
+        self.lifo_queue
+            .pop_newest()
+            .or_else(|| self.fifo_queue.pop_oldest())
+            .or_else(|| self.steal_queue().pop())
+    }
+
+    /// TODO
     #[inline(always)]
     fn find_work(&self) -> Option<(JobRef, bool)> {
-        // We give preference first to things in our local deque, then in other
-        // workers deques, and finally to injected jobs from the outside. The
-        // idea is to finish what we started before we take on something new.
-        //
-        // We pull from the local queue in LIFO order, which means are popping
-        // from the *back* of the queue (the most recently added jobs). This is
-        // because `yield_now` (and by extension `wait_for` which uses it) is
-        // often called directly after pushing work onto the queue (as in `join`
-        // and `scope`). Pulling from the back of the queue potentially can
-        // allow these blocking operations to complete faster. In the cast when
-        // scopes/joins are deeply nested, this also causes work to be executed
-        // *depth-first*, which is often desirable.
-        self.queue
-            .pop_newest()
+        self.find_local_work()
             .map(|job| (job, false))
+            .or_else(|| self.steal_from_siblings().map(|job| (job, true)))
             .or_else(|| self.claim_shared_job().map(|job| (job, true)))
     }
 
-    /// Claims a shared job from the thread pool.
+    /// Attempts to steal a job from another worker's work-stealing queue.
+    ///
+    /// Iterates over occupied seats in a random order to avoid always hitting
+    /// the same victim. Because stealers are pre-allocated and permanent, no
+    /// lock or atomic load is needed to access them.
+    fn steal_from_siblings(&self) -> Option<JobRef> {
+        let thread_pool = self.lease.thread_pool;
+        // Queues are guaranteed to be initialized before any worker calls this,
+        // but return None gracefully if somehow called earlier.
+        let Some(queues) = thread_pool.steal_queues.get() else {
+            return None;
+        };
+        let occupied = thread_pool.occupied.load(Ordering::Relaxed);
+        let my_seat = self.lease.seat_number as u32;
+
+        // Randomise the starting position so all workers get a fair shot as victims.
+        let offset = self.rng.next_usize(32) as u32;
+        let mut bits = (occupied & !(1u32 << my_seat)).rotate_right(offset);
+
+        while bits != 0 {
+            let shifted_idx = bits.trailing_zeros();
+            let idx = (shifted_idx + offset) % 32;
+            bits &= bits - 1;
+
+            // The stealer is a permanent reference — no lock or atomic load needed.
+            let stealer = &queues.stealers[idx as usize];
+            // steal_and_pop returns one job directly and moves up to half the
+            // remaining items into our steal queue for later use.
+            loop {
+                match stealer.steal_and_pop(self.steal_queue(), |n| n / 2) {
+                    Ok((job, _)) => return Some(job),
+                    Err(StealError::Busy) => {} // transient; retry
+                    Err(StealError::Empty) => break,
+                }
+            }
+        }
+        None
+    }
+
+    /// Claims a job from the global injector queue.
     #[inline(always)]
     fn claim_shared_job(&self) -> Option<JobRef> {
         self.lease.thread_pool.shared_jobs.pop()
@@ -834,7 +971,7 @@ impl Worker {
     pub fn yield_local(&self) -> Yield {
         // We use LIFO order here, pulling the newest work from the queue. This
         // is just for consistency with yield_now/find_work.
-        match self.queue.pop_newest() {
+        match self.find_local_work() {
             Some(job_ref) => {
                 self.execute(job_ref, false);
                 Yield::Executed
@@ -985,7 +1122,7 @@ impl Worker {
         let job_ref_id = job_ref.id();
 
         // Push the job onto the queue.
-        self.enqueue(job_ref);
+        self.lifo_queue.push_new(job_ref);
 
         // If we have received a heartbeat, we remove the oldest item in the
         // local queue and push it into the shared queue. This causes work to be
@@ -999,7 +1136,7 @@ impl Worker {
 
         // Attempt to recover the job from the queue. It should still be there
         // if we didn't share it.
-        if self.queue.recover_just_pushed(job_ref_id) {
+        if self.lifo_queue.recover_newest(job_ref_id) {
             // SAFETY: Because the ids match, the JobRef we just popped from
             // the queue must point to `stack_job`, implying that
             // `stack_job` cannot have been executed yet.
@@ -1318,7 +1455,7 @@ where
 /// Operating on the principle that you should finish what you start before
 /// starting something new, workers will first execute their queue, then execute
 /// shared jobs, then pull new jobs from the injector.
-fn managed_worker(mut lease: Lease, halt: Arc<AtomicBool>) {
+fn managed_worker(lease: Lease, halt: Arc<AtomicBool>) {
     trace!("starting managed worker");
 
     // Register as the indicated worker, and work until we are told to halt.

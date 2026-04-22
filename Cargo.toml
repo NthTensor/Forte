@@ -15,7 +15,7 @@ async-task = "4.7.1"
 atomic-wait = "1.1.0"
 crossbeam-queue = "0.3.12"
 crossbeam-utils = "0.8.21"
-fast_time = "0.1.13"
+st3 = "0.4"
 tick_counter = "0.4.5"
 
 shuttle = { version = "0.8.0", optional = true }
