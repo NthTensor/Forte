@@ -1,10 +1,11 @@
-//! A core concept in Rayon is the *latch*. Forte has borrowed this, in a
-//! somewhat simplified form.
+//! Forte borrows the *latch* concept from Rayon.
 //!
 //! Every forte worker thread has a single "sleep controller" that it uses to
 //! park and unpark itself. Latches build on this to create a simple boolean
 //! switch, which allows the owning thread to sleep until the latch becomes set
 //! by another thread.
+//!
+//! Every latch points at one "sleep controller".
 
 use alloc::task::Wake;
 use core::borrow::Borrow;
@@ -77,9 +78,9 @@ impl Latch {
         self.state.load(Ordering::Relaxed) == SIGNAL
     }
 
-    /// Waits for the latch to be set. In actuality, this may be woken.
-    ///
-    /// Returns true if the latch signal was received, and false otherwise.
+    /// Puts the thread to sleep if the latch has not been set. The thread will
+    /// be woken when the latch becomes set, but may also wake before then. The
+    /// caller should always re-check the latch condition after this returns.
     ///
     /// # Memory Ordering
     ///

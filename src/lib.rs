@@ -90,7 +90,7 @@
 //!
 //! Thread pools are dynamically sized; When your program starts they have size
 //! zero (meaning no worker threads are running). You can change the number of
-//! works assigned to a pool using [`ThreadPool::grow`], [`ThreadPool::shrink`]
+//! workers assigned to a pool using [`ThreadPool::grow`], [`ThreadPool::shrink`]
 //! and [`ThreadPool::resize_to`]. But most of the time you will want to call
 //! [`ThreadPool::resize_to_available`], which will resize the pool to exploit
 //! all the available parallelism on your system by spawning a worker thread for
@@ -122,8 +122,8 @@
 //! // there are no workers to parallelize it).
 //! THREAD_POOL.join(|_| println!("world"), |_| println!("hello "));
 //!
-//! // This will always print "hello world" (because join happens execute things
-//! // backwards in this case).
+//! // This will always print "hello world" (because join executes the second
+//! // closure first when running in serial).
 //! ```
 //!
 //! # Workers
@@ -151,7 +151,7 @@
 //! tasks left in the local queue are executed.
 //!
 //! You will only ever receive `&Worker` references, because the worker is not
-//! allowed to move or be mutably referenced. Worker are `!Send` and `!Sync`,
+//! allowed to move or be mutably referenced. Workers are `!Send` and `!Sync`,
 //! and are meant to represent local-only data.
 //!
 //! To access the current worker context, you can use [`Worker::map_current`] or
@@ -196,25 +196,14 @@
 //! | *Scope*    | [`scope()`] | [`ThreadPool::scope()`] | [`Worker::scope()`]
 //! | *Block on* | [`block_on()`] | [`ThreadPool::block_on()`] | [`Worker::block_on()`]
 //!
-//! * *Worker.* Uses the provided worker context.
-//! * *Thread pool.* Looks for an existing worker context, creates one if it doesn't find one.
 //! * *Headless.* Looks for an existing worker context, and panics if it doesn't find one.
+//! * *Thread pool.* Looks for an existing worker context, creates one if it doesn't find one.
+//! * *Worker.* Uses the provided worker context.
 //!
 //! The headless and thread pool flavors are more or less just aliases for the
 //! worker flavor. Where possible, the worker flavor should be preferred to the
 //! thread pool flavor, and the thread pool flavor should be preferred to the
 //! headless flavor.
-//!
-//! # Theory & Background
-//!
-//! Forte is based on `rayon_core`, to the extent that during development it was
-//! often possible to port code from `rayon_core` more or less verbatim.
-//! However, forte and rayon differ significantly in their goals and approach.
-//!
-//! Rayon uses an approach to work-stealing adapted from Cilk and Intel TBB.
-//! These techniques are largely the industry standard.
-//!
-//! [^TZANNES]: Tzannes et al. 2024, <https://dl.acm.org/doi/pdf/10.1145/2629643>
 
 #![no_std]
 #![cfg_attr(feature = "shuttle", allow(dead_code))]
@@ -252,6 +241,7 @@ pub struct FutureMarker();
 pub use scope::Scope;
 pub use scope::ScopedSpawn;
 pub use thread_pool::Spawn;
+pub use thread_pool::Task;
 pub use thread_pool::ThreadPool;
 pub use thread_pool::Worker;
 pub use thread_pool::Yield;

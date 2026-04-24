@@ -35,8 +35,9 @@ use crate::unwind::AbortOnDrop;
 // -----------------------------------------------------------------------------
 // Scope
 
-/// A scope which can spawn a number of non-static jobs and async tasks. Refer
-/// to [`scope`](crate::scope()) for more extensive documentation.
+/// A scope which can spawn a number of non-static jobs and async tasks.
+///
+/// Refer to [`scope`](crate::scope()) for more extensive documentation.
 ///
 /// # Lifetimes
 ///
@@ -119,7 +120,7 @@ where
     // reference is allowed to escape, the caller cannot safely cause the scope
     // to move either.
     //
-    // `Scope::complete` is called unconditionally on the line bellow, before
+    // `Scope::complete` is called unconditionally on the line below, before
     // the implicit drop of `scope`. If the closure `f` panics, it is caught and
     // re-emitted after `complete` finishes. In the event of an uncaught panic,
     // we cannot ensure `complete` runs properly before the scope is dropped, so
@@ -254,7 +255,7 @@ impl<'scope, 'env> Scope<'scope, 'env> {
         // allocating a second time, and means we can immediately drop the panic
         // we have just been passed.
         //
-        // Dropping this panic may itself trigger a pnaic, but this will simply
+        // Dropping this panic may itself trigger a panic, but this will simply
         // trigger the scope's abort guard, causing an abort rather than UB.
         if self.panic.load(Ordering::Relaxed).is_null() {
             let nil = ptr::null_mut();
@@ -267,7 +268,7 @@ impl<'scope, 'env> Scope<'scope, 'env> {
             //
             // If the write fails, another panic must have already occurred, and
             // we don't need to synchronize memory (the previous call to
-            // `store_panic` handles the syncrhonization for it's panic data).
+            // `store_panic` handles the synchronization for it's panic data).
             if self
                 .panic
                 .compare_exchange(nil, err_ptr, Ordering::Release, Ordering::Relaxed)
@@ -292,7 +293,7 @@ impl<'scope, 'env> Scope<'scope, 'env> {
         // whatever it points to.
         let panic = self.panic.swap(ptr::null_mut(), Ordering::Relaxed);
         if !panic.is_null() {
-            // We generally don't expect pancis to happen.
+            // We generally don't expect panics to happen.
             cold_path();
             // If the panic pointer is not null, emit an `Acquire` fence to
             // establish a happens-after relationship with the `Release` branch
