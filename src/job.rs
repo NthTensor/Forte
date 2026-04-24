@@ -132,7 +132,7 @@ unsafe impl Send for JobRef {}
 // Job queue
 
 /// A queue of jobs. This is a simple wrapper around a vec dequeue that uses
-/// inner mutation, and has some more intiuitively named methods to enforce
+/// inner mutation, and has some more intuitively named methods to enforce
 /// conventions.
 pub struct JobQueue {
     job_refs: UnsafeCell<VecDeque<JobRef>>,
@@ -206,8 +206,8 @@ impl JobQueue {
     const CHUNK_SIZE: usize = 16;
 
     /// Splits off a series of chunks from the end of the queue (the side with
-    /// the newest jobs). Each chunk is of size `CHUNK_SIZE`. After, At most
-    /// `CHUNK_SIZE` jobs will be left in the queue.
+    /// the newest jobs). Each chunk is of size `CHUNK_SIZE`. Afterwards, at most
+    /// `CHUNK_SIZE` jobs will remain in the queue.
     pub fn split(&self) -> Vec<VecDeque<JobRef>> {
         // SAFETY: `JobQueue` is not `Sync`, so this can only be called from one
         // thread. We ensure no other references to the inner value exist by not
@@ -226,7 +226,7 @@ impl JobQueue {
     }
 
     /// Appends a chunk of jobs (expected to be provided by `split`) to the
-    /// queue. Jobs are added to the end (the side with the newst jobs).
+    /// queue. Jobs are added to the end (the side with the newest jobs).
     pub fn append(&self, mut split_refs: VecDeque<JobRef>) {
         // SAFETY: `JobQueue` is not `Sync`, so this can only be called from one
         // thread. We ensure no other references to the inner value exist by not
@@ -417,9 +417,9 @@ where
         // The latch has not been set, and this function is called at most once,
         // so no concurrent access can occur.
         unsafe { (*return_value).write(result) };
-        // This syncrhonizies with the `Acquire` fence within `return_value()`,
+        // This synchronizes with the `Acquire` fence within `return_value()`,
         // establishing a happens-before relationship that makes the preceding
-        // `return_value` write vsibile to the reader.
+        // `return_value` write visible to the reader.
         //
         // This is required because latches do not synchronize memory.
         fence(Ordering::Release);

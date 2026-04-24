@@ -16,7 +16,7 @@ This project is currently in early [pre-release], and there may be arbitrary bre
 
 ### Added 
 
-- `ThreadPool::num_workers` method which return the current number of workers
+- `ThreadPool::num_workers` method which returns the current number of workers
 - `ThreadPool::on_worker` variant of `with_worker` for `Send` closures.
 - `ThreadPool::expect_worker` variant of `with_worker` that panics.
 

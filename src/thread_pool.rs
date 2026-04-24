@@ -45,27 +45,29 @@ use crate::util::XorShift64Star;
 // -----------------------------------------------------------------------------
 // Thread pool
 
-/// A thread pool is a set of threads.
+/// A statically-allocated handle to a dynamically-sized collection of threads.
 ///
-/// You can dispatch work to a thread pool, and it will be distributed amongst
-/// the threads and run as quickly as possible. To create a new thread pool,
-/// assign it to a constant.
-/// ```
+/// Each `ThreadPool` must be stored in a `static`, ideally defined within your
+/// root binary crate rather than a library crate. You can create a new pool
+/// with [`ThreadPool::new`], and will probably want to resize sometime between
+/// program init and when you want to start scheduling work.
+///
+/// ```rust
 /// # use forte::ThreadPool;
-/// # use forte::Worker;
-/// static THREAD_POOL: ThreadPool = ThreadPool::new();
+/// static POOL: ThreadPool = ThreadPool::new();
+///
+/// fn main() {
+///     POOL.resize_to_available();
+///     // … schedule work …
+///     POOL.depopulate();
+/// }
 /// ```
-/// Thread pools are empty when created, and must be explicitly resized at
-/// runtime.
-/// ```
-/// # use forte::ThreadPool;
-/// # use forte::Worker;
-/// # static THREAD_POOL: ThreadPool = ThreadPool::new();
-/// THREAD_POOL.resize_to_available();
-/// ```
-/// After this, you can start sending work to the pool with
-/// [`spawn`][ThreadPool::spawn], [`block_on`][ThreadPool::block_on],
-/// [`join`][ThreadPool::join], or [`scope`][ThreadPool::scope].
+///
+/// A pool can accommodate at most 32 participating threads (this includes
+/// managed worker threads created by the `resize` functions, but also external
+/// threads that become "temporary members" when they make blocking calls to the
+/// pool). All blocking methods (e.g. [`join`] and [`scope`]) work even with
+/// zero managed workers, but they won't run in parallel.
 pub struct ThreadPool {
     /// A bit-set that tracks which seats are occupied.
     occupied: CachePadded<AtomicU32>,
@@ -73,7 +75,7 @@ pub struct ThreadPool {
     sleeping: CachePadded<AtomicU32>,
     /// Holds shared data for each thread participating in the pool.
     seats: OnceLock<Box<Seats>>,
-    /// Holds controls for threads spawned and managed by the pool. Initalized
+    /// Holds controls for threads spawned and managed by the pool. Initialized
     /// on first call to `occupy`, to allow for some non-static constructors.
     managed_threads: Mutex<ManagedThreads>,
     /// Used to inject external work into the thread pool. This is generally
@@ -108,7 +110,7 @@ pub struct Lease {
     thread_pool: &'static ThreadPool,
     /// The index of the seat in the data list
     seat_number: usize,
-    /// A reference to the pre-initalized seat data (to avoid repeated hits of
+    /// A reference to the pre-initialized seat data (to avoid repeated hits of
     /// the `OnceLock`).
     seats: &'static Seats,
 }
@@ -187,7 +189,7 @@ impl ThreadPool {
     /// Claims a lease on the thread pool which can be occupied by a worker
     /// (using [`Worker::occupy`]), allowing a thread to participate in the pool.
     ///
-    /// Returns none if all seats are occupied.
+    /// Returns `None` if all seats are occupied.
     #[cold]
     pub fn claim_lease(&'static self) -> Option<Lease> {
         loop {
@@ -280,19 +282,25 @@ impl ThreadPool {
 // Thread pool resizing
 
 impl ThreadPool {
-    /// Resizes the thread pool to fill all available space. After this returns,
-    /// the pool will have at least one worker thread and at most `MAX_THREADS`.
-    /// Returns the new size of the pool.
+    /// Resizes the thread pool to fill (almost) all available cores. After this
+    /// returns, the pool will have between 1 and 32 workers. Returns the new
+    /// size of the pool.
+    ///
+    /// This always leaves one core free, so that the main program loop can
+    /// continue executing on it. If you have 8 cores, calling this function
+    /// will add 7 workers to the pool (and then the main thread will become the
+    /// 8th worker if it makes a blocking call like `join`).
     ///
     /// See [`ThreadPool::resize`] for more information about resizing.
     pub fn resize_to_available(&'static self) -> usize {
         let mut available = available_parallelism().map(NonZero::get).unwrap_or(1);
-        available = available.saturating_sub(1);
+        available = available.saturating_sub(1).max(1);
         self.resize_to(available)
     }
 
     /// Resizes the pool to the specified number of threads. Returns the new
-    /// size of the thread pool, which may be smaller than requested.
+    /// size of the thread pool. The new size may be smaller than requested if
+    /// all the seats in the thread pool are occupied.
     ///
     /// See [`ThreadPool::resize`] for more information about resizing.
     pub fn resize_to(&'static self, new_size: usize) -> usize {
@@ -300,19 +308,20 @@ impl ThreadPool {
     }
 
     /// Adds the given number of threads to the thread pool. Returns the new
-    /// size of the pool, which may be smaller than requested.
+    /// size of the pool. The new size may be smaller than requested if all the
+    /// seats in the thread pool are occupied.
     ///
-    /// See [`ThreadPool::resize_to`] for more information about resizing.
+    /// See [`ThreadPool::resize`] for more information about resizing.
     pub fn grow(&'static self, added_threads: usize) -> usize {
-        self.resize(|current_size| current_size + added_threads)
+        self.resize(|current_size| current_size.saturating_add(added_threads))
     }
 
     /// Removes the given number of threads from the thread pool. Returns the new
     /// size of the pool.
     ///
-    /// See [`ThreadPool::resize_to`] for more information about resizing.
+    /// See [`ThreadPool::resize`] for more information about resizing.
     pub fn shrink(&'static self, terminated_threads: usize) -> usize {
-        self.resize(|current_size| current_size - terminated_threads)
+        self.resize(|current_size| current_size.saturating_sub(terminated_threads))
     }
 
     /// Ensures that there is at least one worker thread attached to the thread
@@ -338,9 +347,8 @@ impl ThreadPool {
         self.resize_to(0)
     }
 
-    /// Resizes the pool, and returns the new size.
-    ///
-    /// Note that the new size may be different from the size requested.
+    /// Resizes the pool, and returns the new size. The new size may be smaller
+    /// than requested if all the seats in the thread pool are occupied.
     #[cold]
     pub fn resize<F>(&'static self, get_size: F) -> usize
     where
@@ -504,10 +512,10 @@ impl ThreadPool {
     /// Runs the closure on a thread-pool worker.
     ///
     /// If this thread is currently acting as a worker for the thread-pool, this
-    /// just looks that worker up. If this is not registered as a worker, or the
-    /// thread's worker is registered with different thread pool, the thread
-    /// will try to register itself with the correct pool. If the thread pool is
-    /// full, it passes the closure `None`.
+    /// just looks that worker up. If this thread is not registered as a worker,
+    /// or if the thread's worker is registered with different thread pool, the
+    /// thread will try to register itself with the correct pool. If the thread
+    /// pool is full, it passes the closure `None`.
     ///
     /// The provided closure is never sent to another thread. If your closure is
     /// `Send`, consider using [`on_worker`][ThreadPool::on_worker] instead.
@@ -549,6 +557,10 @@ impl ThreadPool {
 /// * Closures that satisfy `for<'worker> FnOnce(&'worker Worker) + Send + 'static`.
 ///
 /// * Futures that satisfy `Future<Output = T> + Send + 'static` where `T: Send + 'static`.
+///
+/// Closures return `()` when spawned, but futures return a [`Task`].
+///
+/// # Compile Errors
 ///
 /// Due to a bug in rustc, you may be given errors when using closures
 /// with inferred types. If you encounter the following:
@@ -606,6 +618,8 @@ where
     }
 }
 
+/// An alias for [`async_task::Task`] that includes a reference to the pool on
+/// which the future is executing.
 pub type Task<T> = async_task::Task<T, &'static ThreadPool>;
 
 /// Schedules a runnable future as a job.
@@ -744,7 +758,7 @@ thread_local! {
 ///
 /// Every thread has at most one worker at a time. If a worker has already been
 /// set up, it may be accessed at any time by calling [`Worker::with_current`].
-/// A thread's worker can also manually overridden by claiming a lease
+/// A thread's worker can also be manually overridden by claiming a lease
 /// ([`ThreadPool::claim_lease`]) and passing it to [`Worker::occupy`]. The
 /// worker returned by `with_current` always represents the lease most recently
 /// occupied in the call stack.
@@ -781,15 +795,16 @@ pub struct Worker {
 pub enum Yield {
     /// Indicates that a job was executed.
     Executed,
-    /// Indicates that no job was executed, and the worker should perhaps be put
-    /// to sleep.
+    /// Indicates that no job was executed. After receiving this, do not `yield`
+    /// again until you have a reasonable expectation that new work will have
+    /// been shared.
     Idle,
 }
 
 impl Worker {
     /// Temporarily sets the thread's worker. [`Worker::with_current`] always
-    /// returns a reference to the worker set up by the most recent call to this
-    /// worker.
+    /// returns a reference to the worker set up by the most recent call to
+    /// `occupy`.
     ///
     /// Rust's thread locals are fairly costly, so this function is expensive.
     /// If you can avoid calling it, do so.
@@ -845,10 +860,9 @@ impl Worker {
         &self.lease.seats.sharers[self.lease.seat_number]
     }
 
-    /// Calls the provided closure on the thread's worker instance, if it has one.
-    ///
-    /// Rust's thread locals are fairly costly, so this function is expensive.
-    /// If you can avoid calling it, do so.
+    /// Calls the provided closure on the thread's worker instance, if it has
+    /// one. If this thread is not registered as a worker, the closure is not
+    /// called.
     #[inline(always)]
     pub fn map_current<F, R>(f: F) -> Option<R>
     where
@@ -876,10 +890,9 @@ impl Worker {
         }
     }
 
-    /// Looks up the current `Worker` instance from the thread local.
-    ///
-    /// Rust's thread locals are fairly costly, so this function is expensive.
-    /// If you can avoid calling it, do so.
+    /// Calls the provided closure on the thread's worker instance, if it has
+    /// one. If this thread is not registered as a worker, the closure is passed
+    /// `None`.
     #[inline(always)]
     pub fn with_current<F, R>(f: F) -> R
     where
@@ -903,13 +916,16 @@ impl Worker {
         }
     }
 
-    /// Returns the index of the worker in the leases list.
+    /// Returns this worker's seat index within the pool (0–31).
+    ///
+    /// Seat numbers may be re-used by different workers at different times, and
+    /// may not be contiguous or ordered.
     #[inline(always)]
     pub fn seat_number(&self) -> usize {
         self.lease.seat_number
     }
 
-    /// Returns the index of the thread pool of the worker.
+    /// Returns the thread pool this worker belongs to.
     #[inline(always)]
     pub fn thread_pool(&self) -> &'static ThreadPool {
         self.lease.thread_pool
@@ -1048,7 +1064,6 @@ impl Worker {
         self.lifo_queue
             .pop_newest()
             .or_else(|| self.fifo_queue.pop_oldest())
-            .or_else(|| self.sharer().pop())
     }
 
     /// Finds a job to work on. This tries
@@ -1058,6 +1073,7 @@ impl Worker {
     fn find_work(&self) -> Option<(JobRef, bool)> {
         self.find_local_work()
             .map(|job| (job, false))
+            .or_else(|| self.sharer().pop().map(|job| (job, false)))
             .or_else(|| self.steal_from_siblings().map(|job| (job, true)))
             .or_else(|| self.claim_shared_job().map(|job| (job, true)))
     }
@@ -1104,8 +1120,14 @@ impl Worker {
     /// Cooperatively yields execution to the thread pool, allowing it to execute
     /// some work.
     ///
-    /// This function only executes local work: work already queued on the
-    /// worker. It will never claim shared work.
+    /// This function will only execute work already held locally by the worker,
+    /// and does no synchronization. To claim and run shared work, use
+    /// [`yield_now`][Worker::yield_now].
+    ///
+    /// If no work is found, this returns `Yield::Idle`. This function should
+    /// not be called again (for at least a few microseconds) after an idle.
+    /// Calling this repeatedly in a spin-loop should be avoided, as it's likely
+    /// to significantly spike CPU usage and waste resources.
     #[inline(always)]
     pub fn yield_local(&self) -> Yield {
         // We use LIFO order here, pulling the newest work from the queue. This
@@ -1122,11 +1144,17 @@ impl Worker {
     /// Cooperatively yields execution to the thread pool, allowing it to execute
     /// some work.
     ///
-    /// This function may execute either local or shared work: work already
-    /// queued on the worker, or work off-loaded by a different worker. If there
-    /// is no work on the pool, this will lock the thread pool mutex, so it
-    /// should not be called within a hot loop. Consider using
-    /// [`Worker::yield_local`] instead.
+    /// If the worker has no local work to do, it will try to steal work from
+    /// coworkers or claim work from the shared injection queue. If instead the
+    /// worker has a backlog of local work, the worker may make some of it
+    /// accessible to other workers for stealing. This involves synchronization
+    /// with the pool, and so should be called infrequently. To yield without
+    /// synchronizing with the pool, use [`yield_local`][Worker::yield_local].
+    ///
+    /// If no work is found, this returns `Yield::Idle`. This function should
+    /// not be called again (for at least a few microseconds) after an idle.
+    /// Calling this repeatedly in a spin-loop should be avoided, as it's likely
+    /// to significantly spike CPU usage and waste resources.
     #[inline(always)]
     pub fn yield_now(&self) -> Yield {
         self.promote();
@@ -1160,7 +1188,6 @@ impl Worker {
 // -----------------------------------------------------------------------------
 // Worker operations
 
-/// # Operations
 impl Worker {
     /// Spawns work (a closure or future) onto the thread pool. Just like a
     /// standard thread, this work executes concurrently (and potentially in
@@ -1185,10 +1212,37 @@ impl Worker {
     /// Polls a future to completion, then returns the outcome. This function
     /// will prioritize polling the future as soon as it becomes available, and
     /// while the future is not available it will try to do other meaningful
-    /// work.
+    /// work from the thread-pool. If the thread pool runs out of work, the
+    /// thread is suspended until the future completes or more background work
+    /// becomes available.
+    ///
+    /// # Async & Concurrency
+    ///
+    /// This is a convenient way to introduce concurrency into otherwise blocking
+    /// operations. For example, it is _totally acceptable_ to use `block_on`
+    /// within one of the branches of of a `join` operation (to perform I/O, for
+    /// example).
+    ///
+    /// This should **not** be called within `async` contexts. While it will not
+    /// block the execution of work on the pool, it will prevent the enclosing
+    /// future's `poll` method from returning. This can potentially lead to
+    /// deadlocks.
+    ///
+    /// Other implementation of `block_on` (like those defined by the `futures`
+    /// crate) should not be called within parallel forte operations. They will
+    /// block execution of work on the pool.
+    ///
+    /// # Alternatives
     ///
     /// If you do not have access to a [`Worker`], you may call
-    /// [`ThreadPool::block_on`] or simply [`block_on`].
+    /// [`ThreadPool::block_on`] instead. If you don't have a static reference
+    /// to a specific thread pool (as is often the case in library code) you can
+    /// use [`block_on`] instead, as long as you are sure that your code will
+    /// run within a worker.
+    ///
+    /// # Panics
+    ///
+    /// If the future panics, this immediately panics.
     #[inline(always)]
     pub fn block_on<F, T>(&self, future: F) -> T
     where
@@ -1230,8 +1284,118 @@ impl Worker {
 
     /// Executes the two closures, possibly in parallel.
     ///
-    /// If you do not have access to a [`Worker`], you may call
-    /// [`ThreadPool::join`] or simply [`join`].
+    /// This is conceptually similar to spawning two threads to execute each
+    /// closure, and then joining both (although the implementation is quite
+    /// different). It is intended for implementing recursive,
+    /// divide-and-conquer algorithms where each branch may itself call `join`.
+    ///
+    /// # Examples
+    ///
+    /// This example (taken wholesale from `rayon`) uses `join` to perform a
+    /// quick-sort.
+    ///
+    /// ```rust
+    /// # use forte::*;
+    /// # static THREAD_POOL: ThreadPool = ThreadPool::new();
+    /// # THREAD_POOL.resize_to_available();
+    ///
+    /// let mut v = vec![5, 1, 8, 22, 0, 44];
+    /// THREAD_POOL.on_worker(|worker| quick_sort(worker, &mut v));
+    /// assert_eq!(v, vec![0, 1, 5, 8, 22, 44]);
+    ///
+    /// fn quick_sort<T: PartialOrd + Send>(worker: &Worker, v: &mut [T]) {
+    ///     if v.len() > 1 {
+    ///         let mid = partition(v);
+    ///         let (lo, hi) = v.split_at_mut(mid);
+    ///         worker.join(|w| quick_sort(w, lo),
+    ///                     |w| quick_sort(w, hi));
+    ///     }
+    /// }
+    ///
+    /// // Partition rearranges all items `<=` to the pivot
+    /// // item (arbitrary selected to be the last item in the slice)
+    /// // to the first half of the slice. It then returns the
+    /// // "dividing point" where the pivot is placed.
+    /// fn partition<T: PartialOrd + Send>(v: &mut [T]) -> usize {
+    ///     let pivot = v.len() - 1;
+    ///     let mut i = 0;
+    ///     for j in 0..pivot {
+    ///         if v[j] <= v[pivot] {
+    ///             v.swap(i, j);
+    ///             i += 1;
+    ///         }
+    ///     }
+    ///     v.swap(i, pivot);
+    ///     i
+    /// }
+    /// ```
+    ///
+    /// This example (taken from `chili`) shows how to use `join` to sum the
+    /// nodes of a binary tree.
+    ///
+    /// ```rust
+    /// # use forte::*;
+    /// # static THREAD_POOL: ThreadPool = ThreadPool::new();
+    /// # THREAD_POOL.resize_to_available();
+    ///
+    /// let tree = gen_tree(8);
+    /// let result = THREAD_POOL.on_worker(|worker| sum(worker, &tree));
+    /// assert_eq!(result, 255);
+    ///
+    /// struct Node {
+    ///     val: u64,
+    ///     left: Option<Box<Node>>,
+    ///     right: Option<Box<Node>>,
+    /// }
+    ///
+    /// fn gen_tree(layers: usize) -> Box<Node> {
+    ///     Box::new(Node {
+    ///         val: 1,
+    ///         left: (layers != 1).then(|| gen_tree(layers - 1)),
+    ///         right: (layers != 1).then(|| gen_tree(layers - 1)),
+    ///     })
+    /// }
+    ///
+    /// fn sum(worker: &Worker, node: &Node) -> u64 {
+    ///     let (left, right) = worker.join(
+    ///         |w| node.left.as_deref().map(|n| sum(w, n)).unwrap_or_default(),
+    ///         |w| node.right.as_deref().map(|n| sum(w, n)).unwrap_or_default(),
+    ///     );
+    ///     node.val + left + right
+    /// }
+    /// ```
+    ///
+    /// # Alternatives
+    ///
+    /// If you do not have a `Worker`, you can use [`ThreadPool::join`]
+    /// instead. If you don't have a static reference to a specific thread pool
+    /// (as is often the case in library code) you can use [`join`] instead, as
+    /// long as you are sure that your code will run within a worker.
+    ///
+    /// If your workload isn't amenable to the divide-and-conquer approach or is
+    /// async, but you still want to borrow local data in your computations, you
+    /// may want to use a [`scope`][`Worker::scope`] instead.
+    ///
+    /// # Warning about blocking I/O
+    ///
+    /// The assumption is that the closures given to `join()` are CPU-bound
+    /// tasks that do not perform blocking operations. If you do perform I/O,
+    /// and that I/O should block (e.g., waiting for a network request), the
+    /// overall performance may be poor. Moreover, if you cause one closure to
+    /// be blocked waiting on another (for example, using a channel), that could
+    /// lead to a deadlock.
+    ///
+    /// You can use [`block_on`][Worker::block_on] to do async I/O within a
+    /// `join` branch, as long as different branches are not made to depend on
+    /// each other.
+    ///
+    /// # Panics
+    ///
+    /// Both closures are always executed to completion. If either panics,
+    /// `join` will propagate that panic after both complete. When both panic,
+    /// only the panic from the first argument is propagated and the panic from
+    /// the other argument is dropped (this may cause program aborts in some
+    /// situations).
     #[inline(always)]
     pub fn join<A, B, RA, RB>(&self, a: A, b: B) -> (RA, RB)
     where
@@ -1295,9 +1459,209 @@ impl Worker {
         }
     }
 
-    /// Creates a scope onto which non-static work can be spawned. For more complete docs, see [`scope`].
+    /// Creates a new scope for spawning non-static work.
     ///
-    /// If you do not have access to a worker, you can use [`ThreadPool::scope`] or simply [`scope`].
+    /// Work spawned onto the new scope does not have to have a `'static`
+    /// lifetime, and can borrow local variables. Local borrowing is possible
+    /// because this function will not return until all work spawned on the
+    /// scope has completed, this ensuring the stack frame is kept alive for the
+    /// duration.
+    ///
+    /// # Accessing stack data
+    ///
+    /// In general, spawned tasks may borrow any stack data that lives outside
+    /// the scope closure.
+    ///
+    /// ```
+    /// # use forte::ThreadPool;
+    /// # use forte::Worker;
+    /// # static THREAD_POOL: ThreadPool = ThreadPool::new();
+    /// # THREAD_POOL.populate();
+    /// # THREAD_POOL.expect_worker(|worker| {
+    /// let ok: Vec<i32> = vec![1, 2, 3];
+    /// forte::scope(|scope| {
+    ///     let bad: Vec<i32> = vec![4, 5, 6];
+    ///     scope.spawn_on(worker, |_: &Worker| {
+    ///         // Transfer ownership of `bad` into a local variable (also named `bad`).
+    ///         // This will force the closure to take ownership of `bad` from the environment.
+    ///         let bad = bad;
+    ///         println!("ok: {:?}", ok); // `ok` is only borrowed.
+    ///         println!("bad: {:?}", bad); // refers to our local variable, above.
+    ///     });
+    ///
+    ///     scope.spawn_on(worker, |_: &Worker| println!("ok: {:?}", ok)); // we too can borrow `ok`
+    /// });
+    /// # });
+    /// ```
+    /// As the comments example above suggest, to reference `bad` we must
+    /// take ownership of it. One way to do this is to detach the closure
+    /// from the surrounding stack frame, using the `move` keyword. This
+    /// will cause it to take ownership of *all* the variables it touches,
+    /// in this case including both `ok` *and* `bad`:
+    ///
+    /// ```rust
+    /// # use forte::ThreadPool;
+    /// # use forte::Worker;
+    /// # static THREAD_POOL: ThreadPool = ThreadPool::new();
+    /// # THREAD_POOL.populate();
+    /// # THREAD_POOL.expect_worker(|worker| {
+    /// let ok: Vec<i32> = vec![1, 2, 3];
+    /// forte::scope(|scope| {
+    ///     let bad: Vec<i32> = vec![4, 5, 6];
+    ///     scope.spawn_on(worker, move |_: &Worker| {
+    ///         println!("ok: {:?}", ok);
+    ///         println!("bad: {:?}", bad);
+    ///     });
+    ///
+    ///     // That closure is fine, but now we can't use `ok` anywhere else,
+    ///     // since it is owned by the previous task:
+    ///     // scope.spawn_on(worker, |_: &Worker| println!("ok: {:?}", ok));
+    /// });
+    /// # });
+    /// ```
+    ///
+    /// While this works, it could be a problem if we want to use `ok` elsewhere.
+    /// There are two choices. We can keep the closure as a `move` closure, but
+    /// instead of referencing the variable `ok`, we create a shadowed variable that
+    /// is a borrow of `ok` and capture *that*:
+    ///
+    /// ```rust
+    /// # use forte::ThreadPool;
+    /// # use forte::Worker;
+    /// # static THREAD_POOL: ThreadPool = ThreadPool::new();
+    /// # THREAD_POOL.populate();
+    /// # THREAD_POOL.expect_worker(|worker| {
+    /// let ok: Vec<i32> = vec![1, 2, 3];
+    /// forte::scope(|scope| {
+    ///     let bad: Vec<i32> = vec![4, 5, 6];
+    ///     let ok: &Vec<i32> = &ok; // shadow the original `ok`
+    ///     scope.spawn_on(worker, move |_: &Worker| {
+    ///         println!("ok: {:?}", ok); // captures the shadowed version
+    ///         println!("bad: {:?}", bad);
+    ///     });
+    ///
+    ///     // Now we too can use the shadowed `ok`, since `&Vec<i32>` references
+    ///     // can be shared freely. Note that we need a `move` closure here though,
+    ///     // because otherwise we'd be trying to borrow the shadowed `ok`,
+    ///     // and that doesn't outlive `scope`.
+    ///     scope.spawn_on(worker, move |_: &Worker| println!("ok: {:?}", ok));
+    /// });
+    /// # });
+    /// ```
+    ///
+    /// Another option is not to use the `move` keyword but instead to take ownership
+    /// of individual variables:
+    ///
+    /// ```rust
+    /// # use forte::ThreadPool;
+    /// # use forte::Worker;
+    /// # static THREAD_POOL: ThreadPool = ThreadPool::new();
+    /// # THREAD_POOL.populate();
+    /// # THREAD_POOL.expect_worker(|worker| {
+    /// let ok: Vec<i32> = vec![1, 2, 3];
+    /// forte::scope(|scope| {
+    ///     let bad: Vec<i32> = vec![4, 5, 6];
+    ///     scope.spawn_on(worker, |_: &Worker| {
+    ///         // Transfer ownership of `bad` into a local variable (also named `bad`).
+    ///         // This will force the closure to take ownership of `bad` from the environment.
+    ///         let bad = bad;
+    ///         println!("ok: {:?}", ok); // `ok` is only borrowed.
+    ///         println!("bad: {:?}", bad); // refers to our local variable, above.
+    ///     });
+    ///
+    ///     scope.spawn_on(worker, |_: &Worker| println!("ok: {:?}", ok)); // we too can borrow `ok`
+    /// });
+    /// # });
+    /// ```
+    ///
+    /// # Referencing the scope
+    ///
+    /// The scope passed into the closure is not allowed to leak out of this call.
+    /// In other words, this will fail to compile:
+    ///
+    /// ```compile_fail
+    /// # use forte::ThreadPool;
+    /// # use forte::Worker;
+    /// # static THREAD_POOL: ThreadPool = ThreadPool::new();
+    /// # THREAD_POOL.populate();
+    /// # THREAD_POOL.expect_worker(|worker| {
+    /// let mut leak = None;
+    /// forte::scope(|scope| {
+    ///     leak = Some(scope); // <-- ERROR: scope would be leaked here
+    /// });
+    /// drop(leak);
+    /// # });
+    /// ```
+    ///
+    /// Anything spawned onto the scope can capture a reference to it.
+    /// This allows scoped work to spawn other scoped work.
+    ///
+    /// ```
+    /// # use forte::ThreadPool;
+    /// # use forte::Worker;
+    /// # static THREAD_POOL: ThreadPool = ThreadPool::new();
+    /// # THREAD_POOL.populate();
+    /// # THREAD_POOL.expect_worker(|worker| {
+    /// let mut counter = 0;
+    /// let counter_ref = &mut counter;
+    /// forte::scope(|scope| {
+    ///     scope.spawn_on(worker, |worker: &Worker| {
+    ///         *counter_ref += 1;
+    ///         // Note: we borrow the scope again here.
+    ///         scope.spawn_on(worker, move |_: &Worker| {
+    ///             *counter_ref += 1;
+    ///         });
+    ///     });
+    /// });
+    /// assert_eq!(counter, 2);
+    /// # });
+    /// ```
+    ///
+    /// It's possible to spawn non-scoped work within the closure, but these
+    /// generally can't hold references to the scope. So for example, the
+    /// following also fails to compile:
+    ///
+    /// ```compile_fail,E0521
+    /// # use forte::ThreadPool;
+    /// # use forte::Worker;
+    /// # static THREAD_POOL: ThreadPool = ThreadPool::new();
+    /// # THREAD_POOL.populate();
+    /// THREAD_POOL.with_worker(|worker| {
+    ///     worker.scope(|scope| {
+    ///         worker.spawn(|worker: &Worker| {
+    ///             // ^^^^^ ERROR: This creates a *static* job on the worker,
+    ///             //       which may outlive the scope.
+    ///             
+    ///             scope.spawn_on(worker, |_: &Worker| { });
+    ///             // ^^^^^ ERROR: This requires borrowing the scope within the
+    ///             //       unscoped job, which isn't allowed by the compiler
+    ///             //       because 'scope would have to to outlive 'static.
+    ///         });
+    ///     });
+    /// });
+    /// ```
+    ///
+    /// # Alternatives
+    ///
+    /// If you do not have a `Worker`, you can use [`ThreadPool::scope`]
+    /// instead. If you don't have a static reference to a specific thread pool
+    /// (as is often the case in library code) you can use [`scope`] instead, as
+    /// long as you are sure that your code will run within a worker.
+    ///
+    /// Scopes are a more flexible building block compared to
+    /// [`join`][Worker::join], since a loop can be used to spawn any number of
+    /// tasks without recursing. However, that flexibility comes at a
+    /// performance price: tasks spawned using `scope` must be allocated onto
+    /// the heap, whereas [`join`][Worker::join] can make exclusive use of the
+    /// stack. Prefer [`join`][Worker::join]) where possible.
+    ///
+    /// # Panics
+    ///
+    /// If a panic occurs, either in the closure given to `scope` or in job
+    /// spawned on the scope, that panic is caught and stored. When all the work
+    /// on the scope is complete, `scope` will then re-emit that panic. If
+    /// multiple panics occurs, the first will propagate and the others will be
+    /// caught and dropped (which may result in program aborts).
     #[inline(always)]
     pub fn scope<'env, F, T>(&self, f: F) -> T
     where
@@ -1308,16 +1672,24 @@ impl Worker {
 }
 
 // -----------------------------------------------------------------------------
-// Thread local scheduling api
+// Implicit worker registration api
 
 /// Runs the provided closure in the background.
 ///
-/// <div class="warning">
-/// <strong>Note:</strong>
-/// This function panics if the current thread is not registered as a worker.
-/// </div>
+/// When executed on a thread that is currently registered as a worker (i.e. the
+/// closure inside [`Worker::occupy`], [`ThreadPool::with_worker`], or similar)
+/// this is able to look up that registration and find the worker and
+/// thread-pool implicitly.
 ///
-/// See also: [`Worker::spawn`] and [`ThreadPool::spawn`].
+/// If you have a reference to a [`Worker`], it's better to use [`Worker::spawn`]
+/// instead. If you don't have a worker, but know which thread pool you want to
+/// use, [`ThreadPool::spawn`] is more appropriate.
+///
+/// <div class="example-wrap" style="display:inline-block"><pre class="compile_fail" style="white-space:normal;font:inherit;">
+///
+/// **Warning:** This function panics if the current thread is not registered as a worker.
+///
+/// </pre></div>
 pub fn spawn<M, S: Spawn<M>>(work: S) -> S::Output {
     Worker::with_current(|worker| {
         worker
@@ -1328,12 +1700,20 @@ pub fn spawn<M, S: Spawn<M>>(work: S) -> S::Output {
 
 /// Waits for a future to complete.
 ///
-/// <div class="warning">
-/// <strong>Note:</strong>
-/// This function panics if the current thread is not registered as a worker.
-/// </div>
+/// When executed on a thread that is currently registered as a worker (i.e. the
+/// closure inside [`Worker::occupy`], [`ThreadPool::with_worker`], or similar)
+/// this is able to look up that registration and find the worker and
+/// thread-pool implicitly.
 ///
-/// See also: [`Worker::block_on`] and [`ThreadPool::block_on`].
+/// If you have a reference to a [`Worker`], it's better to use
+/// [`Worker::block_on`] instead. If you don't have a worker, but know which
+/// thread pool you want to use, [`ThreadPool::block_on`] is more appropriate.
+///
+/// <div class="example-wrap" style="display:inline-block"><pre class="compile_fail" style="white-space:normal;font:inherit;">
+///
+/// **Warning:** This function panics if the current thread is not registered as a worker.
+///
+/// </pre></div>
 pub fn block_on<F, T>(future: F) -> T
 where
     F: Future<Output = T> + Send,
@@ -1348,12 +1728,20 @@ where
 
 /// Executes the two closures, possibly in parallel.
 ///
-/// <div class="warning">
-/// <strong>Note:</strong>
-/// This function panics if the current thread is not registered as a worker.
-/// </div>
+/// When executed on a thread that is currently registered as a worker (i.e. the
+/// closure inside [`Worker::occupy`], [`ThreadPool::with_worker`], or similar)
+/// this is able to look up that registration and find the worker and
+/// thread-pool implicitly.
 ///
-/// See also: [`Worker::join`] and [`ThreadPool::join`].
+/// If you have a reference to a [`Worker`], it's better to use [`Worker::join`]
+/// instead. If you don't have a worker, but know which thread pool you want to
+/// use, [`ThreadPool::join`] is more appropriate.
+///
+/// <div class="example-wrap" style="display:inline-block"><pre class="compile_fail" style="white-space:normal;font:inherit;">
+///
+/// **Warning:** This function panics if the current thread is not registered as a worker.
+///
+/// </pre></div>
 pub fn join<A, B, RA, RB>(a: A, b: B) -> (RA, RB)
 where
     A: FnOnce(&Worker) -> RA + Send,
@@ -1370,218 +1758,20 @@ where
 
 /// Creates a new scope for spawning non-static work.
 ///
-/// Work spawned onto the new scope does not have to have a `'static`
-/// lifetime, and can borrow local variables. Local borrowing is possible
-/// because this function will not return until all work spawned on the
-/// scope has completed, this ensuring the stack frame is kept alive for the
-/// duration.
+/// When executed on a thread that is currently registered as a worker (i.e. the
+/// closure inside [`Worker::occupy`], [`ThreadPool::with_worker`], or similar)
+/// this is able to look up that registration and find the worker and
+/// thread-pool implicitly.
 ///
-/// <div class="warning">
-/// <strong>Note:</strong>
-/// This function panics if the current thread is not registered as a worker.
-/// </div>
+/// If you have a reference to a [`Worker`], it's better to use
+/// [`Worker::scope`] instead. If you don't have a worker, but know which thread
+/// pool you want to use, [`ThreadPool::scope`] is more appropriate.
 ///
-/// # Alternatives
+/// <div class="example-wrap" style="display:inline-block"><pre class="compile_fail" style="white-space:normal;font:inherit;">
 ///
-/// Where possible, [`ThreadPool::scope`] or [`Worker::scope`] should be used
-/// instead. These functions are more efficient, and do not panic when not
-/// within a worker.
+/// **Warning:** This function panics if the current thread is not registered as a worker.
 ///
-/// Scopes are a more flexible building block compared to [`join()`], since a
-/// loop can be used to spawn any number of tasks without recursing.
-/// However, that flexibility comes at a performance price: tasks spawned
-/// using `scope` must be allocated onto the heap, whereas [`join()`] can make
-/// exclusive use of the stack. Prefer [`join()`] (or ideally [`Worker::join`]) where possible.
-///
-/// [`join()`]: Worker::join
-///
-/// # Accessing stack data
-///
-/// In general, spawned tasks may borrow any stack data that lives outside
-/// the scope closure.
-///
-/// ```
-/// # use forte::ThreadPool;
-/// # use forte::Worker;
-/// # static THREAD_POOL: ThreadPool = ThreadPool::new();
-/// # THREAD_POOL.populate();
-/// # THREAD_POOL.expect_worker(|worker| {
-/// let ok: Vec<i32> = vec![1, 2, 3];
-/// forte::scope(|scope| {
-///     let bad: Vec<i32> = vec![4, 5, 6];
-///     scope.spawn_on(worker, |_: &Worker| {
-///         // Transfer ownership of `bad` into a local variable (also named `bad`).
-///         // This will force the closure to take ownership of `bad` from the environment.
-///         let bad = bad;
-///         println!("ok: {:?}", ok); // `ok` is only borrowed.
-///         println!("bad: {:?}", bad); // refers to our local variable, above.
-///     });
-///
-///     scope.spawn_on(worker, |_: &Worker| println!("ok: {:?}", ok)); // we too can borrow `ok`
-/// });
-/// # });
-/// ```
-/// As the comments example above suggest, to reference `bad` we must
-/// take ownership of it. One way to do this is to detach the closure
-/// from the surrounding stack frame, using the `move` keyword. This
-/// will cause it to take ownership of *all* the variables it touches,
-/// in this case including both `ok` *and* `bad`:
-///
-/// ```rust
-/// # use forte::ThreadPool;
-/// # use forte::Worker;
-/// # static THREAD_POOL: ThreadPool = ThreadPool::new();
-/// # THREAD_POOL.populate();
-/// # THREAD_POOL.expect_worker(|worker| {
-/// let ok: Vec<i32> = vec![1, 2, 3];
-/// forte::scope(|scope| {
-///     let bad: Vec<i32> = vec![4, 5, 6];
-///     scope.spawn_on(worker, move |_: &Worker| {
-///         println!("ok: {:?}", ok);
-///         println!("bad: {:?}", bad);
-///     });
-///
-///     // That closure is fine, but now we can't use `ok` anywhere else,
-///     // since it is owned by the previous task:
-///     // scope.spawn_on(worker, |_: &Worker| println!("ok: {:?}", ok));
-/// });
-/// # });
-/// ```
-///
-/// While this works, it could be a problem if we want to use `ok` elsewhere.
-/// There are two choices. We can keep the closure as a `move` closure, but
-/// instead of referencing the variable `ok`, we create a shadowed variable that
-/// is a borrow of `ok` and capture *that*:
-///
-/// ```rust
-/// # use forte::ThreadPool;
-/// # use forte::Worker;
-/// # static THREAD_POOL: ThreadPool = ThreadPool::new();
-/// # THREAD_POOL.populate();
-/// # THREAD_POOL.expect_worker(|worker| {
-/// let ok: Vec<i32> = vec![1, 2, 3];
-/// forte::scope(|scope| {
-///     let bad: Vec<i32> = vec![4, 5, 6];
-///     let ok: &Vec<i32> = &ok; // shadow the original `ok`
-///     scope.spawn_on(worker, move |_: &Worker| {
-///         println!("ok: {:?}", ok); // captures the shadowed version
-///         println!("bad: {:?}", bad);
-///     });
-///
-///     // Now we too can use the shadowed `ok`, since `&Vec<i32>` references
-///     // can be shared freely. Note that we need a `move` closure here though,
-///     // because otherwise we'd be trying to borrow the shadowed `ok`,
-///     // and that doesn't outlive `scope`.
-///     scope.spawn_on(worker, move |_: &Worker| println!("ok: {:?}", ok));
-/// });
-/// # });
-/// ```
-///
-/// Another option is not to use the `move` keyword but instead to take ownership
-/// of individual variables:
-///
-/// ```rust
-/// # use forte::ThreadPool;
-/// # use forte::Worker;
-/// # static THREAD_POOL: ThreadPool = ThreadPool::new();
-/// # THREAD_POOL.populate();
-/// # THREAD_POOL.expect_worker(|worker| {
-/// let ok: Vec<i32> = vec![1, 2, 3];
-/// forte::scope(|scope| {
-///     let bad: Vec<i32> = vec![4, 5, 6];
-///     scope.spawn_on(worker, |_: &Worker| {
-///         // Transfer ownership of `bad` into a local variable (also named `bad`).
-///         // This will force the closure to take ownership of `bad` from the environment.
-///         let bad = bad;
-///         println!("ok: {:?}", ok); // `ok` is only borrowed.
-///         println!("bad: {:?}", bad); // refers to our local variable, above.
-///     });
-///
-///     scope.spawn_on(worker, |_: &Worker| println!("ok: {:?}", ok)); // we too can borrow `ok`
-/// });
-/// # });
-/// ```
-///
-/// # Referencing the scope
-///
-/// The scope passed into the closure is not allowed to leak out of this call.
-/// In other words, this will fail to compile:
-///
-/// ```compile_fail
-/// # use forte::ThreadPool;
-/// # use forte::Worker;
-/// # static THREAD_POOL: ThreadPool = ThreadPool::new();
-/// # THREAD_POOL.populate();
-/// # THREAD_POOL.expect_worker(|worker| {
-/// let mut leak = None;
-/// forte::scope(|scope| {
-///     leak = Some(scope); // <-- ERROR: scope would be leaked here
-/// });
-/// drop(leak);
-/// # });
-/// ```
-///
-/// Anything spawned onto the scope can capture a reference to it.
-/// This allows scoped work to spawn other scoped work.
-///
-/// ```
-/// # use forte::ThreadPool;
-/// # use forte::Worker;
-/// # static THREAD_POOL: ThreadPool = ThreadPool::new();
-/// # THREAD_POOL.populate();
-/// # THREAD_POOL.expect_worker(|worker| {
-/// let mut counter = 0;
-/// let counter_ref = &mut counter;
-/// forte::scope(|scope| {
-///     scope.spawn_on(worker, |worker: &Worker| {
-///         *counter_ref += 1;
-///         // Note: we borrow the scope again here.
-///         scope.spawn_on(worker, move |_: &Worker| {
-///             *counter_ref += 1;
-///         });
-///     });
-/// });
-/// assert_eq!(counter, 2);
-/// # });
-/// ```
-///
-/// It's possible to spawn non-scoped work within the closure, but these
-/// generally can't hold references to the scope. So for example, the
-/// following also fails to compile:
-///
-/// ```compile_fail,E0521
-/// # use forte::ThreadPool;
-/// # use forte::Worker;
-/// # static THREAD_POOL: ThreadPool = ThreadPool::new();
-/// # THREAD_POOL.populate();
-/// THREAD_POOL.with_worker(|worker| {
-///     worker.scope(|scope| {
-///         worker.spawn(|worker: &Worker| {
-///             // ^^^^^ ERROR: This creates a *static* job on the worker,
-///             //       which may outlive the scope.
-///             
-///             scope.spawn_on(worker, |_: &Worker| { });
-///             // ^^^^^ ERROR: This requires borrowing the scope within the
-///             //       unscoped job, which isn't allowed by the compiler
-///             //       because 'scope would have to to outlive 'static.
-///         });
-///     });
-/// });
-/// ```
-///
-/// # Panics
-///
-/// This function panics when not called within a worker. The
-/// [`ThreadPool::scope`] and [`Worker::scope`] functions do not, and should be
-/// preferred when possible.
-///
-/// If a panic occurs, either in the closure given to `scope()` or in a blocking
-/// (non-async) job spawned on the scope, that panic will be propagated and the
-/// call to `scope()` will panic. If multiple panics occurs, it is
-/// non-deterministic which of their panic values will propagate. Regardless,
-/// once a task is spawned using `scope.spawn(),` it will execute, even if the
-/// spawning task should later panic. The scope returns once all work is
-/// complete, and panics are propagated at that point.
+/// </pre></div>
 pub fn scope<'env, F, T>(f: F) -> T
 where
     F: for<'scope> FnOnce(&'scope Scope<'scope, 'env>) -> T,
