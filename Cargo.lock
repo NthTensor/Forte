@@ -499,10 +499,10 @@ dependencies = [
  "crossbeam-utils",
  "dashmap",
  "divan",
+ "hotclock",
  "rayon",
  "shuttle",
  "st3",
- "tick_counter",
  "tracing",
  "tracing-subscriber",
 ]
@@ -632,6 +632,11 @@ name = "hex"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
+
+[[package]]
+name = "hotclock"
+version = "0.2.0"
+source = "git+https://github.com/spence/hotclock#8cf14ae9d62dba7f7780a3c920ab6208b6568777"
 
 [[package]]
 name = "is-terminal"
@@ -1183,12 +1188,6 @@ checksum = "f60246a4944f24f6e018aa17cdeffb7818b76356965d03b07d6a9886e8962185"
 dependencies = [
  "cfg-if",
 ]
-
-[[package]]
-name = "tick_counter"
-version = "0.4.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "37f1310986d0aa940019cbb2b480161c60a614dba076cbb20e82bfbc236bbabd"
 
 [[package]]
 name = "tinytemplate"
