@@ -945,7 +945,7 @@ impl Worker {
         // Promotions are fairly costly, so we limit their frequency using the
         // cpu's instruction counter. Promote is called at a high frequency, and
         // actually doing the promotion is probably a cold path.
-        let current_tick = tick_counter::start();
+        let current_tick = hotclock::Instant::now().as_raw();
         if current_tick.wrapping_sub(self.last_promote_tick.get()) >= Self::PROMOTE_TICK_INTERVAL {
             // This should ideally become a conditional jump.
             self.promote_cold(current_tick);
