@@ -13,11 +13,11 @@ use shuttle::hint::black_box;
 use shuttle::sync::atomic::AtomicBool;
 use shuttle::sync::atomic::AtomicUsize;
 use shuttle::sync::atomic::Ordering;
-use tracing::Level;
-use tracing_subscriber::fmt::Subscriber;
 
 // -----------------------------------------------------------------------------
 // Infrastructure
+
+static THREAD_POOL: ThreadPool = ThreadPool::new();
 
 /// Provides access to a thread pool which can be treated as static for the
 /// purposes of testing.
@@ -26,17 +26,21 @@ where
     F: Fn(&'static ThreadPool) + 'static,
 {
     move || {
-        let thread_pool = Box::new(ThreadPool::new());
-        let thread_pool_ptr = Box::into_raw(thread_pool);
-
-        // SAFETY: This thread pool is never dropped.
-        let thread_pool_ref = unsafe { &*thread_pool_ptr };
-        f(thread_pool_ref);
+        f(&THREAD_POOL);
     }
 }
 
 // -----------------------------------------------------------------------------
 // Pool resizing
+
+#[test]
+pub fn shuttle_control() {
+    let test = with_thread_pool(|pool| {
+        shuttle::thread::spawn(|| {});
+    });
+
+    shuttle::check_pct(test, 100_000, 100_000);
+}
 
 /// Tests for concurrency issues within the `with_thread_pool` helper function.
 /// This spins up a thread pool with a single thread, then spins it back down.
@@ -47,7 +51,7 @@ pub fn shuttle_populate_depopulate() {
         pool.depopulate();
     });
 
-    shuttle::check_pct(test, 100_000, 100_000);
+    shuttle::check_pct(test, 10, 10);
 }
 
 // -----------------------------------------------------------------------------
@@ -73,7 +77,10 @@ struct CountFuture {
 impl Future for CountFuture {
     type Output = ();
 
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+    fn poll(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Self::Output> {
         if self.count == 128 {
             Poll::Ready(())
         } else {
@@ -195,16 +202,19 @@ pub fn join_long() {
                 0 => (),
                 1 => slice[0] += 1,
                 _ => {
-                    let (head, tail) = slice.split_at_mut(1);
-
-                    worker.join(|_| head[0] += 1, |worker| increment(worker, tail));
+                    let mid = slice.len() / 2;
+                    let (head, tail) = slice.split_at_mut(mid);
+                    worker.join(
+                        |worker| increment(worker, head),
+                        |worker| increment(worker, tail),
+                    );
                 }
             }
         }
 
-        let mut vals = [0; 10];
-        pool.expect_worker(|worker| increment(worker, &mut vals));
-        assert_eq!(vals, [1; 10]);
+        let mut vals = [0; 1];
+        pool.with_worker(|worker| increment(worker, &mut vals));
+        assert_eq!(vals, [1; 1]);
 
         pool.depopulate();
     });

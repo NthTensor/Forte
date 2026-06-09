@@ -3,10 +3,6 @@
 use chili::Scope;
 use divan::Bencher;
 use forte::Worker;
-use tracing::info;
-use tracing_subscriber::fmt;
-use tracing_subscriber::layer::SubscriberExt;
-use tracing_subscriber::util::SubscriberInitExt;
 
 // -----------------------------------------------------------------------------
 // Workload
@@ -32,7 +28,8 @@ impl Node {
 // Returns an iterator over the number of layers. Also returns the total number
 // of nodes.
 const LAYERS: &[usize] = &[
-    5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, // 10, 24, 27,
+    5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
+    20, // 10, 24, 27,
 ];
 
 fn nodes() -> impl Iterator<Item = (usize, usize)> {
@@ -86,8 +83,7 @@ fn forte(bencher: Bencher, nodes: (usize, usize)) {
 
     let tree = Node::tree(nodes.0);
 
-    COMPUTE.expect_worker(|worker| {
-        info!("Staring Benchmark");
+    COMPUTE.with_worker(|worker| {
         bencher.bench_local(move || {
             assert_eq!(sum(&tree, worker), nodes.1 as u64);
         });
@@ -105,9 +101,8 @@ fn throughput_forte(bencher: Bencher, nodes: (usize, usize)) {
         node.val + left + right
     }
 
-    info!("Staring Benchmark");
     bencher.bench(|| {
-        COMPUTE.expect_worker(|worker| {
+        COMPUTE.with_worker(|worker| {
             let tree = Node::tree(nodes.0);
             assert_eq!(sum(&tree, worker), nodes.1 as u64);
         });
@@ -187,14 +182,6 @@ fn throughput_rayon(bencher: Bencher, nodes: (usize, usize)) {
 }
 
 fn main() {
-    let fmt_layer = fmt::layer()
-        .without_time()
-        .with_target(false)
-        .with_thread_names(true)
-        .compact();
-
-    tracing_subscriber::registry().with(fmt_layer).init();
-
     COMPUTE.resize_to_available();
 
     divan::main();

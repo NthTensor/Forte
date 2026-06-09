@@ -16,20 +16,29 @@ This project is currently in early [pre-release], and there may be arbitrary bre
 
 ### Added 
 
-- `ThreadPool::num_workers` method which returns the current number of workers
-- `ThreadPool::on_worker` variant of `with_worker` for `Send` closures.
-- `ThreadPool::expect_worker` variant of `with_worker` that panics.
+- `Worker::spawn_local` for spawning `!Send` work.
+- `Worker::broadcast`, `ThreadPool::spawn_broadcast`, and `broadcast` for blocking broadcasts.
+- `ThreadPool::broadcast`, `ThreadPool::spawn_broadcast`, and `spawn_broadcast` for non-blocking broadcasts.
+- `ThreadPool::num_members` method which returns the current number of member threads.
+- `ThreadPool::get_worker` which looks up the worker if it exists.
+- `ThreadPool::enroll` which requests membership and blocks until it is granted.
+- `ThreadPool::try_enroll` which requests a membership and returns None if none are available.
 
 ### Changed
+
+- `Lease` and `StackJob` have been refactored to improve stack utilization.
 - Work sharing has been rewritten to improve performance.
-- Thread pools can now have a max of 32 workers at a time.
+- Thread pools can now have a max of 32 members at a time.
+- `ThreadPool::with_worker` now waits for a membership to become available.
 - `spawn`, `Scope::spawn`, and `Worker::spawn` now accept closures and futures.
-- `ThreadPool::with_worker` now provides `Option<&Worker>` instead of `&Worker`.
-- `claim_lease` now returns `Option<Lease>` instead of `Lease`.
+- `Lease` is now called `Membership`.
 - `Scope` now has two lifetimes instead of one, and is more flexible.
 
 ### Removed
+
 - All versions of `spawn_future` and `spawn_async`; just use `spawn` instead.
+- `claim_lease` has been replaced with `try_enroll`.
+- `Worker::occupy` has been replaced with `Membership::activate`.
 
 ## [1.0.0-alpha.4]
 

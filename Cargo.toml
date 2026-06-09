@@ -5,6 +5,10 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "Low-overhead parallel and async work scheduler"
 repository = "https://github.com/NthTensor/Forte"
+rust-version = "1.96.0"
+
+# Lie to cargo
+links = "forte"
 
 [workspace]
 resolver = "2"
@@ -12,15 +16,13 @@ members = ["ci"]
 
 [dependencies]
 async-task = "4.7.1"
-atomic-wait = "1.1.0"
+atomic-wait = { package = "shuttle-atomic-wait", path = "../../awslabs/shuttle/wrappers/atomic_wait" }
+lazy_static = { package = "shuttle-lazy_static", path = "../../awslabs/shuttle/wrappers/lazy_static" }
 crossbeam-queue = "0.3.12"
 crossbeam-utils = "0.8.21"
 st3 = "0.4"
-hotclock = { git = "https://github.com/spence/hotclock" }
-
-shuttle = { version = "0.8.0", optional = true }
-tracing = { version = "0.1.41", features = ["release_max_level_off"] }
-tracing-subscriber = "0.3.19"
+futures-lite = "2.6.1"
+shuttle = { path = "../../awslabs/shuttle/shuttle", optional = true }
 
 [dev-dependencies]
 # Required for comparison testing
@@ -34,7 +36,7 @@ dashmap = "6.1.0"
 criterion = { version = "0.5" }
 
 [features]
-shuttle = ["dep:shuttle"]
+shuttle = ["dep:shuttle", "atomic-wait/shuttle"]
 
 [profile.release]
 debug = true

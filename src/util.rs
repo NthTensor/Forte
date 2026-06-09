@@ -1,8 +1,8 @@
 use core::cell::Cell;
 use core::hash::Hasher;
-use core::sync::atomic::AtomicUsize;
-use core::sync::atomic::Ordering;
 use std::hash::DefaultHasher;
+
+use crate::platform::*;
 
 /// [xorshift*] is a fast pseudorandom number generator which will
 /// even tolerate weak seeding, as long as it's not zero.
@@ -69,3 +69,38 @@ impl XorShift64Star {
         thread_rng().gen_range(0..n)
     }
 }
+
+pub trait IterBits {
+    fn iter_bits(self) -> BitIter;
+}
+
+impl IterBits for u32 {
+    fn iter_bits(self) -> BitIter {
+        BitIter { bitset: self }
+    }
+}
+
+pub struct BitIter {
+    bitset: u32,
+}
+
+impl Iterator for BitIter {
+    type Item = usize;
+
+    fn next(&mut self) -> Option<usize> {
+        if self.bitset == 0 {
+            None
+        } else {
+            let i = self.bitset.trailing_zeros(); // TZCNT
+            self.bitset &= self.bitset - 1; // BLSR
+            Some(i as usize)
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let populated = self.bitset.count_ones(); // POPCNT
+        (populated as usize, Some(populated as usize))
+    }
+}
+
+impl ExactSizeIterator for BitIter {}

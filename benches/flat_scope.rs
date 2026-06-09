@@ -6,9 +6,6 @@ use std::hash::Hasher;
 
 use criterion::black_box;
 use divan::Bencher;
-use tracing_subscriber::fmt;
-use tracing_subscriber::layer::SubscriberExt;
-use tracing_subscriber::util::SubscriberInitExt;
 
 const SIZES: &[usize] = &[8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4012, 8196];
 
@@ -39,7 +36,7 @@ static COMPUTE: forte::ThreadPool = forte::ThreadPool::new();
 fn forte(bencher: Bencher, size: usize) {
     use forte::Worker;
 
-    COMPUTE.expect_worker(|worker| {
+    COMPUTE.with_worker(|worker| {
         bencher.bench_local(|| {
             worker.scope(|scope| {
                 for i in 0..size {
@@ -78,14 +75,6 @@ fn rayon(bencher: Bencher, size: usize) {
 }
 
 fn main() {
-    let fmt_layer = fmt::layer()
-        .without_time()
-        .with_target(false)
-        .with_thread_names(true)
-        .compact();
-
-    tracing_subscriber::registry().with(fmt_layer).init();
-
     COMPUTE.resize_to_available();
 
     divan::main();

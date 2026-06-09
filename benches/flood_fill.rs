@@ -9,9 +9,6 @@ use std::hash::Hasher;
 use criterion::black_box;
 use dashmap::DashSet;
 use divan::Bencher;
-use tracing_subscriber::fmt;
-use tracing_subscriber::layer::SubscriberExt;
-use tracing_subscriber::util::SubscriberInitExt;
 
 const SIZES: &[usize] = &[8, 16, 32, 64, 128, 256, 512];
 
@@ -126,7 +123,7 @@ fn forte(bencher: Bencher, size: usize) {
         }
     }
 
-    COMPUTE.expect_worker(|worker| {
+    COMPUTE.with_worker(|worker| {
         bencher.bench_local(|| {
             let visited = DashSet::new();
 
@@ -202,14 +199,6 @@ fn rayon(bencher: Bencher, size: usize) {
 }
 
 fn main() {
-    let fmt_layer = fmt::layer()
-        .without_time()
-        .with_target(false)
-        .with_thread_names(true)
-        .compact();
-
-    tracing_subscriber::registry().with(fmt_layer).init();
-
     COMPUTE.resize_to_available();
 
     divan::main();

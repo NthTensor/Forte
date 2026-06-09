@@ -11,7 +11,11 @@ use crate::PreparedCommand;
 pub struct CompileCheckCommand {}
 
 impl Prepare for CompileCheckCommand {
-    fn prepare<'a>(&self, sh: &'a xshell::Shell, _flags: Flag) -> Vec<PreparedCommand<'a>> {
+    fn prepare<'a>(
+        &self,
+        sh: &'a xshell::Shell,
+        _flags: Flag,
+    ) -> Vec<PreparedCommand<'a>> {
         vec![PreparedCommand::new::<Self>(
             cmd!(sh, "cargo check --workspace"),
             "Please fix compiler errors in output above.",

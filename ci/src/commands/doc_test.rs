@@ -11,7 +11,11 @@ use crate::PreparedCommand;
 pub struct DocTestCommand {}
 
 impl Prepare for DocTestCommand {
-    fn prepare<'a>(&self, sh: &'a xshell::Shell, flags: Flag) -> Vec<PreparedCommand<'a>> {
+    fn prepare<'a>(
+        &self,
+        sh: &'a xshell::Shell,
+        flags: Flag,
+    ) -> Vec<PreparedCommand<'a>> {
         let no_fail_fast = if flags.contains(Flag::KEEP_GOING) {
             "--no-fail-fast"
         } else {

@@ -12,7 +12,11 @@ use crate::commands::DocTestCommand;
 pub struct DocCommand {}
 
 impl Prepare for DocCommand {
-    fn prepare<'a>(&self, sh: &'a xshell::Shell, flags: Flag) -> Vec<PreparedCommand<'a>> {
+    fn prepare<'a>(
+        &self,
+        sh: &'a xshell::Shell,
+        flags: Flag,
+    ) -> Vec<PreparedCommand<'a>> {
         let mut commands = vec![];
         commands.append(&mut DocTestCommand::default().prepare(sh, flags));
         commands.append(&mut DocCheckCommand::default().prepare(sh, flags));
