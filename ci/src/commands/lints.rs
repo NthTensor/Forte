@@ -12,7 +12,11 @@ use crate::commands::FormatCommand;
 pub struct LintsCommand {}
 
 impl Prepare for LintsCommand {
-    fn prepare<'a>(&self, sh: &'a xshell::Shell, flags: Flag) -> Vec<PreparedCommand<'a>> {
+    fn prepare<'a>(
+        &self,
+        sh: &'a xshell::Shell,
+        flags: Flag,
+    ) -> Vec<PreparedCommand<'a>> {
         let mut commands = vec![];
         commands.append(&mut FormatCommand::default().prepare(sh, flags));
         commands.append(&mut ClippyCommand::default().prepare(sh, flags));

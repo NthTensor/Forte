@@ -1,7 +1,8 @@
 //! Comparative benchmarks against bevy_tasks
 
 struct BevyParChunksMut<'a, T>(core::slice::ChunksMut<'a, T>);
-impl<'a, T> bevy_tasks::ParallelIterator<core::slice::IterMut<'a, T>> for BevyParChunksMut<'a, T>
+impl<'a, T> bevy_tasks::ParallelIterator<core::slice::IterMut<'a, T>>
+    for BevyParChunksMut<'a, T>
 where
     T: 'a + Send + Sync,
 {
@@ -12,8 +13,11 @@ where
 
 static THREAD_POOL: forte::ThreadPool = forte::ThreadPool::new();
 
-fn forte_chunks<const CHUNK_SIZE: usize, T, F>(worker: &forte::Worker, data: &mut [T], func: &F)
-where
+fn forte_chunks<const CHUNK_SIZE: usize, T, F>(
+    worker: &forte::Worker,
+    data: &mut [T],
+    func: &F,
+) where
     T: Send + Sync,
     F: Fn(&mut [T]) + Send + Sync,
 {
@@ -83,7 +87,7 @@ mod overhead {
 
         let mut vec: Vec<_> = (0..len).collect();
 
-        THREAD_POOL.expect_worker(|worker| {
+        THREAD_POOL.with_worker(|worker| {
             bencher.bench_local(|| {
                 forte_chunks::<64, _, _>(worker, &mut vec, &|c| {
                     c.iter_mut().for_each(work);

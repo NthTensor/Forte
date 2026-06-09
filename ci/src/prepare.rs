@@ -24,7 +24,11 @@ pub trait Prepare {
     ///     }
     /// }
     /// ```
-    fn prepare<'a>(&self, sh: &'a xshell::Shell, flags: Flag) -> Vec<PreparedCommand<'a>>;
+    fn prepare<'a>(
+        &self,
+        sh: &'a xshell::Shell,
+        flags: Flag,
+    ) -> Vec<PreparedCommand<'a>>;
 }
 
 bitflags! {
@@ -83,7 +87,11 @@ impl<'a> PreparedCommand<'a> {
     }
 
     /// A builder that adds a new environmental variable to the list.
-    pub fn with_env_var(mut self, key: &'static str, value: &'static str) -> Self {
+    pub fn with_env_var(
+        mut self,
+        key: &'static str,
+        value: &'static str,
+    ) -> Self {
         self.env_vars.push((key, value));
         self
     }

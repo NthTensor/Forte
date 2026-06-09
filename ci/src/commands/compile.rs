@@ -11,7 +11,11 @@ use crate::commands::CompileCheckCommand;
 pub struct CompileCommand {}
 
 impl Prepare for CompileCommand {
-    fn prepare<'a>(&self, sh: &'a xshell::Shell, flags: Flag) -> Vec<PreparedCommand<'a>> {
+    fn prepare<'a>(
+        &self,
+        sh: &'a xshell::Shell,
+        flags: Flag,
+    ) -> Vec<PreparedCommand<'a>> {
         let mut commands = vec![];
         commands.append(&mut CompileCheckCommand::default().prepare(sh, flags));
         commands

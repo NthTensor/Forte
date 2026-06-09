@@ -30,7 +30,7 @@
 //!     THREAD_POOL.resize_to_available();
 //!
 //!     // Register this thread as a worker on the pool.
-//!     THREAD_POOL.expect_worker(|worker| {
+//!     THREAD_POOL.with_worker(|worker| {
 //!         // Spawn a job onto the pool. The closure also accepts a worker, because the
 //!         // job may be executed on a different thread. This will be the worker for whatever
 //!         // thread it executes on.
@@ -130,19 +130,18 @@
 //!
 //! Thread pools are comprised of (and run on) workers, represented as instances
 //! of the [`Worker`] type. All work done on the pool is done in a "worker
-//! context" created by [`Worker::occupy`]. The recommended way to access a
-//! worker context for a specific pool is via [`ThreadPool::with_worker`],
-//! [`ThreadPool::on_worker`], or [`ThreadPool::expect_worker`].
+//! context" created by [`Membership::activate`]. The recommended way to access a
+//! worker context for a specific pool is via [`ThreadPool::with_worker`].
 //!
 //! ```
 //! # use forte::ThreadPool;
 //! # static THREAD_POOL: ThreadPool = ThreadPool::new();
-//! THREAD_POOL.expect_worker(|worker_1| {     // <-- Sets up this thread as a worker.
-//!     THREAD_POOL.expect_worker(|worker_2| { // <-- Returns a reference to the existing worker.
+//! THREAD_POOL.with_worker(|worker_1| {     // <-- Sets up this thread as a worker.
+//!     THREAD_POOL.with_worker(|worker_2| { // <-- Returns a reference to the existing worker.
 //!         // These pointers are identical.
 //!         assert!(std::ptr::eq(worker_1, worker_2));
-//!     });                                    // <-- Leaving this scope does nothing.
-//! });                                        // <-- Leaving this scope frees the worker.
+//!     });                                  // <-- Leaving this scope does nothing.
+//! });                                      // <-- Leaving this scope frees the worker.
 //! ```
 //!
 //! Every worker holds a local queue of tasks, as well as metadata that allows
@@ -174,36 +173,14 @@
 //!
 //! # Core Operations
 //!
-//! Thread pools support four core operations:
+//! Thread pools support five core operations:
 //! * *Join.* Executes two non-static closures, possibly in parallel, and waits for them to complete.
 //! * *Spawn.* Runs a static closure or future in the background.
 //! * *Scope.* Runs multiple non-static closures or futures, and waits for them all to complete.
 //! * *Block on.* Waits for a future to complete (outside of an async context).
+//! * *Broadcast.* Runs the same operation across all workers.
 //!
-//! All of these with the exception of *Spawn* are blocking; they have a
-//! specific join-point where a thread must wait for all the forks of the
-//! parallel operation to complete before proceeding. While it is waiting,
-//! threads will attempt to do background work, or help each-other out with
-//! their assigned workload.
 //!
-//! Each operation is available in three different "flavors", depending on the
-//! information available at the callsite.
-//!
-//! | Operation | Headless | Thread pool | Worker |
-//! |-----------|----------|-------------|--------|
-//! | *Join*     | [`join()`] | [`ThreadPool::join()`] | [`Worker::join()`]
-//! | *Spawn*    | [`spawn()`] | [`ThreadPool::spawn()`] | [`Worker::spawn()`]
-//! | *Scope*    | [`scope()`] | [`ThreadPool::scope()`] | [`Worker::scope()`]
-//! | *Block on* | [`block_on()`] | [`ThreadPool::block_on()`] | [`Worker::block_on()`]
-//!
-//! * *Headless.* Looks for an existing worker context, and panics if it doesn't find one.
-//! * *Thread pool.* Looks for an existing worker context, creates one if it doesn't find one.
-//! * *Worker.* Uses the provided worker context.
-//!
-//! The headless and thread pool flavors are more or less just aliases for the
-//! worker flavor. Where possible, the worker flavor should be preferred to the
-//! thread pool flavor, and the thread pool flavor should be preferred to the
-//! headless flavor.
 
 #![no_std]
 #![cfg_attr(feature = "shuttle", allow(dead_code))]
@@ -223,6 +200,7 @@ mod job;
 mod latch;
 mod scope;
 mod thread_pool;
+mod time;
 mod unwind;
 mod util;
 
@@ -239,16 +217,24 @@ pub struct FutureMarker();
 // Top-level exports
 
 pub use scope::Scope;
-pub use scope::ScopedSpawn;
+pub use scope::SpawnScoped;
+pub use thread_pool::Broadcast;
+pub use thread_pool::DEFAULT_POOL;
+pub use thread_pool::DefaultThreadPool;
+pub use thread_pool::Membership;
 pub use thread_pool::Spawn;
+pub use thread_pool::SpawnLocal;
 pub use thread_pool::Task;
 pub use thread_pool::ThreadPool;
 pub use thread_pool::Worker;
 pub use thread_pool::Yield;
 pub use thread_pool::block_on;
+pub use thread_pool::broadcast;
 pub use thread_pool::join;
+pub use thread_pool::num_members;
 pub use thread_pool::scope;
 pub use thread_pool::spawn;
+pub use thread_pool::spawn_broadcast;
 
 // -----------------------------------------------------------------------------
 // Platform Support
@@ -262,45 +248,56 @@ pub use thread_pool::spawn;
 #[cfg(not(feature = "shuttle"))]
 mod platform {
 
-    // Core exports
-
-    pub use alloc::sync::Arc;
     pub use core::sync::atomic::AtomicBool;
     pub use core::sync::atomic::AtomicPtr;
     pub use core::sync::atomic::AtomicU32;
+    pub use core::sync::atomic::AtomicUsize;
     pub use core::sync::atomic::Ordering;
+    pub use core::sync::atomic::fence;
+
+    pub use alloc::sync::Arc;
     pub use std::sync::Mutex;
-    pub use std::sync::OnceLock;
     pub use std::thread::Builder as ThreadBuilder;
     pub use std::thread::JoinHandle;
-    pub use std::thread::available_parallelism;
     pub use std::thread_local;
+
+    pub use std::thread::available_parallelism;
+
+    use std::sync::LazyLock;
+    pub struct Lazy<T>(LazyLock<T>);
+
+    impl<T> Lazy<T> {
+        pub const fn new(init: fn() -> T) -> Self {
+            Lazy(LazyLock::new(init))
+        }
+
+        pub fn get(&'static self) -> &'static T {
+            LazyLock::force(&self.0)
+        }
+    }
 }
 
 #[cfg(feature = "shuttle")]
 mod platform {
 
-    // Core exports
-
-    pub use std::sync::OnceLock; // shuttle has no OnceLock; std's version is fine here
-
-    pub use shuttle::rand::Rng;
-    pub use shuttle::rand::thread_rng;
-    pub use shuttle::sync::Arc;
-    pub use shuttle::sync::Condvar;
-    pub use shuttle::sync::Mutex;
-    pub use shuttle::sync::Weak;
     pub use shuttle::sync::atomic::AtomicBool;
     pub use shuttle::sync::atomic::AtomicPtr;
     pub use shuttle::sync::atomic::AtomicU32;
+    pub use shuttle::sync::atomic::AtomicUsize;
     pub use shuttle::sync::atomic::Ordering;
+    pub use shuttle::sync::atomic::fence;
+
+    pub use shuttle::sync::Arc;
+    pub use shuttle::sync::Mutex;
+    pub use shuttle::sync::Weak;
     pub use shuttle::thread::Builder as ThreadBuilder;
     pub use shuttle::thread::JoinHandle;
     pub use shuttle::thread_local;
 
-    // Available parallelism
-
-    pub fn available_parallelism() -> std::io::Result<core::num::NonZero<usize>> {
+    pub fn available_parallelism() -> std::io::Result<core::num::NonZero<usize>>
+    {
         panic!("available_parallelism does not work on shuttle");
     }
+
+    pub use shuttle::lazy_static::Lazy;
 }

@@ -13,10 +13,15 @@ use crate::commands::ShuttleTestCommand;
 pub struct ShuttleCommand {}
 
 impl Prepare for ShuttleCommand {
-    fn prepare<'a>(&self, sh: &'a xshell::Shell, flags: Flag) -> Vec<PreparedCommand<'a>> {
+    fn prepare<'a>(
+        &self,
+        sh: &'a xshell::Shell,
+        flags: Flag,
+    ) -> Vec<PreparedCommand<'a>> {
         let mut commands = vec![];
         commands.append(&mut ShuttleCheckCommand::default().prepare(sh, flags));
-        commands.append(&mut ShuttleClippyCommand::default().prepare(sh, flags));
+        commands
+            .append(&mut ShuttleClippyCommand::default().prepare(sh, flags));
         commands.append(&mut ShuttleTestCommand::default().prepare(sh, flags));
         commands
     }

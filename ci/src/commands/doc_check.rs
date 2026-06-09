@@ -11,7 +11,11 @@ use crate::PreparedCommand;
 pub struct DocCheckCommand {}
 
 impl Prepare for DocCheckCommand {
-    fn prepare<'a>(&self, sh: &'a xshell::Shell, _flags: Flag) -> Vec<PreparedCommand<'a>> {
+    fn prepare<'a>(
+        &self,
+        sh: &'a xshell::Shell,
+        _flags: Flag,
+    ) -> Vec<PreparedCommand<'a>> {
         vec![
             PreparedCommand::new::<Self>(
                 cmd!(

@@ -11,7 +11,11 @@ use crate::PreparedCommand;
 pub struct ShuttleClippyCommand {}
 
 impl Prepare for ShuttleClippyCommand {
-    fn prepare<'a>(&self, sh: &'a xshell::Shell, _flags: Flag) -> Vec<PreparedCommand<'a>> {
+    fn prepare<'a>(
+        &self,
+        sh: &'a xshell::Shell,
+        _flags: Flag,
+    ) -> Vec<PreparedCommand<'a>> {
         let command = PreparedCommand::new::<Self>(
             cmd!(
                 sh,
