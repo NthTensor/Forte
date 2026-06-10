@@ -94,19 +94,6 @@ impl CI {
                 cmds.append(
                     &mut commands::DocTestCommand::default().prepare(sh, flags),
                 );
-                // Shuttle commands
-                cmds.append(
-                    &mut commands::ShuttleCheckCommand::default()
-                        .prepare(sh, flags),
-                );
-                cmds.append(
-                    &mut commands::ShuttleClippyCommand::default()
-                        .prepare(sh, flags),
-                );
-                cmds.append(
-                    &mut commands::ShuttleTestCommand::default()
-                        .prepare(sh, flags),
-                );
                 cmds
             }
         }
@@ -128,11 +115,6 @@ enum Commands {
     Lints(commands::LintsCommand),
     Clippy(commands::ClippyCommand),
     Format(commands::FormatCommand),
-    // Shuttle commands
-    Shuttle(commands::ShuttleCommand),
-    ShuttleCheck(commands::ShuttleCheckCommand),
-    ShuttleClippy(commands::ShuttleClippyCommand),
-    ShuttleTest(commands::ShuttleTestCommand),
 }
 
 impl Prepare for Commands {
@@ -153,13 +135,6 @@ impl Prepare for Commands {
             Commands::Lints(subcommand) => subcommand.prepare(sh, flags),
             Commands::Clippy(subcommand) => subcommand.prepare(sh, flags),
             Commands::Format(subcommand) => subcommand.prepare(sh, flags),
-            // Shuttle commands
-            Commands::Shuttle(subcommand) => subcommand.prepare(sh, flags),
-            Commands::ShuttleCheck(subcommand) => subcommand.prepare(sh, flags),
-            Commands::ShuttleClippy(subcommand) => {
-                subcommand.prepare(sh, flags)
-            }
-            Commands::ShuttleTest(subcommand) => subcommand.prepare(sh, flags),
         }
     }
 }

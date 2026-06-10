@@ -8,12 +8,10 @@ use crate::platform::*;
 /// even tolerate weak seeding, as long as it's not zero.
 ///
 /// [xorshift*]: https://en.wikipedia.org/wiki/Xorshift#xorshift*
-#[cfg(not(feature = "shuttle"))]
 pub struct XorShift64Star {
     state: Cell<u64>,
 }
 
-#[cfg(not(feature = "shuttle"))]
 impl XorShift64Star {
     pub fn new() -> Self {
         // Any non-zero seed will do -- this uses the hash of a global counter.
@@ -50,23 +48,6 @@ impl XorShift64Star {
     /// Return a value from `0..n`.
     pub fn next_usize(&self, n: usize) -> usize {
         (self.next() % n as u64) as usize
-    }
-}
-
-#[cfg(feature = "shuttle")]
-pub struct XorShift64Star;
-
-#[cfg(feature = "shuttle")]
-impl XorShift64Star {
-    pub fn new() -> Self {
-        Self
-    }
-
-    pub fn next_usize(&self, n: usize) -> usize {
-        use shuttle::rand::Rng;
-        use shuttle::rand::thread_rng;
-
-        thread_rng().gen_range(0..n)
     }
 }
 

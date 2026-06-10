@@ -183,8 +183,6 @@
 //!
 
 #![no_std]
-#![cfg_attr(feature = "shuttle", allow(dead_code))]
-#![cfg_attr(feature = "shuttle", allow(unused_imports))]
 
 // -----------------------------------------------------------------------------
 // Boilerplate for building without the standard library
@@ -239,13 +237,9 @@ pub use thread_pool::spawn_broadcast;
 // -----------------------------------------------------------------------------
 // Platform Support
 
-// This crate uses `shuttle` for testing, which requires mocking all of the core
-// threading primitives (`Mutex` and the like).
-//
-// To make things a bit simpler, we re-export all the important types in the
-// `primitives` module.
-
-#[cfg(not(feature = "shuttle"))]
+// This exists to make it easy to swap out the basic parallelism primitives.
+// Currently there are no alternative implementations, but there may be in
+// future.
 mod platform {
 
     pub use core::sync::atomic::AtomicBool;
@@ -275,29 +269,4 @@ mod platform {
             LazyLock::force(&self.0)
         }
     }
-}
-
-#[cfg(feature = "shuttle")]
-mod platform {
-
-    pub use shuttle::sync::atomic::AtomicBool;
-    pub use shuttle::sync::atomic::AtomicPtr;
-    pub use shuttle::sync::atomic::AtomicU32;
-    pub use shuttle::sync::atomic::AtomicUsize;
-    pub use shuttle::sync::atomic::Ordering;
-    pub use shuttle::sync::atomic::fence;
-
-    pub use shuttle::sync::Arc;
-    pub use shuttle::sync::Mutex;
-    pub use shuttle::sync::Weak;
-    pub use shuttle::thread::Builder as ThreadBuilder;
-    pub use shuttle::thread::JoinHandle;
-    pub use shuttle::thread_local;
-
-    pub fn available_parallelism() -> std::io::Result<core::num::NonZero<usize>>
-    {
-        panic!("available_parallelism does not work on shuttle");
-    }
-
-    pub use shuttle::lazy_static::Lazy;
 }

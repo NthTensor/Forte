@@ -1302,7 +1302,6 @@ impl Worker {
 
     /// Try to promote the oldest task in the queue.
     #[inline(always)]
-    #[cfg(not(feature = "shuttle"))]
     fn promote(&self) {
         // Promotions are fairly costly, so we limit their frequency using the
         // cpu's instruction counter. Promote is called at a high frequency, and
@@ -1313,19 +1312,6 @@ impl Worker {
         {
             // This should ideally become a conditional jump.
             self.promote_cold(current_tick);
-        }
-    }
-
-    // Alternate promote routine for shuttle.
-    #[inline(always)]
-    #[cfg(feature = "shuttle")]
-    fn promote(&self) {
-        // Do promotions randomly
-        use shuttle::rand::Rng;
-        use shuttle::rand::thread_rng;
-        if thread_rng().gen_bool(0.1) {
-            // This should ideally become a conditional jump.
-            self.promote_cold(0);
         }
     }
 
@@ -2495,9 +2481,6 @@ fn managed_worker(membership: Membership, halt: Arc<AtomicBool>) {
     // Register as the indicated worker, and work until we are told to halt.
     membership.activate(|worker| {
         while !halt.load(Ordering::Relaxed) {
-            #[cfg(feature = "shuttle")]
-            shuttle::hint::spin_loop();
-
             if worker.yield_now() == Yield::Idle {
                 worker.wait();
             }
@@ -2508,7 +2491,7 @@ fn managed_worker(membership: Membership, halt: Arc<AtomicBool>) {
 // -----------------------------------------------------------------------------
 // Tests
 
-#[cfg(all(test, not(feature = "shuttle")))]
+#[cfg(test)]
 mod tests {
 
     use std::sync::mpsc::channel;
