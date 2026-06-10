@@ -43,5 +43,5 @@ pub fn ticks() -> u64 {
 pub fn ticks() -> u64 {
     // SAFETY: `_rdtsc` emits the CPU counter read instruction and has no Rust memory safety
     // preconditions.
-    unsafe { _rdtsc() }
+    unsafe { core::arch::x86_64::_rdtsc() }
 }
