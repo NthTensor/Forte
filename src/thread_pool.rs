@@ -587,28 +587,6 @@ where
 /// * Closures that satisfy `for<'worker> FnOnce(&'worker Worker) + 'static`.
 ///
 /// * Futures that satisfy `Future<Output = T> + 'static` where `T: 'static`.
-///
-///
-/// # Compile Errors
-///
-/// Due to a bug in rustc, you may be given errors when using closures
-/// with inferred types. If you encounter the following:
-///
-/// ```compile_fail
-/// # use forte::ThreadPool;
-/// # use forte::Worker;
-/// # static THREAD_POOL: ThreadPool = ThreadPool::new();
-/// THREAD_POOL.spawn_local(|_| { });
-/// //                     ^^^^^^^ ERROR: the trait `Spawn<'_, _>` is not implemented for closure ...
-/// ```
-/// Try adding a type hint to the closure's parameters, like so:
-/// ```
-/// # use forte::ThreadPool;
-/// # use forte::Worker;
-/// # static THREAD_POOL: ThreadPool = ThreadPool::new();
-/// THREAD_POOL.spawn_local(|_: &Worker| { });
-/// ```
-/// Hopefully rustc will fix this type inference failure eventually.
 pub trait SpawnLocal<M>: 'static {
     /// The handled returned when spawning this type.
     type Output: 'static;
@@ -2452,7 +2430,7 @@ where
     Worker::with_current(|worker| match worker {
         Some(worker) => worker.spawn_broadcast(f),
         None => DEFAULT_POOL.spawn_broadcast(f),
-    })
+    });
 }
 
 /// Returns the number of members participating in a thread-pool.
