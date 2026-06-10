@@ -640,8 +640,10 @@ where
     #[inline]
     fn spawn_local(self, worker: &Worker) -> Task<T> {
         // Create a schedule function that will keep a copy of the local fifo
-        // queue arc.
+        // queue arc and be able to wake the local worker up.
         let queue = worker.nonsend_fifo_queue.clone();
+        let member_index = worker.member_index;
+        let member_data = worker.member_data;
         let schedule = move |runnable: Runnable| {
             // Temporarily turn the task into a raw pointer so that it can be
             // used as a job. We could also use `HeapJob` here, but since
@@ -673,6 +675,9 @@ where
 
             // Send this job to the correct thread to be executed.
             queue.push(job_ref);
+
+            // Ensure that the worker is awake to execute this job.
+            member_data.semaphores[member_index].signal();
         };
 
         // Create a runnable and add the thread pool as metadata.
