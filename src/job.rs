@@ -1,7 +1,7 @@
 //! This module defines an executable unit of work called a "Job". Jobs are
 //! what get scheduled on the thread pool. There are two core job types:
 //! [`StackJob`] and [`HeapJob`]. There is no unifying `Job` trait. Instead,
-//! what makes these both jobs is their ability to yeild a [`JobRef`].
+//! what makes these both jobs is their ability to yield a [`JobRef`].
 //!
 //! After a job is allocated, we typically refer to it by a [`JobRef`]. Job refs
 //! are type-erased, and can be sent between threads without moving the
