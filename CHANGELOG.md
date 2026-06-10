@@ -39,7 +39,7 @@ This project is currently in early [pre-release], and there may be arbitrary bre
 - All versions of `spawn_future` and `spawn_async`; just use `spawn` instead.
 - `claim_lease` has been replaced with `try_enroll`.
 - `Worker::occupy` has been replaced with `Membership::activate`.
-- Removed the shuttle testing framework (it's incompatable with crossbeam queues).
+- Removed the shuttle testing framework (it's incompatible with crossbeam queues).
 
 ## [1.0.0-alpha.4]
 
