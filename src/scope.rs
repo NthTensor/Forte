@@ -954,7 +954,7 @@ mod scope_ptr {
 // -----------------------------------------------------------------------------
 // Tests
 
-#[cfg(all(test, not(feature = "shuttle")))]
+#[cfg(test)]
 mod tests {
     use core::iter::once;
     use core::pin::Pin;

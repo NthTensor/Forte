@@ -16,13 +16,12 @@ members = ["ci"]
 
 [dependencies]
 async-task = "4.7.1"
-atomic-wait = { package = "shuttle-atomic-wait", path = "../../awslabs/shuttle/wrappers/atomic_wait" }
-lazy_static = { package = "shuttle-lazy_static", path = "../../awslabs/shuttle/wrappers/lazy_static" }
+atomic-wait = "1.1.0"
+lazy_static = "1.5.0"
 crossbeam-queue = "0.3.12"
 crossbeam-utils = "0.8.21"
 st3 = "0.4"
 futures-lite = "2.6.1"
-shuttle = { path = "../../awslabs/shuttle/shuttle", optional = true }
 
 [dev-dependencies]
 # Required for comparison testing
@@ -35,20 +34,10 @@ dashmap = "6.1.0"
 # Used for A/B perf testing
 criterion = { version = "0.5" }
 
-[features]
-shuttle = ["dep:shuttle", "atomic-wait/shuttle"]
-
 [profile.release]
 debug = true
 
 [profile.bench]
-opt-level = 3
-
-# Custom profile for shuttle tests: enable release optimizations so that the shuttle
-# tests are less slow, but don't disable debug assertions.
-[profile.shuttle]
-inherits = "test"
-lto = true
 opt-level = 3
 
 [lints.clippy]
