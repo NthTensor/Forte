@@ -1,12 +1,11 @@
 //! Architecture-specific timing functions, taken from
 //! <https://github.com/spence/tach>
 
-use core::arch::asm;
-
 /// Read from the `cntvct_el0` register on Arm `AArch64`.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 pub fn ticks() -> u64 {
+    use core::arch::asm;
     let cnt: u64;
     // SAFETY: `mrs cntvct_el0` only reads the architectural virtual counter
     // register and does not touch memory or the stack.
@@ -24,6 +23,7 @@ pub fn ticks() -> u64 {
 #[cfg(target_arch = "riscv64")]
 #[inline(always)]
 pub fn ticks() -> u64 {
+    use core::arch::asm;
     let cnt: u64;
     // SAFETY: `rdtime` reads a timer CSR into a general-purpose register and does not access
     // Rust memory.
