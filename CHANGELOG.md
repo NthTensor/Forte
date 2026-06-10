@@ -14,6 +14,8 @@ This project is currently in early [pre-release], and there may be arbitrary bre
 
 ## [Unreleased]
 
+## [1.0.0-alpha.5]
+
 ### Added 
 
 - `Worker::spawn_local` for spawning `!Send` work.
