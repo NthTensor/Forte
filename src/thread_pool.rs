@@ -480,7 +480,7 @@ where
         // Queue the job for evaluation
         match worker {
             Some(worker) => worker.fifo_queue.push_new(job_ref),
-            None => thread_pool.shared_queue.push(job_ref),
+            None => thread_pool.push_shared_job(job_ref),
         }
     }
 }
@@ -552,7 +552,7 @@ where
             // Send this job off to be executed.
             thread_pool.get_worker(|worker| match worker {
                 Some(worker) => worker.fifo_queue.push_new(job_ref),
-                None => thread_pool.shared_queue.push(job_ref),
+                None => thread_pool.push_shared_job(job_ref),
             });
         };
 
