@@ -1,15 +1,11 @@
-//! This module defines an executable unit of work called a [`Job`]. Jobs are what
-//! get scheduled on the thread pool. There are two core job types: [`StackJob`]
-//! and [`HeapJob`].
+//! This module defines an executable unit of work called a "Job". Jobs are
+//! what get scheduled on the thread pool. There are two core job types:
+//! [`StackJob`] and [`HeapJob`]. There is no unifying `Job` trait. Instead,
+//! what makes these both jobs is their ability to yeild a [`JobRef`].
 //!
 //! After a job is allocated, we typically refer to it by a [`JobRef`]. Job refs
 //! are type-erased, and can be sent between threads without moving the
 //! underlying job.
-//!
-//! When using a job, one must be extremely careful to ensure that:
-//! (a) The job does not outlive anything it closes over.
-//! (b) The job remains valid until it is executed for the last time.
-//! (c) Each job reference is executed exactly once.
 
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
@@ -266,10 +262,10 @@ where
     /// * After this call, the `StackJob` will not be moved or dropped until one
     ///   of these conditions is met:
     ///
-    ///   A. A call to `check` on the `StackJob`'s latch returns something other
-    ///      than `Pending`.
+    ///   * (A) A call to `check` on the `StackJob`'s latch returns something other
+    ///     than `Pending`.
     ///
-    ///   B. The `JobRef` has been dropped without `execute` being called.
+    ///   * (B) The `JobRef` has been dropped without `execute` being called.
     #[inline(always)]
     pub unsafe fn as_job_ref(&self) -> JobRef {
         let job_pointer = NonNull::from(self).cast();

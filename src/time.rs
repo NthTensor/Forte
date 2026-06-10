@@ -3,7 +3,7 @@
 
 use core::arch::asm;
 
-/// Read from the cntvct_el0 register on Arm AArch64.
+/// Read from the `cntvct_el0` register on Arm `AArch64`.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 pub fn ticks() -> u64 {
