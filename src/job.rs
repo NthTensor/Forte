@@ -23,8 +23,8 @@ use crate::unwind;
 // -----------------------------------------------------------------------------
 // JobRef
 
-/// A `JobRef` is a specialized v-table, containing a pointer to work that needs to
-/// be executed, and a function pointer that is capable of executing it.
+/// A `JobRef` is a specialized v-table, containing a pointer to work that needs
+/// to be executed, and a function pointer that is capable of executing it.
 ///
 /// It is analogous to the chili type `JobShared` or the rayon type `JobRef`.
 pub struct JobRef {
@@ -75,11 +75,10 @@ impl JobRef {
     }
 }
 
-// SAFETY: This is sound, but just barely.
-//
-// Every `JobRef` contains a function pointer and a data pointer. Function
-// pointers are always `Send`, but the data pointer may or may not be valid for
-// cross-thread access (the value it points to may or may not be `Sync`).
+// SAFETY: Every `JobRef` contains a function pointer and a data pointer.
+// Function pointers are always `Send`, but the data pointer may or may not be
+// valid for cross-thread access (the value it points to may or may not be
+// `Sync`).
 //
 // However, even when this data is not thread-safe, `JobRef` still needs to be
 // `Send`. This is because we need to be able to pass pointers to `!Send` job
@@ -108,6 +107,8 @@ unsafe impl Send for JobRef {}
 /// A queue of jobs. This is a simple wrapper around a vec dequeue that uses
 /// inner mutation, and has some more intuitively named methods to enforce
 /// conventions.
+///
+/// Note: This is !Sync because of the unsafe cell.
 pub struct JobQueue {
     job_refs: UnsafeCell<VecDeque<JobRef>>,
 }
@@ -122,7 +123,7 @@ impl JobQueue {
 
     /// Insert a job at the back of the queue (the side with the newest jobs).
     pub fn push_new(&self, job_ref: JobRef) {
-        // SAFETY: `JobQueue` is not `Sync`, so this can only be called from one
+        // SAFETY: `JobQueue` is `!Sync`, so this can only be called from one
         // thread. We ensure no other references to the inner value exist by not
         // returning any references from this API, making this exclusive access
         // sound.
@@ -132,7 +133,7 @@ impl JobQueue {
 
     /// Insert a job at the front of the queue (the side with the oldest jobs).
     pub fn push_old(&self, job_ref: JobRef) {
-        // SAFETY: `JobQueue` is not `Sync`, so this can only be called from one
+        // SAFETY: `JobQueue` is `!Sync`, so this can only be called from one
         // thread. We ensure no other references to the inner value exist by not
         // returning any references from this API, making this exclusive access
         // sound.
@@ -142,7 +143,7 @@ impl JobQueue {
 
     /// Removes the newest job in the queue.
     pub fn pop_newest(&self) -> Option<JobRef> {
-        // SAFETY: `JobQueue` is not `Sync`, so this can only be called from one
+        // SAFETY: `JobQueue` is `!Sync`, so this can only be called from one
         // thread. We ensure no other references to the inner value exist by not
         // returning any references from this API, making this exclusive access
         // sound.
@@ -152,7 +153,7 @@ impl JobQueue {
 
     /// Removes the oldest job in the queue.
     pub fn pop_oldest(&self) -> Option<JobRef> {
-        // SAFETY: `JobQueue` is not `Sync`, so this can only be called from one
+        // SAFETY: `JobQueue` is `!Sync`, so this can only be called from one
         // thread. We ensure no other references to the inner value exist by not
         // returning any references from this API, making this exclusive access
         // sound.
@@ -163,7 +164,7 @@ impl JobQueue {
     /// Attempt to remove the given job-ref from the back of the queue.
     #[inline(always)]
     pub fn recover_newest(&self, id: (usize, usize)) -> bool {
-        // SAFETY: `JobQueue` is not `Sync`, so this can only be called from one
+        // SAFETY: `JobQueue` is `!Sync`, so this can only be called from one
         // thread. We ensure no other references to the inner value exist by not
         // returning any references from this API, making this exclusive access
         // sound.
@@ -183,7 +184,7 @@ impl JobQueue {
     /// the newest jobs). Each chunk is of size `CHUNK_SIZE`. Afterwards, at most
     /// `CHUNK_SIZE` jobs will remain in the queue.
     pub fn split(&self) -> Vec<VecDeque<JobRef>> {
-        // SAFETY: `JobQueue` is not `Sync`, so this can only be called from one
+        // SAFETY: `JobQueue` is `!Sync`, so this can only be called from one
         // thread. We ensure no other references to the inner value exist by not
         // returning any references from this API, making this exclusive access
         // sound.
@@ -202,7 +203,7 @@ impl JobQueue {
     /// Appends a chunk of jobs (expected to be provided by `split`) to the
     /// queue. Jobs are added to the end (the side with the newest jobs).
     pub fn append(&self, mut split_refs: VecDeque<JobRef>) {
-        // SAFETY: `JobQueue` is not `Sync`, so this can only be called from one
+        // SAFETY: `JobQueue` is `!Sync`, so this can only be called from one
         // thread. We ensure no other references to the inner value exist by not
         // returning any references from this API, making this exclusive access
         // sound.
@@ -262,8 +263,8 @@ where
     /// * After this call, the `StackJob` will not be moved or dropped until one
     ///   of these conditions is met:
     ///
-    ///   * (A) A call to `check` on the `StackJob`'s latch returns something other
-    ///     than `Pending`.
+    ///   * (A) A call to `check` on the `StackJob`'s latch returns something
+    ///     other than `Pending`.
     ///
     ///   * (B) The `JobRef` has been dropped without `execute` being called.
     #[inline(always)]
@@ -294,8 +295,6 @@ where
         //   The caller ensures only one `JobRef` is ever created for this
         //   `StackJob`. Since `JobRef::execute` consumes that `JobRef`, it
         //   cannot be called multiple times.
-        //
-        //
         unsafe { JobRef::new(job_pointer, Self::execute) }
     }
 
@@ -320,26 +319,14 @@ where
     /// * If a `JobRef` did exist, it was never executed.
     #[inline(always)]
     pub unsafe fn unwrap_func(mut self) -> F {
-        // SAFETY: For this access to be valid, we must first establish that
-        // we have exclusive access to `data`. Only three other functions access
-        // `data`, and none of them can race with this function:
+        // SAFETY: We have exclusive access to the active union field `func`. We
+        // take `self` by value, so no other `unwrap_*` method can also hold it,
+        // and the caller guarantees no `JobRef` exists, so `execute` cannot be
+        // aliasing `data` through a raw pointer.
         //
-        // * Since `JobRef::execute` is not called, `StackJob::execute` is not
-        //   called, and cannot be running.
-        //
-        // * Since this function and `unwrap_output` both consume the
-        //   `StackJob`, and a `StackJob` cannot be duplicated, `unwrap_output`
-        //   cannot be running now.
-        //
-        // * Since this function and `unwrap_error` both consume the `StackJob`,
-        //   and a `StackJob` cannot be duplicated, `unwrap_error` cannot be
-        //   running now.
-        //
-        // Next, we must establish that it is valid to read from union field
-        // `func`. Each `StackJob` is constructed using field `func`, and only
-        // `StackJob::execute` writes to the union after construction. Since
-        // `StackJob::execute` is not called, it must still be valid to read
-        // from `func`.
+        // `func` is the active variant because every `StackJob` is constructed
+        // with `func`, only `execute` overwrites it, and the caller guarantees
+        // `execute` was never called.
         let func_ref = unsafe { &mut self.data.get_mut().func };
         // SAFETY: The `StackJob` is dropped at the end of this block, so `data`
         // is never accessed again.
@@ -357,28 +344,15 @@ where
         // Synchronize with the fence in `StackJob::execute`, establishing a
         // happens-after relationship with the following read.
         fence(Ordering::Acquire);
-        // SAFETY: For this access to be valid, we must first establish that
-        // we have exclusive access to `data`. Only three other functions access
-        // `data`, and none of them can race with this function:
+        // SAFETY: We have exclusive access to the active union field `output`.
+        // We take `self` by value, so no other `unwrap_*` method can also hold
+        // it, and `check` returned `Ok`, so `execute` ran. Since `execute` runs
+        // at most once, it is no longer running and cannot alias `data`.
         //
-        // * Since `check` has returned `Ok`, and the latch is only set in
-        //   `StackJob::execute`, `StackJob::execute` must have been called at
-        //   least once. `StackJob::execute` may be called at most once, so it
-        //   cannot be running now.
-        //
-        // * Since this function and `unwrap_func` both consume the `StackJob`,
-        //   and a `StackJob` cannot be duplicated, `unwrap_func` cannot be
-        //   running now.
-        //
-        // * Since this function and `unwrap_error` both consume the `StackJob`,
-        //   and a `StackJob` cannot be duplicated, `unwrap_error` cannot be
-        //   running now.
-        //
-        // Next, we must establish that it is valid to read from union field
-        // `output`. We know this because `check` returned `Ok`, which means
-        // `set` was called with a false `error_flag` within
-        // `StackJob::execute`. This always follows a write to union field
-        // `output`, after which the union is not written to again.
+        // `output` is the active variant because `check` returning `Ok` means
+        // `execute` called `set` with `error_flag == false`, which always
+        // follows a write of the `output` field, after which the union is not
+        // written again.
         let output_ref = unsafe { &mut self.data.get_mut().output };
         // SAFETY: The `StackJob` is dropped at the end of this block, so `data`
         // is never accessed again.
@@ -396,28 +370,15 @@ where
         // Synchronize with the fence in `StackJob::execute`, establishing a
         // happens-after relationship with the following read.
         fence(Ordering::Acquire);
-        // SAFETY: For this access to be valid, we must first establish that
-        // we have exclusive access to `data`. Only three other functions access
-        // `data`, and none of them can race with this function:
+        // SAFETY: We have exclusive access to the active union field `error`.
+        // We take `self` by value, so no other `unwrap_*` method can also hold
+        // it, and `check` returned `Error`, so `execute` ran. Since `execute`
+        // runs at most once, it is no longer running and cannot alias `data`.
         //
-        // * Since `check` has returned `Error`, and the latch is only set in
-        //   `StackJob::execute`, `StackJob::execute` must have been called at
-        //   least once. `StackJob::execute` may be called at most once, so it
-        //   cannot be running now.
-        //
-        // * Since this function and `unwrap_func` both consume the `StackJob`,
-        //   and a `StackJob` cannot be duplicated, `unwrap_func` cannot be
-        //   running now.
-        //
-        // * Since this function and `unwrap_output` both consume the `StackJob`,
-        //   and a `StackJob` cannot be duplicated, `unwrap_output` cannot be
-        //   running now.
-        //
-        // Next, we must establish that it is valid to read from union field
-        // `error`. We know this because `check` returned `Error`, which means
-        // `set` was called with a true `error_flag` within `StackJob::execute`.
-        // This always follows a write to union field `error`, after which the
-        // union is not written to again.
+        // `error` is the active variant because `check` returning `Error` means
+        // `execute` called `set` with `error_flag == true`, which always
+        // follows a write of the `error` field, after which the union is not
+        // written again.
         let error_ref = unsafe { &mut self.data.get_mut().error };
         // SAFETY: The `StackJob` is dropped at the end of this block, so `data`
         // is never accessed again.
@@ -480,9 +441,10 @@ where
                 }
             }
         };
-        // This synchronizes with the `Acquire` fence within `return_value()`,
-        // establishing a happens-before relationship that makes the preceding
-        // `return_value` write visible to the reader.
+        // This synchronizes with the `Acquire` fence within `unwrap_output` /
+        // `unwrap_error`, establishing a happens-before relationship that makes
+        // the preceding write to the `output`/`error` union field visible to
+        // the reader.
         //
         // This is required because latches do not synchronize memory.
         fence(Ordering::Release);
@@ -516,7 +478,8 @@ where
 
 /// Represents a job stored in the heap. Used to implement `scope` and `spawn`.
 ///
-/// This is analogous to the rayon type `HeapJob`. There is no corresponding chili type.
+/// This is analogous to the rayon type `HeapJob`. There is no corresponding
+/// chili type.
 pub struct HeapJob<F> {
     f: F,
 }
@@ -555,10 +518,11 @@ where
         // We must now show that it is sound to call `HeapJob::execute` on
         // `job_ref` under these conditions, which in turn requires that:
         //
-        // * `job_pointer` is an aligned pointer to an initialized `Box<HeapJob>`.
+        // * `job_pointer` is an aligned pointer to an initialized `HeapJob`.
         //
-        //   We created it from a ref to `self`, which is a `Box<HeapJob>`, so it
-        //   must be.
+        //   We created it with `Box::into_raw(self)`, which yields an aligned,
+        //   non-null pointer to the initialized `HeapJob` formerly owned by the
+        //   `Box`, so it must be.
         //
         // * `HeapJob::execute` is called at most once on any `HeapJob`.
         //

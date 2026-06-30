@@ -25,8 +25,8 @@ pub fn ticks() -> u64 {
 pub fn ticks() -> u64 {
     use core::arch::asm;
     let cnt: u64;
-    // SAFETY: `rdtime` reads a timer CSR into a general-purpose register and does not access
-    // Rust memory.
+    // SAFETY: `rdtime` reads a timer CSR into a general-purpose register and
+    // does not access Rust memory.
     unsafe {
         asm!(
             "rdtime {}",
@@ -37,11 +37,15 @@ pub fn ticks() -> u64 {
     cnt
 }
 
-/// Read from the real-time stamp counter on windows
+/// Read from the real-time stamp counter on x86 / x86-64.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[inline(always)]
 pub fn ticks() -> u64 {
-    // SAFETY: `_rdtsc` emits the CPU counter read instruction and has no Rust memory safety
-    // preconditions.
-    unsafe { core::arch::x86_64::_rdtsc() }
+    #[cfg(target_arch = "x86")]
+    use core::arch::x86::_rdtsc;
+    #[cfg(target_arch = "x86_64")]
+    use core::arch::x86_64::_rdtsc;
+    // SAFETY: `_rdtsc` reads the counter into a register and touches neither
+    // memory nor the stack.
+    unsafe { _rdtsc() }
 }
