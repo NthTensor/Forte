@@ -28,6 +28,7 @@ use crate::job::JobRef;
 use crate::latch::Latch;
 use crate::platform::*;
 use crate::thread_pool::Broadcast;
+use crate::thread_pool::Scheduler;
 use crate::thread_pool::Worker;
 use crate::unwind;
 use crate::unwind::AbortOnDrop;
@@ -157,26 +158,59 @@ impl<'scope, 'env> Scope<'scope, 'env> {
     /// * A `for<'worker> FnOnce(&'worker Worker)` closure, with no return type.
     ///
     /// * A `Future<Output = ()>` future, with no return type.
-    pub fn spawn<M, S: SpawnScoped<'scope, M>>(&'scope self, scoped_work: S) {
-        self.thread_pool.get_worker(|worker| {
-            scoped_work.spawn_scoped(self, worker);
-        });
+    pub fn spawn<M, S>(&'scope self, work: S)
+    where
+        S: SpawnScoped<'scope, M> + Send,
+    {
+        let thread_pool = self.thread_pool;
+        let scheduler = |job_ref, worker: Option<&Worker>| match worker {
+            Some(worker) => worker.fifo_queue.push_new(job_ref),
+            None => thread_pool.push_shared_job(job_ref),
+        };
+        // SAFETY: `spawn_scoped` requires that `!Send` work only be scheduled
+        // to run on the current thread. Here `S: Send`, so that obligation is
+        // vacuous.
+        unsafe { work.spawn_scoped(self, scheduler) };
     }
 
-    /// Runs a closure or future sometime before the scope completes. Valid
-    /// inputs to this method are:
-    ///
-    /// * A `for<'worker> FnOnce(&'worker Worker)` closure, with no return type.
-    ///
-    /// * A `Future<Output = ()>` future, with no return type.
-    ///
-    /// Unlike [`Scope::spawn`], this accepts the current worker as a parameter.
-    pub fn spawn_on<M, S: SpawnScoped<'scope, M>>(
-        &'scope self,
-        worker: &Worker,
-        scoped_work: S,
-    ) {
-        scoped_work.spawn_scoped(self, Some(worker));
+    /// Like [`spawn`](Self::spawn), but routes the work to a specific pool
+    /// member so it runs on that member's thread.
+    pub fn spawn_on<M, S>(&'scope self, member_index: usize, work: S)
+    where
+        S: SpawnScoped<'scope, M> + Send,
+    {
+        let member_data = self.thread_pool.get_member_data();
+        let scheduler = |job_ref, _: Option<&Worker>| {
+            member_data.broadcasts[member_index].push(job_ref);
+            member_data.semaphores[member_index].signal();
+        };
+        // SAFETY: `spawn_scoped` requires that `!Send` work only be scheduled
+        // to run on the current thread. Here `S: Send`, so that obligation is
+        // vacuous.
+        unsafe { work.spawn_scoped(self, scheduler) }
+    }
+
+    /// Like [`spawn`](Self::spawn), but accepts `!Send` work, which is confined
+    /// to (and only ever polled on) the current worker's thread.
+    pub fn spawn_local<M, S>(&'scope self, worker: &Worker, work: S)
+    where
+        S: SpawnScoped<'scope, M>,
+    {
+        let queue = worker.nonsend_fifo_queue.clone();
+        let semaphore = &worker.member_data.semaphores[worker.member_index];
+        let scheduler = move |job_ref, _: Option<&Worker>| {
+            queue.push(job_ref);
+            semaphore.signal();
+        };
+        // SAFETY: `spawn_scoped` requires that `!Send` work only be scheduled
+        // to run on the current thread.
+        //
+        // The scheduler pushes the job onto this worker's `nonsend_fifo_queue`.
+        // That queue is only ever drained by this worker on this thread (see
+        // `Worker::find_local_work`). For a future, every reschedule re-pushes
+        // onto the same queue regardless of which thread issued the wakeup, so
+        // the work is confined to this thread.
+        unsafe { work.spawn_scoped(self, scheduler) }
     }
 
     /// Runs an operation across multiple threads.
@@ -417,26 +451,33 @@ impl<'scope, 'env> Scope<'scope, 'env> {
 /// });
 /// ```
 /// Hopefully rustc will fix this type inference failure eventually.
-pub trait SpawnScoped<'scope, M>: Send + 'scope {
+pub trait SpawnScoped<'scope, M>: 'scope {
     /// Similar to [`spawn`][crate::Worker::spawn] but adds the work to a
     /// [`Scope`]. This work will be polled to completion some-time before the
     /// scome completes, and may borrow data that outlives the scope.
-    fn spawn_scoped<'env>(
+    ///
+    /// # Safety
+    ///
+    /// If `Self` is not `Send`, the `scheduler` must only ever schedule the
+    /// work to run on the current thread. For a future, this includes every
+    /// reschedule triggered by a wakeup, no matter which thread the wakeup
+    /// occurs on.
+    unsafe fn spawn_scoped<'env, S: for<'w> Scheduler<'w>>(
         self,
         scope: &'scope Scope<'scope, 'env>,
-        worker: Option<&Worker>,
+        scheduler: S,
     );
 }
 
 impl<'scope, F> SpawnScoped<'scope, FnOnceMarker> for F
 where
-    F: FnOnce(&Worker) + Send + 'scope,
+    F: FnOnce(&Worker) + 'scope,
 {
     #[inline]
-    fn spawn_scoped<'env>(
+    unsafe fn spawn_scoped<'env, S: for<'w> Scheduler<'w>>(
         self,
         scope: &'scope Scope<'scope, 'env>,
-        worker: Option<&Worker>,
+        scheduler: S,
     ) {
         // Create a job to execute the spawned function in the scope.
         let scope_ptr = ScopePtr::new(scope);
@@ -448,14 +489,6 @@ where
             };
             drop(scope_ptr);
         });
-
-        // SAFETY: We must ensure that the heap job does not outlive the data it
-        // closes over. In effect, this means it must not outlive `'scope`.
-        //
-        // This is ensured by the `scope_ptr` and the scope rules, which will
-        // keep the calling stack frame alive until this job completes,
-        // effectively extending the lifetime of `'scope` for as long as is
-        // necessary.
 
         // SAFETY: `HeapJob::into_job_ref` requires:
         //
@@ -478,29 +511,22 @@ where
         let job_ref = unsafe { job.into_job_ref() };
 
         // Send the job to a queue to be executed.
-        match worker {
-            Some(worker) => worker.fifo_queue.push_new(job_ref),
-            None => scope.thread_pool.push_shared_job(job_ref),
-        }
+        Worker::with_current(|worker| scheduler.schedule(job_ref, worker));
     }
 }
 
 impl<'scope, Fut> SpawnScoped<'scope, FutureMarker> for Fut
 where
-    Fut: Future<Output = ()> + Send + 'scope,
+    Fut: Future<Output = ()> + 'scope,
 {
     #[inline]
-    fn spawn_scoped<'env>(
+    unsafe fn spawn_scoped<'env, S: for<'w> Scheduler<'w>>(
         self,
         scope: &'scope Scope<'scope, 'env>,
-        worker: Option<&Worker>,
+        scheduler: S,
     ) {
-        let poll_job = ScopeFutureJob::new(scope, self);
-        let job_ref = poll_job.into_job_ref();
-        match worker {
-            Some(worker) => worker.fifo_queue.push_new(job_ref),
-            None => scope.thread_pool.push_shared_job(job_ref),
-        }
+        let job = ScopeFutureJob::new(scope, scheduler, self);
+        Worker::with_current(|worker| job.schedule(worker));
     }
 }
 
@@ -563,7 +589,7 @@ const LOCKED: u32 = 2;
 /// The future is always queued on the thread on which it was woken. This allows
 /// the waker to be converted directly into a job-ref, and may mean that the
 /// cache is already primed.
-struct ScopeFutureJob<'scope, 'env, Fut> {
+struct ScopeFutureJob<'scope, 'env, S: for<'w> Scheduler<'w>, Fut> {
     /// The future that the job exists to poll. This is stored in an unsafe cell
     /// to allow mutable access within an `Arc<T>`. The `state` field acts as a
     /// kind of mutex that ensures exclusive access by preventing the job from
@@ -574,11 +600,14 @@ struct ScopeFutureJob<'scope, 'env, Fut> {
     scope_ptr: ScopePtr<'scope, 'env>,
     /// The state of the job, which is either READY, WOKEN, or LOCKED.
     state: AtomicU32,
+    /// The scheduler used to queue this job whenever it needs to be polled.
+    scheduler: S,
 }
 
-impl<'scope, 'env, Fut> ScopeFutureJob<'scope, 'env, Fut>
+impl<'scope, 'env, S, Fut> ScopeFutureJob<'scope, 'env, S, Fut>
 where
-    Fut: Future<Output = ()> + Send + 'scope,
+    S: for<'w> Scheduler<'w>,
+    Fut: Future<Output = ()> + 'scope,
 {
     /// This vtable is part of what allows a `ScopeFutureJob` to act as an
     /// async task waker.
@@ -591,7 +620,11 @@ where
 
     /// Creates a new `ScopedFutureJob` in an `Arc`. The caller is expected to
     /// immediately call `into_job_ref` and queue it on a worker to be polled.
-    fn new(scope: &Scope<'scope, 'env>, future: Fut) -> Arc<Self> {
+    fn new(
+        scope: &Scope<'scope, 'env>,
+        scheduler: S,
+        future: Fut,
+    ) -> Arc<Self> {
         let scope_ptr = ScopePtr::new(scope);
         Arc::new(Self {
             future: UnsafeCell::new(future),
@@ -599,6 +632,7 @@ where
             // The job starts in the WOKEN state because we always queue it
             // after creating it.
             state: AtomicU32::new(WOKEN),
+            scheduler,
         })
     }
 
@@ -617,22 +651,41 @@ where
         // called on the resulting `JobRef` where it is sound to call `poll` on
         // `job_pointer`.
         //
-        // `Poll` has two preconditions:
+        // `Poll` has two obligations:
         //
-        // 1. `job_pointer` must have been produced by `Arc::into_raw` on an
-        //    `Arc<Self>`.
+        // * `job_pointer` must have been produced by `Arc::into_raw` on an
+        //   `Arc<Self>`.
         //
-        //    We produced `job_pointer` this way just above.
+        //   We produced `job_pointer` this way just above.
         //
-        // 2. We must hold ownership of exactly one strong reference count for
-        //    the allocation.
+        // * We must hold ownership of exactly one strong reference count for
+        //   the allocation.
         //
-        //    We start with an `Arc<Self>`, so we must own a strong reference.
-        //    Calling `Arc::into_raw` transfers the strong count of `self` onto
-        //    `job_pointer` without decrementing it. Therefore, when `execute`
-        //    is called, there will still be a strong reference for it to
-        //    consume.
+        //   We start with an `Arc<Self>`, so we must own a strong reference.
+        //   Calling `Arc::into_raw` transfers the strong count of `self` onto
+        //   `job_pointer` without decrementing it. Therefore, when `execute`
+        //   is called, there will still be a strong reference for it to
+        //   consume.
         unsafe { JobRef::new(job_pointer, Self::poll) }
+    }
+
+    /// Schedules this job to be polled, by converting it into a `JobRef` and
+    /// handing that to the job's own `scheduler`. The `worker` param should be
+    /// the same as calling `Worker::with_current`.
+    fn schedule(self: Arc<Self>, worker: Option<&Worker>) {
+        // Clone a strong reference so the allocation — and therefore the
+        // `scheduler` field — stays alive for the entire `schedule` call.
+        //
+        // `into_job_ref` consumes `self` via `Arc::into_raw`, moving our strong
+        // reference into the `JobRef` *without* decrementing the count. The act
+        // of calling `schedule` enqueues that `JobRef`, after which another
+        // worker may execute and drop it before `schedule` returns. Holding
+        // `this` keeps an independent strong reference alive until the end of
+        // this function, so borrowing `this.scheduler` across the call cannot
+        // dangle.
+        let this = Arc::clone(&self);
+        let job_ref = self.into_job_ref();
+        this.scheduler.schedule(job_ref, worker);
     }
 
     /// Polls the future.
@@ -769,11 +822,13 @@ where
                 // immediately. Conveniently, we know the state will already be
                 // WOKEN, so we can leave it as it is.
                 if rescheduled {
-                    // This converts the local `Arc<Self>` into a job ref,
-                    // preventing it from being dropped and potentially
-                    // extending the job's lifetime.
-                    let job_ref = this.into_job_ref();
-                    worker.fifo_queue.push_new(job_ref);
+                    // The future was woken while we were polling it, so it is
+                    // already back in the WOKEN state; queue it to be polled
+                    // again, preferring this worker.
+                    //
+                    // NOTE: Eventually we may want to chose not to re-evaluate
+                    // this sometimes, to break out of infinite async loops.
+                    this.schedule(Some(worker))
                 }
             }
             // The job panicked. Store the panic in the scope so it can be
@@ -815,13 +870,7 @@ where
         let this = unsafe { Arc::from_raw(this.cast::<Self>()) };
 
         if this.state.swap(WOKEN, Ordering::Relaxed) == READY {
-            // Convert the waker into a job ref and queue it.
-            let thread_pool = this.scope_ptr.thread_pool();
-            let job_ref = this.into_job_ref();
-            thread_pool.get_worker(|worker| match worker {
-                Some(worker) => worker.fifo_queue.push_new(job_ref),
-                None => thread_pool.push_shared_job(job_ref),
-            });
+            Worker::with_current(|worker| this.schedule(worker));
         }
     }
 
@@ -843,12 +892,7 @@ where
         if this.state.swap(WOKEN, Ordering::Relaxed) == READY {
             // Clone the waker, convert it into a job-ref and queue it.
             let this = ManuallyDrop::into_inner(this.clone());
-            let thread_pool = this.scope_ptr.thread_pool();
-            let job_ref = this.into_job_ref();
-            thread_pool.get_worker(|worker| match worker {
-                Some(worker) => worker.fifo_queue.push_new(job_ref),
-                None => thread_pool.push_shared_job(job_ref),
-            });
+            Worker::with_current(|worker| this.schedule(worker));
         }
     }
 
@@ -878,32 +922,15 @@ mod scope_ptr {
     use core::any::Any;
 
     use super::Scope;
-    use crate::ThreadPool;
 
     /// A reference-counted pointer to a scope. Used to capture a scope pointer
     /// in jobs without faking a lifetime. Holding a `ScopePtr` keeps the
     /// reference scope from being deallocated.
     pub struct ScopePtr<'scope, 'env>(*const Scope<'scope, 'env>);
 
-    // SAFETY: This is sound because:
-    //
-    // * `ScopePtr` is only used to call `add_reference`, `remove_reference`,
-    //   and `store_panic`, all of which are designed to be called from multiple
-    //   threads concurrently.
-    //
-    // * The `Scope` cannot be deallocated while any `ScopePtr` still points to
-    //   it (due to reference counting), so the raw pointer is always valid.
+    // SAFETY: Transferring ownership of the `*const Scope` is sound because the
+    // pointee is reached only bia atomic ops and is kept alive by the refcount.
     unsafe impl Send for ScopePtr<'_, '_> {}
-
-    // SAFETY: This is sound because:
-    //
-    // * `ScopePtr` is only used to call `add_reference`, `remove_reference`,
-    //   and `store_panic`, all of which are designed to be called from multiple
-    //   threads concurrently.
-    //
-    // * The `Scope` cannot be deallocated while any `ScopePtr` still points to
-    //   it (due to reference counting), so the raw pointer is always valid.
-    unsafe impl Sync for ScopePtr<'_, '_> {}
 
     impl<'scope, 'env> ScopePtr<'scope, 'env> {
         /// Creates a new reference-counted scope pointer which can be sent to other
@@ -923,14 +950,6 @@ mod scope_ptr {
             // scope's counter remains incremented.
             let scope_ref = unsafe { &*self.0 };
             scope_ref.store_panic(err);
-        }
-
-        pub fn thread_pool(&self) -> &'static ThreadPool {
-            // SAFETY: This was created using an immutable scope reference, and
-            // by the scope rules there can be no mutable references to this
-            // scope, nor can the scope have been moved or deallocated while the
-            // scope's counter remains incremented.
-            unsafe { (&*self.0).thread_pool }
         }
     }
 
@@ -1057,9 +1076,9 @@ mod tests {
                     counter.fetch_add(1, Ordering::Relaxed);
                 });
             });
-            scope.spawn(|worker: &Worker| {
+            scope.spawn(|_: &Worker| {
                 counter.fetch_add(1, Ordering::Relaxed);
-                scope.spawn_on(worker, |_: &Worker| {
+                scope.spawn(|_: &Worker| {
                     counter.fetch_add(1, Ordering::Relaxed);
                 });
             });
@@ -1163,10 +1182,10 @@ mod tests {
         let a = AtomicU8::new(0);
         let b = AtomicU8::new(0);
 
-        THREAD_POOL.with_worker(|worker| {
+        THREAD_POOL.with_worker(|_: &Worker| {
             scope(|scope| {
                 for _ in 0..NUM_JOBS {
-                    scope.spawn_on(worker, |_: &Worker| {
+                    scope.spawn(|_: &Worker| {
                         THREAD_POOL.join(
                             |_| a.fetch_add(1, Ordering::Relaxed),
                             |_| b.fetch_add(1, Ordering::Relaxed),
@@ -1214,12 +1233,12 @@ mod tests {
 
         THREAD_POOL.with_worker(|worker| {
             worker.scope(|scope| {
-                scope.spawn_on(worker, |_: &Worker| {
+                scope.spawn(|_: &Worker| {
                     // Creating a new worker instead of reusing the old one is
                     // bad form, but we may as well test it.
                     THREAD_POOL.with_worker(|worker| {
                         worker.scope(|scope| {
-                            scope.spawn_on(worker, |_: &Worker| {
+                            scope.spawn(|_: &Worker| {
                                 completed = true;
                             });
                         });
@@ -1243,8 +1262,8 @@ mod tests {
         let counter_p = &AtomicUsize::new(0);
         THREAD_POOL.with_worker(|worker| {
             worker.scope(|scope| {
-                scope.spawn(move |worker: &Worker| {
-                    divide_and_conquer(worker, scope, counter_p, 1024)
+                scope.spawn(move |_: &Worker| {
+                    divide_and_conquer(scope, counter_p, 1024)
                 })
             });
         });
@@ -1260,17 +1279,16 @@ mod tests {
     }
 
     fn divide_and_conquer<'scope, 'env>(
-        worker: &Worker,
         scope: &'scope Scope<'scope, 'env>,
         counter: &'scope AtomicUsize,
         size: usize,
     ) {
         if size > 1 {
-            scope.spawn_on(worker, move |worker: &Worker| {
-                divide_and_conquer(worker, scope, counter, size / 2)
+            scope.spawn(move |_: &Worker| {
+                divide_and_conquer(scope, counter, size / 2)
             });
-            scope.spawn_on(worker, move |worker: &Worker| {
-                divide_and_conquer(worker, scope, counter, size / 2)
+            scope.spawn(move |_: &Worker| {
+                divide_and_conquer(scope, counter, size / 2)
             });
         } else {
             // count the leaves
@@ -1337,9 +1355,9 @@ mod tests {
             OP: Fn(&mut T) + Sync,
         {
             let Tree { value, children } = self;
-            scope.spawn(move |worker: &Worker| {
+            scope.spawn(move |_: &Worker| {
                 for child in children {
-                    scope.spawn_on(worker, move |_: &Worker| {
+                    scope.spawn(move |_: &Worker| {
                         let child = child;
                         child.update_in_scope(scope, op)
                     });

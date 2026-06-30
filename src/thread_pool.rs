@@ -127,11 +127,17 @@ impl MemberData {
     }
 }
 
-// SAFETY: `Sharer` (aka `st3::Worker`) is `!Sync`. We allow it to be stored in
-// this shared structure, but we only allow one thread to access it at a time
-// (via the membership claiming logic). This is effectively like sending
-// `st3:Worker` ownership between threads (although in practice it always
-// occupies the same place on the heap). Luckily for us, it implements `Send`.
+// SAFETY: The only `!Sync` field of `MemberData` is `sharers`. This is a
+// `Sharer` (aka `st3::Worker`).
+//
+// Each `sharers[i]` is only ever touched by the single thread that currently
+// holds seat `i`, and seat ownership is exclusive. Ownership thus moves between
+// threads one at a time, exactly as if the `Sharer` (which is `Send`) were
+// sent.
+//
+// The handoff is synchronized: a resigning worker makes a `Release` store to
+// the `claimed_bitmask`, and a joining worker makes an `Acquire` load of the
+// same variable. So the next owner of the seat sees a consistent `Sharer`.
 unsafe impl Sync for MemberData {}
 
 /// Represents a worker thread that is managed by the pool, as opposed to
@@ -405,6 +411,24 @@ impl ThreadPool {
 }
 
 // -----------------------------------------------------------------------------
+// Schedulers
+
+pub trait Scheduler<'w>: Send + Sync {
+    // Is passed the result of `Worker::with_current`
+    fn schedule(&self, job_ref: JobRef, worker: Option<&'w Worker>);
+}
+
+impl<'w, F> Scheduler<'w> for F
+where
+    F: Fn(JobRef, Option<&'w Worker>) + Send + Sync,
+{
+    #[inline(always)]
+    fn schedule(&self, job_ref: JobRef, worker: Option<&'w Worker>) {
+        self(job_ref, worker)
+    }
+}
+
+// -----------------------------------------------------------------------------
 // Spawn Trait
 
 pub use async_task::Task;
@@ -439,49 +463,58 @@ pub use async_task::Task;
 /// THREAD_POOL.spawn(|_: &Worker| { });
 /// ```
 /// Hopefully rustc will fix this type inference failure eventually.
-pub trait Spawn<M>: Send + 'static {
+pub trait Spawn<M>: 'static {
     /// The handle returned when spawning this type.
-    type Output: Send + 'static;
+    type Output: 'static;
 
-    /// Spawns work onto the thread pool.
-    fn spawn(
+    /// Turns `Self` into a `JobRef` and passes it to the `Scheduler`.
+    ///
+    /// # Safety
+    ///
+    /// If `Self` is not `Send`, the `scheduler` must only ever schedule the
+    /// work to run on the current thread. For a future, this includes every
+    /// reschedule triggered by a wakeup, no matter which thread the wakeup
+    /// occurs on.
+    unsafe fn spawn<S>(
         self,
-        thread_pool: &'static ThreadPool,
+        scheduler: S,
         worker: Option<&Worker>,
-    ) -> Self::Output;
+    ) -> Self::Output
+    where
+        S: for<'w> Scheduler<'w> + 'static;
 }
 
 impl<F> Spawn<FnOnceMarker> for F
 where
-    F: for<'worker> FnOnce(&'worker Worker) + Send + 'static,
+    F: for<'worker> FnOnce(&'worker Worker) + 'static,
 {
     type Output = ();
 
     #[inline]
-    fn spawn(self, thread_pool: &'static ThreadPool, worker: Option<&Worker>) {
+    unsafe fn spawn<S>(self, scheduler: S, worker: Option<&Worker>)
+    where
+        S: for<'w> Scheduler<'w> + 'static,
+    {
         // Allocate a new job on the heap to store the closure.
         let job = HeapJob::new(self);
 
         // Turn the job into an "owning" `JobRef` so it can be queued.
         //
-        // SAFETY: `HeapJob::into_job_ref` has two preconditions:
+        // SAFETY: `HeapJob::into_job_ref` requires:
         //
-        // * The `JobRef` must not outlive any of the items closed over by the
-        //   function `f`.
+        // * The `JobRef` does not outlive any of the data closed over by the
+        //   closure. `F: 'static`, so the closure captures only `'static` data,
+        //   which outlives any `JobRef`.
         //
-        //   Since `F: 'static`, the `JobRef` cannot outlive its captured data.
+        // * If the closure is `!Send`, `JobRef::execute` is only called on the
+        //   thread where the `HeapJob` was constructed.
         //
-        // * If `F: !Send` then the `JobRef` must only be executed on this
-        //   thread.
-        //
-        //   `F` is `Send`, so this does not apply.
+        //   The safety contract of `Spawn<M>::spawn` makes the caller
+        //   responsible for ensuring this.
         let job_ref = unsafe { job.into_job_ref() };
 
-        // Queue the job for evaluation
-        match worker {
-            Some(worker) => worker.fifo_queue.push_new(job_ref),
-            None => thread_pool.push_shared_job(job_ref),
-        }
+        // Schedule the job-ref.
+        scheduler.schedule(job_ref, worker);
     }
 }
 
@@ -498,10 +531,11 @@ where
 ///   called on the thread where the `Runnable` was created.
 #[inline(always)]
 unsafe fn execute_runnable(this: NonNull<()>, _worker: &Worker) {
-    // SAFETY: This pointer was created by `Runnable::into_raw` in the schedule
-    // closure. Jobs are executed exactly once, so `from_raw` is called at most
-    // once on this function (the next call to `schedule` will call `into_raw`
-    // again to get a "new" raw pointer to the same runnable).
+    // SAFETY: `Runnable::from_raw` must be given a pointer produced by
+    // `Runnable::into_raw` that has not already been consumed by a `from_raw`.
+    //
+    // The caller ensures this, according to the first clause of this function's
+    // safety contract.
     let runnable = unsafe { Runnable::<()>::from_raw(this) };
     // Poll the task. This will drop the future if the task is
     // canceled or the future completes.
@@ -510,188 +544,80 @@ unsafe fn execute_runnable(this: NonNull<()>, _worker: &Worker) {
 
 impl<Fut, T> Spawn<FutureMarker> for Fut
 where
-    Fut: Future<Output = T> + Send + 'static,
-    T: Send + 'static,
-{
-    type Output = Task<T>;
-
-    #[inline]
-    fn spawn(
-        self,
-        thread_pool: &'static ThreadPool,
-        _worker: Option<&Worker>,
-    ) -> Task<T> {
-        // Creates a schedule function that captures a reference to the
-        // thread-pool.
-        let schedule = |runnable: Runnable| {
-            // Temporarily turn the task into a raw pointer so that it can be
-            // used as a job. We could also use `HeapJob` here, but since
-            // `Runnable` is heap allocated this would result in a needless
-            // second allocation.
-            let job_pointer = runnable.into_raw();
-
-            // SAFETY: `JobRef::new` requires us to show that `execute` will
-            // only be called on the returned `JobRef` when it is sound to call
-            // `execute_runnable` on `job_pointer`. The two preconditions to
-            // this are:
-            //
-            // * `job_pointer` must come from `Runnable::into_raw`. and must be
-            //   called at most once per `into_raw`.
-            //
-            //   We produced `job_pointer` this way just above. The call to
-            //   `execute` will consume the `JobRef`, so `execute_runnable` will
-            //   be called at most once.
-            //
-            // * If the `Runnable` was created for a `!Send` future, the
-            //   `JobRef` must only be executed on the thread where the
-            //   `Runnable` was created.
-            //
-            //   The future is required to be `Send`, so this does not apply.
-            let job_ref = unsafe { JobRef::new(job_pointer, execute_runnable) };
-
-            // Send this job off to be executed.
-            thread_pool.get_worker(|worker| match worker {
-                Some(worker) => worker.fifo_queue.push_new(job_ref),
-                None => thread_pool.push_shared_job(job_ref),
-            });
-        };
-
-        // Create a runnable and add the thread pool as metadata.
-        let (runnable, task) = async_task::spawn(self, schedule);
-
-        // Call the schedule function, pushing a `JobRef` for the future onto
-        // the local work queue. If the future doesn't complete, it can be
-        // woken and scheduled at a later point.
-        //
-        // Because we always look up the local worker within the schedule
-        // function, woken futures will tend to run on the thread that wakes
-        // them. This is a desirable property, as typically the next thing a
-        // future is going to do after being woken up is read some data from the
-        // thread/task that woke it.
-        //
-        // This is potentially more efficient than `Runnable::schedule`.
-        schedule(runnable);
-
-        // Return the task.
-        task
-    }
-}
-
-// -----------------------------------------------------------------------------
-// Local Spawn Trait
-
-/// A version of the [`Spawn`] trait without the `Send` bound.
-///
-/// It is implemented for:
-///
-/// * Closures that satisfy `for<'worker> FnOnce(&'worker Worker) + 'static`.
-///
-/// * Futures that satisfy `Future<Output = T> + 'static` where `T: 'static`.
-pub trait SpawnLocal<M>: 'static {
-    /// The handled returned when spawning this type.
-    type Output: 'static;
-
-    /// Spawns work that will run in the background on the current worker
-    /// thread.
-    fn spawn_local(self, worker: &Worker) -> Self::Output;
-}
-
-impl<F> SpawnLocal<FnOnceMarker> for F
-where
-    F: for<'worker> FnOnce(&'worker Worker) + 'static,
-{
-    type Output = ();
-
-    #[inline]
-    fn spawn_local(self, worker: &Worker) {
-        // Allocate a new job on the heap to store the closure.
-        let job = HeapJob::new(self);
-
-        // Turn the job into an "owning" `JobRef` so it can be queued.
-        //
-        // SAFETY: `HeapJob::into_job_ref` has two preconditions:
-        //
-        // * The `JobRef` must not outlive any of the items closed over by the
-        //   function `f`.
-        //
-        //   Since `F: 'static`, the `JobRef` cannot outlive its captured data.
-        //
-        // * If `F: !Send` then the `JobRef` must only be executed on this
-        //   thread.
-        //
-        //   This `JobRef` is added to the `nonsend_fifo_queue` for this thread.
-        //   No other thread ever pulls from this queue, and work is never
-        //   shared from it, so it cannot be executed on any other thread.
-        let job_ref = unsafe { job.into_job_ref() };
-
-        // Push into the non-send queue, which can only be accessed from this
-        // thread.
-        worker.nonsend_fifo_queue.push(job_ref);
-    }
-}
-
-impl<Fut, T> SpawnLocal<FutureMarker> for Fut
-where
     Fut: Future<Output = T> + 'static,
     T: 'static,
 {
     type Output = Task<T>;
 
     #[inline]
-    fn spawn_local(self, worker: &Worker) -> Task<T> {
-        // Create a schedule function that will keep a copy of the local fifo
-        // queue arc and be able to wake the local worker up.
-        let queue = worker.nonsend_fifo_queue.clone();
-        let member_index = worker.member_index;
-        let member_data = worker.member_data;
-        let schedule = move |runnable: Runnable| {
+    unsafe fn spawn<S>(self, scheduler: S, _worker: Option<&Worker>) -> Task<T>
+    where
+        S: for<'w> Scheduler<'w> + 'static,
+    {
+        // Turn our `JobRef` scheduler into something that `async-task` knows how
+        // to use.
+        let schedule_task = move |runnable: Runnable| {
             // Temporarily turn the task into a raw pointer so that it can be
             // used as a job. We could also use `HeapJob` here, but since
             // `Runnable` is heap allocated this would result in a needless
             // second allocation.
             let job_pointer = runnable.into_raw();
 
-            // SAFETY: `JobRef::new` requires us to show that `execute` will
-            // only be called on the returned `JobRef` when it is sound to call
-            // `execute_runnable` on `job_pointer`. The two preconditions to
-            // this are:
+            // SAFETY: `JobRef::new` requires us to show that `JobRef::execute`
+            // will only be called on the returned `JobRef` when it would be
+            // sound to call `execute_runnable` on `job_pointer`. This requires:
             //
-            // * `job_pointer` must come from `Runnable::into_raw`. and must be
-            //   called at most once per `into_raw`.
+            // * That `job_pointer` was produced by `Runnable::into_raw` and not
+            //   yet consumed by `Runnable::from_raw`. We produced it with
+            //   `into_raw` immediately above. The only call to `from_raw` is
+            //   inside `execute_runnable`, which runs at most once because
+            //   `JobRef::execute` consumes the `JobRef`.
             //
-            //   We produced `job_pointer` this way just above. The call to
-            //   `execute` will consume the `JobRef`, so `execute_runnable` will
-            //   be called at most once.
+            // * If the future is `!Send`, `execute_runnable` is only called on
+            //   the thread the future was spawned on.
             //
-            // * If the `Runnable` was created for a `!Send` future, the
-            //   `JobRef` must only be executed on the thread where the
-            //   `Runnable` was created.
-            //
-            //   This `JobRef` is added to the `nonsend_fifo_queue` for this
-            //   thread. No other thread ever pulls from this queue, and work is
-            //   never shared from it, so it cannot be executed on any other
-            //   thread.
+            //   The second clause of the `Spawn<M>::spawn` safety contract
+            //   requires the caller to ensure this.
             let job_ref = unsafe { JobRef::new(job_pointer, execute_runnable) };
 
-            // Send this job to the correct thread to be executed.
-            queue.push(job_ref);
-
-            // Ensure that the worker is awake to execute this job.
-            member_data.semaphores[member_index].signal();
+            // Schedule the job-ref, looking up the current worker so woken
+            // futures tend to run on the thread that woke them.
+            Worker::with_current(|worker| scheduler.schedule(job_ref, worker));
         };
 
-        // Create a runnable and add the thread pool as metadata.
-        let (runnable, task) = async_task::spawn_local(self, schedule);
-
-        // Call the schedule function, pushing a `JobRef` for the future onto
-        // the local work queue. If the future doesn't complete, it can be
-        // woken and scheduled at a later point.
+        // Create a runnable for the future.
         //
-        // Because we always look up the local worker within the schedule
-        // function, woken futures will tend to run on the thread that wakes
-        // them. This is a desirable property, as typically the next thing a
-        // future is going to do after being woken up is read some data from the
-        // thread/task that woke it.
+        // SAFETY: `spawn_unchecked` has four obligations:
+        //
+        // * If `Self` is `!Send`, its `Runnable` must be used and dropped on
+        //   the original thread. The `Runnable` is wrapped in a `JobRef` and
+        //   handed to `scheduler`.
+        //
+        //   The second clause of the `Spawn<M>::spawn` safety contract
+        //   requires the caller to ensure this.
+        //
+        // * If `Self` is `!'static`, borrowed variables must outlive its
+        //   `Runnable`.
+        //
+        //   Vacuously true, since `Self: 'static`.
+        //
+        // * If `schedule_task` is `!Send`/`!Sync`, all of the `Runnable`'s
+        //   `Waker`s must be used and dropped on the original thread.
+        //
+        //   Vacuously true, since `S: Scheduler` is `Send + Sync` so too
+        //   must `schedule_task` be `Send + Sync`.
+        //
+        // * If `schedule_task` is `!'static`, borrowed variables must outlive
+        //   all of the `Runnable`'s `Waker`s.
+        //
+        //   Vacuously true, since `S: 'static`.
+        let (runnable, task) =
+            unsafe { async_task::spawn_unchecked(self, schedule_task) };
+
+        // Perform the initial schedule via the task's own stored schedule
+        // function, pushing a `JobRef` for the future onto the current worker's
+        // queue. If the future doesn't complete, it can be woken and scheduled
+        // again later.
         runnable.schedule();
 
         // Return the task.
@@ -722,8 +648,44 @@ impl ThreadPool {
     ///
     /// See also: [`Worker::spawn`] and [`spawn`].
     #[inline(always)]
-    pub fn spawn<M, S: Spawn<M>>(&'static self, work: S) -> S::Output {
-        self.get_worker(|worker| work.spawn(self, worker))
+    pub fn spawn<M, S>(&'static self, work: S) -> S::Output
+    where
+        S: Spawn<M> + Send,
+        S::Output: Send,
+    {
+        let scheduler = |job_ref, worker: Option<&Worker>| match worker {
+            Some(worker) => worker.fifo_queue.push_new(job_ref),
+            None => self.push_shared_job(job_ref),
+        };
+        Worker::with_current(|worker| {
+            // SAFETY: `Spawn::spawn`'s contract requires that `!Send` work is
+            // only scheduled to run on this thread. The work is `Send` here, so
+            // this is vacuous.
+            unsafe { work.spawn(scheduler, worker) }
+        })
+    }
+
+    /// Tries to spawn a job on a specific member index. If no thread currently
+    /// holds that membership, the work will not be run.
+    #[inline(always)]
+    pub fn spawn_on<M, S>(
+        &'static self,
+        member_index: usize,
+        work: S,
+    ) -> S::Output
+    where
+        S: Spawn<M> + Send,
+        S::Output: Send,
+    {
+        let member_data = self.get_member_data();
+        let scheduler = move |job_ref, _: Option<&Worker>| {
+            member_data.broadcasts[member_index].push(job_ref);
+            member_data.semaphores[member_index].signal();
+        };
+        // SAFETY: `Spawn::spawn`'s contract requires that `!Send` work is only
+        // scheduled to run on this thread. The work is `Send` here, so this is
+        // vacuous.
+        unsafe { work.spawn(scheduler, None) }
     }
 
     /// Blocks the thread waiting for a future to complete.
@@ -807,9 +769,9 @@ pub struct Membership {
     thread_pool: &'static ThreadPool,
     /// Contains the index of a row in the `MembersData` table, if the worker
     /// has been granted membership on the thread-pool.
-    member_index: usize,
+    pub(crate) member_index: usize,
     /// A reference to the `MemberData` table.
-    member_data: &'static MemberData,
+    pub(crate) member_data: &'static MemberData,
 }
 
 impl ThreadPool {
@@ -840,7 +802,7 @@ impl ThreadPool {
     pub fn try_enroll(&'static self) -> Option<Membership> {
         loop {
             let available_bitmask =
-                !self.claimed_bitmask.load(Ordering::Relaxed);
+                !self.claimed_bitmask.load(Ordering::Acquire);
             if available_bitmask == 0 {
                 return None;
             }
@@ -868,7 +830,7 @@ impl ThreadPool {
         }
         let member_data = self.get_member_data();
         loop {
-            let claimed_bitmask = self.claimed_bitmask.load(Ordering::Relaxed);
+            let claimed_bitmask = self.claimed_bitmask.load(Ordering::Acquire);
             if claimed_bitmask == u32::MAX {
                 return Vec::new();
             }
@@ -1041,7 +1003,6 @@ impl Membership {
             }
         }
 
-        // Indicate we are no longer waiting to resign.
         worker
             .thread_pool
             .wants_to_resign
@@ -1051,19 +1012,16 @@ impl Membership {
         let thread_pool = worker.thread_pool;
         drop(worker);
 
-        // Complete the resignation
+        // Complete the resignation.
         loop {
             let resignations = thread_pool.resignations.load(Ordering::Relaxed);
-            // Try to decrement the resignations count. This uses `Release`
-            // ordering so that the the `claimed_bitmask` store done as part of
-            // `drop(worker)` appears to any thread waiting for this resignation
-            // to complete.
+            // Try to decrement the resignations count.
             if thread_pool
                 .resignations
                 .compare_exchange_weak(
                     resignations,
                     resignations - (1 << 26),
-                    Ordering::Release,
+                    Ordering::Relaxed,
                     Ordering::Relaxed,
                 )
                 .is_ok()
@@ -1073,7 +1031,7 @@ impl Membership {
                 if (resignations >> 26) - 1 == 0 {
                     atomic_wait::wake_all(&*thread_pool.resignations);
                 }
-                // Exit the CAS loop
+                // Exit the CAS loop.
                 break;
             }
         }
@@ -1120,7 +1078,7 @@ impl Drop for Membership {
         // Release the claim on this membership.
         self.thread_pool
             .claimed_bitmask
-            .fetch_and(!(1 << self.member_index), Ordering::Relaxed);
+            .fetch_and(!(1 << self.member_index), Ordering::Release);
         // In case another thread is waiting for a membership slot to free
         // up, issue a wake on the bitmask.
         atomic_wait::wake_one(&*self.thread_pool.claimed_bitmask);
@@ -1150,7 +1108,7 @@ impl Drop for Membership {
 pub struct Worker {
     /// Registers the worker as belonging to a specific thread pool, and
     /// potentially also grants "membership" on that thread-pool.
-    membership: Membership,
+    pub(crate) membership: Membership,
     /// A sequence of jobs waiting to be executed. Newer jobs are executed
     /// before older ones, allowing efficient depth-first execution. During
     /// promotion, the oldest job is shared. Populated by `join()`.
@@ -1171,7 +1129,7 @@ pub struct Worker {
     /// that a `Future` that is `!Send` and has been spawned onto this thread
     /// can be woken on another thread (the other thread then sends this thread
     /// a job that polls the future).
-    nonsend_fifo_queue: Arc<SegQueue<JobRef>>,
+    pub(crate) nonsend_fifo_queue: Arc<SegQueue<JobRef>>,
     /// A local psudorandom number-generator. Used to spread out
     /// worker-to-worker operations evenly across the pool.
     rng: XorShift64Star,
@@ -1339,11 +1297,15 @@ impl Worker {
             let batch_job = HeapJob::new(move |worker| {
                 worker.fifo_queue.append(job_refs);
             });
-            // SAFETY: `into_job_ref` requires that the data closed over by the
-            // `HeapJob` outlive the `JobRef`.
+            // SAFETY: `HeapJob::into_job_ref` requires:
             //
-            // Here, the closure captures `job_refs` (a `VecDequeue<JobRef>`) by
-            // value, and so trivially outlives the newly created `JobRef`.
+            // * The data closed over by the `HeapJob` outlives the `JobRef`.
+            //
+            //   The closure captures `job_refs` (a `VecDeque<JobRef>`) by value,
+            //   so it trivially outlives the newly created `JobRef`.
+            //
+            // * If the closure is `!Send`, `JobRef::execute` only runs on this
+            //   thread. The closure is `Send`, so this obligation is vacuous.
             let batch_job_ref = unsafe { batch_job.into_job_ref() };
             // Push the batch job into the steal queue so siblings can steal it.
             if let Err(job_ref) = self.sharing_queue().push(batch_job_ref) {
@@ -1410,39 +1372,39 @@ impl Worker {
         }
     }
 
-    /// Finds a job to work on. This function is almost entirely local, but does
-    /// a small amount of synchronization to allow for !Send futures that must
-    /// be polled on this thread but are woken on a different thread.
+    /// Finds a job to work on.
+    ///
+    /// This function will not steal work from other workers or read from the
+    /// global injector queue. It prioritizes work that _must_ be run on this
+    /// thread (assuming no other workers are running).
     ///
     /// Work is prioritized as follows:
     /// 1. Pull from the LIFO queue (`join` calls)
     /// 2. Pull from the !Send FIFO queue (`spawn_local` calls)
-    /// 3. Pull from the regular FIFO queue (`spawn` calls)
+    /// 3. Pull from the broadcast queue (`broadcast` and `spawn_on` calls)
+    /// 4. Pull from the regular FIFO queue (`spawn` calls)
+    /// 5. Reclaim work shared by this worker
     #[inline(always)]
     fn find_local_work(&self) -> Option<JobRef> {
         (self.lifo_queue.pop_newest())
             .or_else(|| self.nonsend_fifo_queue.pop())
+            .or_else(|| self.broadcast_queue().pop())
             .or_else(|| self.fifo_queue.pop_oldest())
+            .or_else(|| self.sharing_queue().pop())
     }
 
     /// Finds a job to work on.
     ///
     /// Work is prioritized as follows:
-    /// 1. Pull from the LIFO queue (`join` calls)
-    /// 2. Pull from the !Send FIFO queue (`spawn_local` calls)
-    /// 3. Pull from the regular FIFO queue (`spawn` calls)
-    /// 4. Pull from the broadcast queue (`broadcast` calls)
-    /// 5. Reclaim work shared by this worker
-    /// 6. Steal work shared from other workers
-    /// 7. Read from the global queue (external calls)
+    /// 1. Try [`find_local_work`][Worker::find_local_work] first
+    /// 2. Steal work shared from other workers
+    /// 3. Read from the global queue (external calls)
     ///
     /// If work is found in the last two cases, it is treated as having been
     /// "migrated" to this thread.
     #[inline(always)]
     fn find_work(&self) -> Option<(JobRef, bool)> {
         (self.find_local_work().map(|job| (job, false)))
-            .or_else(|| self.broadcast_queue().pop().map(|job| (job, false)))
-            .or_else(|| self.sharing_queue().pop().map(|job| (job, false)))
             .or_else(|| self.steal_from_siblings().map(|job| (job, true)))
             .or_else(|| {
                 self.thread_pool.shared_queue.pop().map(|job| (job, true))
@@ -1454,6 +1416,7 @@ impl Worker {
     /// Iterates over occupied seats in a random order to avoid always hitting
     /// the same victim. Because stealers are pre-allocated and permanent, no
     /// lock or atomic load is needed to access them.
+    #[inline(always)]
     fn steal_from_siblings(&self) -> Option<JobRef> {
         let my_member_index = self.membership.member_index;
         let my_sharer = self.sharing_queue();
@@ -1470,7 +1433,6 @@ impl Worker {
             let shifted_idx = bits.trailing_zeros();
             let idx = (shifted_idx + offset) % 32;
             bits &= bits - 1;
-            // The stealer is a permanent reference — no lock or atomic load needed.
             let stealer = &stealers[idx as usize];
             // `steal_and_pop` returns one job directly and moves up to half the
             // remaining items into our steal queue for later use.
@@ -1583,8 +1545,42 @@ impl Worker {
     /// * If a future panics, the [`Task`] will panic when awaited.
     ///
     #[inline]
-    pub fn spawn<M, S: Spawn<M>>(&self, work: S) -> S::Output {
-        work.spawn(self.thread_pool, Some(self))
+    pub fn spawn<M, S>(&self, work: S) -> S::Output
+    where
+        S: Spawn<M> + Send,
+        S::Output: Send,
+    {
+        let thread_pool = self.thread_pool;
+        let scheduler = |job_ref, worker: Option<&Worker>| match worker {
+            Some(worker) => worker.fifo_queue.push_new(job_ref),
+            None => thread_pool.push_shared_job(job_ref),
+        };
+        // SAFETY: `Spawn::spawn`'s contract requires that `!Send` work only be
+        // scheduled to run on this thread. The work is `Send` and this is
+        // vacuous.
+        unsafe { work.spawn(scheduler, Some(self)) }
+    }
+
+    /// Runs work (a closure or future) on the background of a specific worker
+    /// thread.
+    ///
+    /// This is quite similar to [`spawn`](Worker::spawn), except that the work
+    /// will run on another worker instead of the current one.
+    ///
+    /// # Panics
+    ///
+    /// The panic behavior depends on the type of work being spawned:
+    ///
+    /// * If a closure panics, it will be caught and ignored.
+    ///
+    /// * If a future panics, the [`Task`] will panic when awaited.
+    #[inline]
+    pub fn spawn_on<M, S>(&self, member_index: usize, work: S) -> S::Output
+    where
+        S: Spawn<M> + Send,
+        S::Output: Send,
+    {
+        self.thread_pool.spawn_on(member_index, work)
     }
 
     /// Runs work (a closure or future) in the background of this thread.
@@ -1602,8 +1598,25 @@ impl Worker {
     /// * If a future panics, the [`Task`] will panic when awaited.
     ///
     #[inline]
-    pub fn spawn_local<M, S: SpawnLocal<M>>(&self, work: S) -> S::Output {
-        work.spawn_local(self)
+    pub fn spawn_local<M, S>(&self, work: S) -> S::Output
+    where
+        S: Spawn<M>,
+    {
+        let queue = self.nonsend_fifo_queue.clone();
+        let semaphore = &self.member_data.semaphores[self.member_index];
+        let scheduler = move |job_ref, _: Option<&Worker>| {
+            queue.push(job_ref);
+            semaphore.signal();
+        };
+        // SAFETY: `Spawn::spawn`'s contract requires that any `!Send` work be
+        // scheduled to run on this thread.
+        //
+        // The scheduler pushes the job onto this worker's `nonsend_fifo_queue`,
+        // which is only ever drained by this worker on this thread (see
+        // `find_local_work`). For a future, every reschedule re-pushes onto
+        // that same queue regardless of which thread issued the wakeup, so the
+        // work stays on this thread.
+        unsafe { work.spawn(scheduler, Some(self)) }
     }
 
     /// Polls a future to completion, then returns the outcome.
@@ -1910,7 +1923,7 @@ impl Worker {
     /// let ok: Vec<i32> = vec![1, 2, 3];
     /// forte::scope(|scope| {
     ///     let bad: Vec<i32> = vec![4, 5, 6];
-    ///     scope.spawn_on(worker, |_: &Worker| {
+    ///     scope.spawn(|_: &Worker| {
     ///         // Transfer ownership of `bad` into a local variable (also named `bad`).
     ///         // This will force the closure to take ownership of `bad` from the environment.
     ///         let bad = bad;
@@ -1918,7 +1931,7 @@ impl Worker {
     ///         println!("bad: {:?}", bad); // refers to our local variable, above.
     ///     });
     ///
-    ///     scope.spawn_on(worker, |_: &Worker| println!("ok: {:?}", ok)); // we too can borrow `ok`
+    ///     scope.spawn(|_: &Worker| println!("ok: {:?}", ok)); // we too can borrow `ok`
     /// });
     /// # });
     /// ```
@@ -1937,14 +1950,14 @@ impl Worker {
     /// let ok: Vec<i32> = vec![1, 2, 3];
     /// forte::scope(|scope| {
     ///     let bad: Vec<i32> = vec![4, 5, 6];
-    ///     scope.spawn_on(worker, move |_: &Worker| {
+    ///     scope.spawn(move |_: &Worker| {
     ///         println!("ok: {:?}", ok);
     ///         println!("bad: {:?}", bad);
     ///     });
     ///
     ///     // That closure is fine, but now we can't use `ok` anywhere else,
     ///     // since it is owned by the previous task:
-    ///     // scope.spawn_on(worker, |_: &Worker| println!("ok: {:?}", ok));
+    ///     // scope.spawn(|_: &Worker| println!("ok: {:?}", ok));
     /// });
     /// # });
     /// ```
@@ -1964,7 +1977,7 @@ impl Worker {
     /// forte::scope(|scope| {
     ///     let bad: Vec<i32> = vec![4, 5, 6];
     ///     let ok: &Vec<i32> = &ok; // shadow the original `ok`
-    ///     scope.spawn_on(worker, move |_: &Worker| {
+    ///     scope.spawn(move |_: &Worker| {
     ///         println!("ok: {:?}", ok); // captures the shadowed version
     ///         println!("bad: {:?}", bad);
     ///     });
@@ -1973,7 +1986,7 @@ impl Worker {
     ///     // can be shared freely. Note that we need a `move` closure here though,
     ///     // because otherwise we'd be trying to borrow the shadowed `ok`,
     ///     // and that doesn't outlive `scope`.
-    ///     scope.spawn_on(worker, move |_: &Worker| println!("ok: {:?}", ok));
+    ///     scope.spawn(move |_: &Worker| println!("ok: {:?}", ok));
     /// });
     /// # });
     /// ```
@@ -1990,7 +2003,7 @@ impl Worker {
     /// let ok: Vec<i32> = vec![1, 2, 3];
     /// forte::scope(|scope| {
     ///     let bad: Vec<i32> = vec![4, 5, 6];
-    ///     scope.spawn_on(worker, |_: &Worker| {
+    ///     scope.spawn(|_: &Worker| {
     ///         // Transfer ownership of `bad` into a local variable (also named `bad`).
     ///         // This will force the closure to take ownership of `bad` from the environment.
     ///         let bad = bad;
@@ -1998,7 +2011,7 @@ impl Worker {
     ///         println!("bad: {:?}", bad); // refers to our local variable, above.
     ///     });
     ///
-    ///     scope.spawn_on(worker, |_: &Worker| println!("ok: {:?}", ok)); // we too can borrow `ok`
+    ///     scope.spawn(|_: &Worker| println!("ok: {:?}", ok)); // we too can borrow `ok`
     /// });
     /// # });
     /// ```
@@ -2034,10 +2047,10 @@ impl Worker {
     /// let mut counter = 0;
     /// let counter_ref = &mut counter;
     /// forte::scope(|scope| {
-    ///     scope.spawn_on(worker, |worker: &Worker| {
+    ///     scope.spawn(|worker: &Worker| {
     ///         *counter_ref += 1;
     ///         // Note: we borrow the scope again here.
-    ///         scope.spawn_on(worker, move |_: &Worker| {
+    ///         scope.spawn(move |_: &Worker| {
     ///             *counter_ref += 1;
     ///         });
     ///     });
@@ -2061,7 +2074,7 @@ impl Worker {
     ///             // ^^^^^ ERROR: This creates a *static* job on the worker,
     ///             //       which may outlive the scope.
     ///             
-    ///             scope.spawn_on(worker, |_: &Worker| { });
+    ///             scope.spawn(|_: &Worker| { });
     ///             // ^^^^^ ERROR: This requires borrowing the scope within the
     ///             //       unscoped job, which isn't allowed by the compiler
     ///             //       because 'scope would have to to outlive 'static.
@@ -2230,12 +2243,19 @@ impl Worker {
             return;
         }
 
+        // Wrap the operation in an `Arc` so each per-member job can own an
+        // independent, `'static` reference to it. We must *not* let a job
+        // capture a borrow of `f`: `spawn_broadcast` does not wait, so `f`
+        // would be dropped while jobs are still queued or running on other
+        // threads.
+        let f = Arc::new(f);
+
         // Send the broadcast to each member, and wake them up.
         for (i, member_index) in members.iter_bits().enumerate() {
-            let func = &f;
+            let func = Arc::clone(&f);
             let op = move |worker: &Worker| {
                 // Run the job
-                func(Broadcast {
+                (*func)(Broadcast {
                     worker,
                     index: i,
                     participants,
@@ -2247,15 +2267,17 @@ impl Worker {
             // SAFETY: `HeapJob::into_job_ref` has two preconditions:
             //
             // * The `JobRef` must not outlive any of the items closed over by
-            //   the function `f`.
+            //   `op`.
             //
-            //   Since `F: 'static`, the `JobRef` cannot outlive its captured
-            //   data.
+            //   `op` owns an `Arc<F>` clone (`func`). Since `F: 'static`, that
+            //   `Arc` — and everything it keeps alive — is itself `'static`,
+            //   so it outlives the `JobRef` regardless of when the job runs.
             //
             // * If `F: !Send` then the `JobRef` must only be executed on this
             //   thread.
             //
-            //   The `op` is `Send`, so this does not apply.
+            //   `op` is `Send` (`Arc<F>: Send` because `F: Send + Sync`), so
+            //   this does not apply.
             let job_ref = unsafe { job.into_job_ref() };
             self.member_data.broadcasts[member_index].push(job_ref);
             self.member_data.semaphores[member_index].signal();
@@ -2302,7 +2324,7 @@ pub static DEFAULT_POOL: DefaultThreadPool = DefaultThreadPool {
     initialized: AtomicU32::new(0),
 };
 
-/// Runs the provided closure in the background.
+/// Runs work in the background.
 ///
 /// When executed on a thread that is currently registered as a worker (i.e. the
 /// closure inside [`Membership::activate`], [`ThreadPool::with_worker`], or
@@ -2314,10 +2336,35 @@ pub static DEFAULT_POOL: DefaultThreadPool = DefaultThreadPool {
 /// If you have a reference to a [`Worker`], it's better to use [`Worker::spawn`]
 /// instead. If you don't have a worker, but know which thread pool you want to
 /// use, [`ThreadPool::spawn`] is more appropriate.
-pub fn spawn<M, S: Spawn<M>>(work: S) -> S::Output {
+pub fn spawn<M, S>(work: S) -> S::Output
+where
+    S: Spawn<M> + Send,
+    S::Output: Send,
+{
     Worker::with_current(|worker| match worker {
         Some(worker) => worker.spawn(work),
         None => DEFAULT_POOL.spawn(work),
+    })
+}
+
+/// Runs work on the background on a specific worker thread.
+///
+/// This is quite similar to [`spawn`], except that the work will run on another
+/// worker instead of the current one.
+///
+/// If not called within a thread pool, this uses the [`DEFAULT_POOL`].
+///
+/// If you have a reference to a [`Worker`], it's better to use
+/// [`Worker::spawn_on`] instead. If you don't have a worker, but know which
+/// thread pool you want to use, [`ThreadPool::spawn_on`] is more appropriate.
+pub fn spawn_on<M, S>(member_index: usize, work: S) -> S::Output
+where
+    S: Spawn<M> + Send,
+    S::Output: Send,
+{
+    Worker::with_current(|worker| match worker {
+        Some(worker) => worker.spawn_on(member_index, work),
+        None => DEFAULT_POOL.spawn_on(member_index, work),
     })
 }
 

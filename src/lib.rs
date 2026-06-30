@@ -11,8 +11,6 @@
 //!
 //! * The ability to execute both closures and futures on the same pool.
 //!
-//! * Hybrid scopes that can contain work distributed across multiple thread pools.
-//!
 //! * A primitive for awaiting async work in non-async contexts without spinning.
 //!
 //! * An exposed unsafe api, built for low-level integration and customization.
@@ -214,6 +212,7 @@ pub struct FutureMarker();
 // -----------------------------------------------------------------------------
 // Top-level exports
 
+pub use latch::Latch;
 pub use scope::Scope;
 pub use scope::SpawnScoped;
 pub use thread_pool::Broadcast;
@@ -221,7 +220,6 @@ pub use thread_pool::DEFAULT_POOL;
 pub use thread_pool::DefaultThreadPool;
 pub use thread_pool::Membership;
 pub use thread_pool::Spawn;
-pub use thread_pool::SpawnLocal;
 pub use thread_pool::Task;
 pub use thread_pool::ThreadPool;
 pub use thread_pool::Worker;
@@ -233,6 +231,7 @@ pub use thread_pool::num_members;
 pub use thread_pool::scope;
 pub use thread_pool::spawn;
 pub use thread_pool::spawn_broadcast;
+pub use thread_pool::spawn_on;
 
 // -----------------------------------------------------------------------------
 // Platform Support

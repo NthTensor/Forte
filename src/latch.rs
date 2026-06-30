@@ -31,11 +31,12 @@ const ASLEEP: u32 = 0b100;
 // Latch
 
 /// A Latch is a signaling mechanism used to indicate when an event has
-/// occurred. The latch begins as *unset* (In the `LOCKED` state), and can later
-/// be *set* by any thread (entering the `SIGNAL`) state.
+/// occurred.
 ///
-/// Each latch is "owned" by a single thread at a time; other threads may set
-/// the latch, but only the owning thread may wait on it.
+/// The latch begins as *unset* (In the `LOCKED` state), and can later be *set*
+/// by any thread (entering the `SIGNAL`) state. Each latch is "owned" by a
+/// single thread at a time; other threads may set the latch, but only the
+/// owning thread may wait on it.
 ///
 /// The general idea and spirit for latches (as well as some of the
 /// documentation) is due to rayon. However the implementation is specific to
@@ -141,15 +142,16 @@ impl Latch {
         // First we store a reference to the semaphore (which is 'static) so
         // that we can access it even if the latch pointer becomes dangling.
         //
-        // SAFETY: The caller guarantees the latch pointer is aligned and non-null.
+        // SAFETY: The caller guarantees the latch pointer is aligned and
+        // non-null.
         //
         // If Variant 1 is met, the latch cannot be dangling.
         //
         // If Variant 2 is met, the latch cannot become dangling so long as the
-        // state is `LOCKED` (because `check` will return `Pending`). Since there
-        // can have been no previous call to `set` since construction or the
-        // last `reset`, and there can be no racing calls to `set`, the state
-        // must be `LOCKED`. Therefore the latch cannot be dangling.
+        // state is `LOCKED` (because `check` will return `Pending`). Since
+        // there can have been no previous call to `set` since construction or
+        // the last `reset`, and there can be no racing calls to `set`, the
+        // state must be `LOCKED`. Therefore the latch cannot be dangling.
         //
         // Since this pointer is aligned, non-null, is not dangling, and the
         // latch is never accessed mutably, it is valid to access immutably.
