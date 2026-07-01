@@ -14,6 +14,17 @@ This project is currently in early [pre-release], and there may be arbitrary bre
 
 ## [Unreleased]
 
+### Added
+
+- `Scope::spawn_on` as a scoped version of `Worker::spawn_on`
+- `Scope::spawn_local` as a scoped version of `Worker::spawn_local`
+
+### Changed
+
+- `Worker::spawn_on` now accepts a member number, and sends work to that thread.
+
+## [1.0.0-alpha.5]
+
 ### Added 
 
 - `Worker::spawn_local` for spawning `!Send` work.
