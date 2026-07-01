@@ -828,7 +828,7 @@ where
                     //
                     // NOTE: Eventually we may want to chose not to re-evaluate
                     // this sometimes, to break out of infinite async loops.
-                    this.schedule(Some(worker))
+                    this.schedule(Some(worker));
                 }
             }
             // The job panicked. Store the panic in the scope so it can be
