@@ -424,7 +424,7 @@ where
 {
     #[inline(always)]
     fn schedule(&self, job_ref: JobRef, worker: Option<&'w Worker>) {
-        self(job_ref, worker)
+        self(job_ref, worker);
     }
 }
 
