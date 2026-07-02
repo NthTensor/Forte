@@ -232,10 +232,14 @@ impl<'scope, 'env> Scope<'scope, 'env> {
         // operation.
         self.count.fetch_add(participants as u32, Ordering::Relaxed); // (*)
 
+        // The jobs can outlive this stack frame, so they cannot borrow `f`;
+        // they share ownership of it through an `Arc` instead.
+        let f = Arc::new(f);
+
         // Create a new job for each member
         let member_data = self.thread_pool.get_member_data();
         for (i, member_index) in members.iter_bits().enumerate() {
-            let func = &f;
+            let func = Arc::clone(&f);
             let scope = self;
             let op = move |worker: &Worker| {
                 // Run the job
@@ -251,6 +255,11 @@ impl<'scope, 'env> Scope<'scope, 'env> {
                 if let Err(err) = result {
                     scope.store_panic(err);
                 };
+                // Dropping the last handle drops `f`, whose drop glue may read
+                // `'scope` data. That data is only guaranteed to live until the
+                // scope's counter reaches zero, so the handle must be dropped
+                // before this job's count is removed.
+                drop(func);
                 // SAFETY: This corresponds to one of the increments performed in
                 // a batch with the `fetch_add` at the start of this function.
                 // It was incremented `p` times, and this will be called `p`
@@ -265,25 +274,30 @@ impl<'scope, 'env> Scope<'scope, 'env> {
             // * The `JobRef` will not outlive any of the items closed over by
             //   the `op`.
             //
-            //   The only non-copy captures are `scope: &'scope Scope` and
-            //   `func: &&F + 'scope`, so we must show that the `JobRef` will
-            //   not outlive `'scope`.
+            //   The captures of `op` are `i` and `participants` (both `Copy`),
+            //   `scope: &'scope Scope`, and `func: Arc<F>`.
             //
-            //   This is ensured via the scope's lifetime extension logic: we
-            //   incremented the scope's counter on the line marked with (*),
-            //   and we know the scope will not complete (extending the lifetime
-            //   of `'scope`) until there is a corresponding call to
-            //   `remove_reference()`.
+            //   The job owns `func`, so the `JobRef` cannot outlive it. The
+            //   `Arc` keeps the value `f` alive until the last handle is
+            //   dropped; each handle is dropped inside `op` when a job runs,
+            //   when this function's own handle goes out of scope, or leaks
+            //   along with an unexecuted `JobRef`.
             //
-            //   All `n` added references are not removed until the op has run
-            //   `n` times on `n` threads, so the `op` cannot outlive the data
-            //   it borrows.
+            //   The capture `scope`, and any `'scope` data borrowed by `f`,
+            //   are kept alive by the scope's lifetime extension logic: we
+            //   incremented the scope's counter once per job on the line
+            //   marked with (*), and the scope will not complete (extending
+            //   the lifetime of `'scope`) until there is a corresponding call
+            //   to `remove_reference()`. Each job holds its increment until
+            //   after it has called `func` and dropped its `Arc` handle, so
+            //   neither the `Scope` nor anything `f` borrows can be freed
+            //   while a job might still use (or drop) them.
             //
             // * If `op` is `!Send` then `JobRef::execute` will only be called
             //   on this thread.
             //
-            //   `op` is unconditionally `Send`. Since `F` and `Scope` are
-            //   `Sync,` the enclosed references `&Scope` and `&&F` are `Send`.
+            //   `op` is unconditionally `Send`: `F: Send + Sync` makes
+            //   `Arc<F>: Send`, and `Scope: Sync` makes `&Scope: Send`.
             let job_ref = unsafe { job.into_job_ref() };
             member_data.broadcasts[member_index].push(job_ref);
             member_data.semaphores[member_index].signal();
