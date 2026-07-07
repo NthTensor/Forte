@@ -1032,7 +1032,8 @@ impl Membership {
     ///
     /// # Panics
     ///
-    /// A panic within the closure will cause an abort. Panics within jobs run
+    /// If a panic occurs within the closure, it is captured and the worker is
+    /// safely torn down before the panic is re-emited. Panics within jobs run
     /// by this worker are passed to the pool's panic handler, as described in
     /// [`Worker::spawn`].
     #[inline(always)]
@@ -1051,19 +1052,8 @@ impl Membership {
             _phantom: PhantomData,
         };
 
-        // Panics inside this function cause aborts. I chose this policy because
-        // the alternative are:
-        //
-        // * To capture and forget panics. This is a memory-leak, which is not
-        //   acceptable.
-        //
-        // * To capture and drop panics. This can still cause an abort, and I
-        //   prefer consistant aborts to random ones.
-        //
-        // * To propagate the panic and continue unwinding the stack. While this
-        //   can be done safely, it may result in orphaned work (in particular
-        //   work created with `spawn_local`). This may cause deadlocks, which
-        //   is not acceptable.
+        // Guard against any unexpected panics, so that the pointer is not left
+        // dangling.
         let abort_guard = unwind::AbortOnDrop;
 
         // Swap the local pointer to point to the newly allocated worker.
@@ -1071,7 +1061,7 @@ impl Membership {
 
         // Run the function within the context created by the worker pointer,
         // and pass in a worker reference directly.
-        let result = f(&worker);
+        let result = unwind::halt_unwinding(|| f(&worker));
 
         // Indicate that we want to resign.
         worker
@@ -1143,9 +1133,12 @@ impl Membership {
         // The worker is fully torn down, so panics may unwind freely again.
         core::mem::forget(abort_guard);
 
-        // Return the intermediate values created while running the closure,
-        // namely the result and any jobs still remaining on the local queue.
-        result
+        // If the closure panicked, re-raise it now that teardown is complete so
+        // that it propagates to the caller. Otherwise return its result.
+        match result {
+            Ok(result) => result,
+            Err(panic) => unwind::resume_unwinding(panic),
+        }
     }
 
     /// Returns a reference to the push-side `Sharer` queue for this
