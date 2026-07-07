@@ -842,30 +842,19 @@ where
                 // schedule it again. This will only fail if the job was woken
                 // while running, and is already in the WOKEN state.
                 //
-                // If successful, this effectively releases our exclusive
-                // ownership of the future.
+                // If successful, this releases our exclusive ownership of the
+                // future and synchronizes with the `Acquire` swap at the start
+                // of this function. This establishes a "happens before"
+                // relaationship with each poll of the future.
                 let rescheduled = this
                     .state
                     .compare_exchange(
                         LOCKED,
                         READY,
-                        Ordering::Relaxed,
+                        Ordering::Release,
                         Ordering::Relaxed,
                     )
                     .is_err();
-                // Emit a fence here, which synchronizes with the `Acquire` swap
-                // at the start of this function to ensure that the next thread
-                // to poll this future will observe the most recent version of
-                // it.
-                //
-                // A fence is required here because the write to `state` that
-                // establishes the happens-before relationship may be caused by
-                // either (a) the `compare_exchange` call above, or (b) the
-                // `swap` call in `wake`.
-                //
-                // This fence lets `wake` use `Relaxed` ordering, and upgrades
-                // it to `Release` only when necessary.
-                fence(Ordering::Release);
                 // If the job was woken while running, it should be queued
                 // immediately. Conveniently, we know the state will already be
                 // WOKEN, so we can leave it as it is.
