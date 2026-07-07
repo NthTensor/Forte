@@ -27,6 +27,13 @@ use crate::unwind;
 /// to be executed, and a function pointer that is capable of executing it.
 ///
 /// It is analogous to the chili type `JobShared` or the rayon type `JobRef`.
+///
+/// # Panics
+///
+/// Execute functions must never allow panics to unwind out of
+/// `JobRef::execute`; this is a safety requirement of [`JobRef::new`]. Panics
+/// must be caught and either handed to the pool's panic handler or re-emitted
+/// when it is safe to do so.
 pub struct JobRef {
     /// A non-null pointer to some type-erased data which can be executed as a
     /// job by the `execute_fn`. This will usually point to either an instance
@@ -44,9 +51,12 @@ impl JobRef {
     ///
     /// # Safety
     ///
-    /// The caller must ensure that `JobRef::execute` will only called on the
-    /// returned `JobRef` when it would be sound to call `execute_fn` on
-    /// `job_pointer`.
+    /// The caller must ensure that:
+    ///
+    /// * `JobRef::execute` will only be called on the returned `JobRef` when
+    ///   it would be sound to call `execute_fn` on `job_pointer`.
+    ///
+    /// * `execute_fn` will not unwind when called on `job_pointer`.
     #[inline(always)]
     pub unsafe fn new(
         job_pointer: NonNull<()>,
@@ -295,6 +305,12 @@ where
         //   The caller ensures only one `JobRef` is ever created for this
         //   `StackJob`. Since `JobRef::execute` consumes that `JobRef`, it
         //   cannot be called multiple times.
+        //
+        // `JobRef::new` also requires that the execute function not unwind.
+        // `StackJob::execute` never unwinds: it catches panics from the
+        // closure (recording them in the latch, to be re-thrown by whoever
+        // waits on it), and holds an abort guard while it runs, which turns
+        // any other panic into an abort.
         unsafe { JobRef::new(job_pointer, Self::execute) }
     }
 
@@ -489,8 +505,12 @@ where
     F: FnOnce(&Worker),
 {
     /// Allocates a new `HeapJob` on the heap.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that the function `f` does not unwind.
     #[inline(always)]
-    pub fn new(f: F) -> Box<Self> {
+    pub unsafe fn new(f: F) -> Box<Self> {
         Box::new(HeapJob { f })
     }
 
@@ -540,6 +560,9 @@ where
         // * Accessing `f` will not violate a `!Send` requirement.
         //
         //   This is ensured by the executability condition.
+        //
+        // `JobRef::new` also requires that the execute function not unwind.
+        // This is left to the caller of `HeapJob::new` to ensure.
         unsafe { JobRef::new(job_pointer, Self::execute) }
     }
 

@@ -242,7 +242,7 @@ impl<'scope, 'env> Scope<'scope, 'env> {
             let func = Arc::clone(&f);
             let scope = self;
             let op = move |worker: &Worker| {
-                // Run the job
+                // Run an instance of the job job.
                 let result = unwind::halt_unwinding(|| {
                     func(Broadcast {
                         worker,
@@ -259,7 +259,13 @@ impl<'scope, 'env> Scope<'scope, 'env> {
                 // `'scope` data. That data is only guaranteed to live until the
                 // scope's counter reaches zero, so the handle must be dropped
                 // before this job's count is removed.
-                drop(func);
+                //
+                // Because `f` is user code its drop glue may also panic. The
+                // panic is caught and stored on the scope so that it cannot
+                // unwind out of this job.
+                if let Err(err) = unwind::halt_unwinding(|| drop(func)) {
+                    scope.store_panic(err);
+                }
                 // SAFETY: This corresponds to one of the increments performed in
                 // a batch with the `fetch_add` at the start of this function.
                 // It was incremented `p` times, and this will be called `p`
@@ -267,7 +273,10 @@ impl<'scope, 'env> Scope<'scope, 'env> {
                 unsafe { scope.remove_reference() };
             };
 
-            let job = HeapJob::new(op);
+            // SAFETY: `HeapJob::new` may only be passed functions that do not
+            // unwind. The function `op` catches panics from the broadcast
+            // operation `func`, and makes no other calls that can panic.
+            let job = unsafe { HeapJob::new(op) };
 
             // SAFETY: `HeapJob::into_job_ref` requires:
             //
@@ -346,14 +355,15 @@ impl<'scope, 'env> Scope<'scope, 'env> {
     /// Stores a panic so that it can be propagated when the scope is complete.
     /// If called multiple times, only the first panic is stored, and the
     /// remainder are dropped.
+    ///
+    /// This function never unwinds, but may abort in circumstances.
     #[cold]
     fn store_panic(&self, err: Box<dyn Any + Send + 'static>) {
+        // Create an abort guard that will prevent this function from unwinding.
+        let abort_guard = AbortOnDrop;
         // Check if the panic pointer has already been set. This lets us avoid
         // allocating a second time, and means we can immediately drop the panic
         // we have just been passed.
-        //
-        // Dropping this panic may itself trigger a panic, but this will simply
-        // trigger the scope's abort guard, causing an abort rather than UB.
         if self.panic.load(Ordering::Relaxed).is_null() {
             let nil = ptr::null_mut();
             let err_ptr = Box::into_raw(Box::new(err));
@@ -366,7 +376,7 @@ impl<'scope, 'env> Scope<'scope, 'env> {
             // If the write fails, another panic must have already occurred, and
             // we don't need to synchronize memory (the previous call to
             // `store_panic` handles the synchronization for it's panic data).
-            if self
+            if !self
                 .panic
                 .compare_exchange(
                     nil,
@@ -376,17 +386,22 @@ impl<'scope, 'env> Scope<'scope, 'env> {
                 )
                 .is_ok()
             {
-                // Ownership is now transferred into the panic field.
-            } else {
-                // Another panic raced in ahead of us, so we need to drop this one.
+                // Another panic raced in ahead of us, so we need to drop this
+                // error. Dropping the payload may itself panic, but this will
+                // trigger the abort guard instead of unwinding.
                 //
-                // SAFETY: This was created by `Box::into_raw` just above. It is
-                // possible that this will panic, because it's a `Box<dyn Any>`,
-                // however in the worst case this will simply trigger the
-                // scope's abort guard, causing an abort rather than UB.
-                let _: Box<_> = unsafe { Box::from_raw(err_ptr) };
+                // SAFETY: This was created by `Box::into_raw` just above.
+                let err = unsafe { Box::from_raw(err_ptr) };
+                drop(err);
             }
+        } else {
+            // A panic is already stored, so this payload is dropped. Dropping
+            // it may itself panic, but this will trigger the abort guard
+            // instead of unwinding.
+            drop(err);
         }
+        // At this point we can allow panics to unwind again.
+        core::mem::forget(abort_guard);
     }
 
     /// Propagates any panic captured while the scope was executing.
@@ -495,15 +510,21 @@ where
     ) {
         // Create a job to execute the spawned function in the scope.
         let scope_ptr = ScopePtr::new(scope);
-        let job = HeapJob::new(move |worker| {
+
+        // Create the spawned operation
+        let op = move |worker: &Worker| {
             // Catch any panics and store them on the scope.
             let result = unwind::halt_unwinding(|| self(worker));
             if let Err(err) = result {
                 scope_ptr.store_panic(err);
             };
             drop(scope_ptr);
-        });
+        };
 
+        // SAFETY: `HeapJob::new` may only be called with functions that do not
+        // unwind. The function `op` uses `halt_unwinding` to ensure this is the
+        // case.
+        let job = unsafe { HeapJob::new(op) };
         // SAFETY: `HeapJob::into_job_ref` requires:
         //
         // * The `JobRef` will not outlive any of the items closed over by
@@ -680,6 +701,9 @@ where
         //   `job_pointer` without decrementing it. Therefore, when `execute`
         //   is called, there will still be a strong reference for it to
         //   consume.
+        //
+        // `JobRef::new` also requires that `poll` not unwind. See the
+        // doc-comment for `poll` for an argument as to why this is the case.
         unsafe { JobRef::new(job_pointer, Self::poll) }
     }
 
@@ -703,6 +727,12 @@ where
     }
 
     /// Polls the future.
+    ///
+    /// # Panics
+    ///
+    /// This function does not unwind. Panics that occur while running the job
+    /// are caught with `catch_unwind` and stored on the scope. Other panics,
+    /// such as those emited by drop-glue, may cause aborts.
     ///
     /// # Safety
     ///
@@ -796,11 +826,15 @@ where
         let result = unwind::halt_unwinding(|| future.poll(&mut cx));
 
         // Update the job state depending on the outcome of polling the future.
+        //
+        // Out of an abundance of causion, we add an abort guard here.
+        let abort_guard = AbortOnDrop;
         match result {
             // The job completed without panicking.
             Ok(Poll::Ready(())) => {
                 // Drop the job without rescheduling it, leaving it in the
                 // LOCKED or WOKEN state so that it cannot be rescheduled.
+                drop(this);
             }
             // The job is still pending, and has not yet panicked.
             Ok(Poll::Pending) => {
@@ -843,20 +877,27 @@ where
                     // NOTE: Eventually we may want to chose not to re-evaluate
                     // this sometimes, to break out of infinite async loops.
                     this.schedule(Some(worker));
+                } else {
+                    drop(this);
                 }
             }
             // The job panicked. Store the panic in the scope so it can be
             // resumed later.
-            Err(err) => this.scope_ptr.store_panic(err),
+            Err(err) => {
+                this.scope_ptr.store_panic(err);
+                drop(this);
+            }
         }
+        core::mem::forget(abort_guard);
 
-        // At this point, if we have not converted `this` into a job-ref and
-        // queued it, it will be dropped. If no wakers for this task are being
-        // held, then this will cause the reference counter to decrement to zero
-        // and free the task.
+        // In the branches above where the task is dropped (rather than
+        // converted into a job-ref and queued), the drop decrements the
+        // reference count, freeing the task if no wakers for it are being
+        // held.
         //
-        // The alternative, if there are no wakers being held for the task, is
-        // that the task will never wake and the scope will deadlock.
+        // I view this as preferable to the alternative if there are no wakers
+        // being held for the task the task will never wake and the scope will
+        // wait for it's latch indefinetly, and deadlock.
     }
 
     /// Creates a new `RawWaker` from the provided pointer.

@@ -1,7 +1,9 @@
 //! This module contains the api and worker logic for the Forte thread pool.
 
+use alloc::boxed::Box;
 use alloc::format;
 use alloc::vec::Vec;
+use core::any::Any;
 use core::array;
 use core::borrow::Borrow;
 use core::cell::Cell;
@@ -15,6 +17,8 @@ use core::ptr;
 use core::ptr::NonNull;
 use core::task::Context;
 use core::task::Poll;
+use std::eprintln;
+use std::process::abort;
 
 use async_task::Runnable;
 use crossbeam_queue::SegQueue;
@@ -90,7 +94,14 @@ pub struct ThreadPool {
     /// Holds controls for threads spawned and managed by the pool. Initialized
     /// on first call to `activate`, to allow for some non-static constructors.
     managed_workers: Mutex<Vec<ManagedWorker>>,
+    /// Called with the payload of panics that have nowhere to propagate (see
+    /// [`ThreadPool::handle_panic`]).
+    panic_handler: Mutex<Option<PanicHandler>>,
 }
+
+/// The type of the callback registered by [`ThreadPool::set_panic_handler`].
+pub type PanicHandler =
+    Box<dyn Fn(Box<dyn Any + Send>) + Send + Sync + 'static>;
 
 /// A public interface that can be temporarily claimed and used by a thread.
 /// Claiming a seat allows a thread to participate in the thread pool as a
@@ -173,7 +184,56 @@ impl ThreadPool {
             waiting_bitmask: CachePadded::new(AtomicU32::new(0)),
             wants_to_resign: CachePadded::new(AtomicU32::new(0)),
             managed_workers: Mutex::new(Vec::new()),
+            panic_handler: Mutex::new(None),
         }
+    }
+
+    /// Registers a callback to be invoked (via [`handle_panic`]) with the
+    /// payload of panics that have nowhere to propagate, such as panics from
+    /// closures or futures passed to [`spawn`]. This replaces any previously
+    /// registered handler.
+    ///
+    /// If no handler is registered, such panics abort the process.
+    ///
+    /// The handler must not panic; if it does, the process aborts.
+    ///
+    /// [`handle_panic`]: ThreadPool::handle_panic
+    /// [`spawn`]: ThreadPool::spawn
+    pub fn set_panic_handler<H>(&self, handler: H)
+    where
+        H: Fn(Box<dyn Any + Send>) + Send + Sync + 'static,
+    {
+        let handler = Box::new(handler);
+        *self.panic_handler.lock().unwrap() = Some(handler);
+    }
+
+    /// Disposes of a panic payload that has nowhere to propagate, by passing it
+    /// to the thread pool handler. If no handler is registered, this aborts the
+    /// process.
+    ///
+    /// # Panics
+    ///
+    /// This function never unwinds; if the handler (or anything else within
+    /// this function) panics, the process aborts.
+    pub fn handle_panic(&self, payload: Box<dyn Any + Send>) {
+        // Jobs call this function to discharge the `JobRef::new` requirement
+        // that they never unwind, so nothing in this function may panic: any
+        // panic (from the handler, a poisoned lock, or the write to stderr)
+        // is converted into an abort.
+        let abort_guard = unwind::AbortOnDrop;
+        {
+            let handler = self.panic_handler.lock().unwrap();
+            match handler.as_ref() {
+                Some(handler) => handler(payload),
+                None => {
+                    eprintln!(
+                        "Forte: job panicked with no panic handler set; aborting"
+                    );
+                    abort();
+                }
+            }
+        }
+        core::mem::forget(abort_guard);
     }
 
     /// Returns an opaque identifier for this thread pool.
@@ -384,6 +444,11 @@ impl ThreadPool {
     ///
     /// Note: If the thread pool is full (it already has 32 active members) this
     /// waits for a vacancy before returning.
+    ///
+    /// # Panics
+    ///
+    /// Panics that propagate out of the closure may cause aborts, if this call
+    /// registered this thread as a temporary member of the pool.
     #[inline(always)]
     pub fn with_worker<F, R>(&'static self, func: F) -> R
     where
@@ -496,7 +561,16 @@ where
         S: for<'w> Scheduler<'w> + 'static,
     {
         // Allocate a new job on the heap to store the closure.
-        let job = HeapJob::new(self);
+        let op = move |worker: &Worker| {
+            // Panics may not unwind out of the job, so are sent to the thread
+            // pool's handler.
+            if let Err(payload) = unwind::halt_unwinding(|| self(worker)) {
+                worker.thread_pool.handle_panic(payload);
+            }
+        };
+
+        // SAFETY: `op` cannot not unwind.
+        let job = unsafe { HeapJob::new(op) };
 
         // Turn the job into an "owning" `JobRef` so it can be queued.
         //
@@ -530,7 +604,7 @@ where
 /// * If the `Runnable` was created for a `!Send` future, this must only be
 ///   called on the thread where the `Runnable` was created.
 #[inline(always)]
-unsafe fn execute_runnable(this: NonNull<()>, _worker: &Worker) {
+unsafe fn execute_runnable(this: NonNull<()>, worker: &Worker) {
     // SAFETY: `Runnable::from_raw` must be given a pointer produced by
     // `Runnable::into_raw` that has not already been consumed by a `from_raw`.
     //
@@ -539,7 +613,13 @@ unsafe fn execute_runnable(this: NonNull<()>, _worker: &Worker) {
     let runnable = unsafe { Runnable::<()>::from_raw(this) };
     // Poll the task. This will drop the future if the task is
     // canceled or the future completes.
-    runnable.run();
+    //
+    // A panic from the future propagates out of `run`, has nowhere else to
+    // propagate, and must not unwind into the executing worker, so it is
+    // caught and passed to the pool's panic handler.
+    if let Err(payload) = unwind::halt_unwinding(|| runnable.run()) {
+        worker.thread_pool.handle_panic(payload);
+    }
 }
 
 impl<Fut, T> Spawn<FutureMarker> for Fut
@@ -949,6 +1029,12 @@ impl Membership {
     ///
     /// Rust's thread locals are fairly costly, so this function is expensive.
     /// If you can avoid calling it, do so.
+    ///
+    /// # Panics
+    ///
+    /// A panic within the closure will cause an abort. Panics within jobs run
+    /// by this worker are passed to the pool's panic handler, as described in
+    /// [`Worker::spawn`].
     #[inline(always)]
     pub fn activate<F, R>(self, f: F) -> R
     where
@@ -964,6 +1050,21 @@ impl Membership {
             last_promote_tick: Cell::new(0),
             _phantom: PhantomData,
         };
+
+        // Panics inside this function cause aborts. I chose this policy because
+        // the alternative are:
+        //
+        // * To capture and forget panics. This is a memory-leak, which is not
+        //   acceptable.
+        //
+        // * To capture and drop panics. This can still cause an abort, and I
+        //   prefer consistant aborts to random ones.
+        //
+        // * To propagate the panic and continue unwinding the stack. While this
+        //   can be done safely, it may result in orphaned work (in particular
+        //   work created with `spawn_local`). This may cause deadlocks, which
+        //   is not acceptable.
+        let abort_guard = unwind::AbortOnDrop;
 
         // Swap the local pointer to point to the newly allocated worker.
         let outer_ptr = WORKER_PTR.with(|ptr| ptr.replace(&worker));
@@ -1038,6 +1139,9 @@ impl Membership {
 
         // Swap back to pointing to the previous value (possibly null).
         WORKER_PTR.with(|ptr| ptr.set(outer_ptr));
+
+        // The worker is fully torn down, so panics may unwind freely again.
+        core::mem::forget(abort_guard);
 
         // Return the intermediate values created while running the closure,
         // namely the result and any jobs still remaining on the local queue.
@@ -1181,9 +1285,10 @@ impl Worker {
             // pointer to a `Worker`. It is only written to by
             // `Membership::activate`, which stores the address of a `Worker`
             // allocated within it's own stack frame. Before it returns,
-            // `activate` restores the previous value of `WORKER_PTR`, so that
-            // it is always either null or points to a live, immovable `Worker`
-            // on the current thread's call stack (but is never left dangling).
+            // `activate` restores the previous value of `WORKER_PTR` (and it
+            // aborts on panic, so this reset is guaranteed to occur). So the
+            // `WORKER_PTR` is either null or pointer to a live, immovable
+            // `Worker`.
             //
             // If the pointer is non-null, it is therefore valid to dereference
             // as a shared reference. Forming a `'static` reference is avoided
@@ -1210,10 +1315,11 @@ impl Worker {
             // SAFETY: `WORKER_PTR` is a thread-local `Cell` holding a raw
             // pointer to a `Worker`. It is only written to by
             // `Membership::activate`, which stores the address of a `Worker`
-            // allocated within its own stack frame. Before it returns,
-            // `activate` restores the previous value of `WORKER_PTR`, so that
-            // it is always either null or points to a live, immovable `Worker`
-            // on the current thread's call stack (but is never left dangling).
+            // allocated within it's own stack frame. Before it returns,
+            // `activate` restores the previous value of `WORKER_PTR` (and it
+            // aborts on panic, so this reset is guaranteed to occur). So the
+            // `WORKER_PTR` is either null or pointer to a live, immovable
+            // `Worker`
             //
             // If the pointer is non-null, it is therefore sound to dereference
             // as a shared reference. Forming a `'static` reference is avoided
@@ -1294,9 +1400,11 @@ impl Worker {
             // runner's fifo queue when executed.
             //
             // This reduces the cost of sharing a large number of small jobs.
-            let batch_job = HeapJob::new(move |worker| {
+            let op = move |worker: &Worker| {
                 worker.fifo_queue.append(job_refs);
-            });
+            };
+            // SAFETY: `op` cannot unwind.
+            let batch_job = unsafe { HeapJob::new(op) };
             // SAFETY: `HeapJob::into_job_ref` requires:
             //
             // * The data closed over by the `HeapJob` outlives the `JobRef`.
@@ -1354,6 +1462,9 @@ impl Worker {
     ///
     /// The thread may go to sleep if it runs out of work to do, but will wake
     /// when the latch is set or more work becomes available.
+    ///
+    /// This function does not panic: jobs never allow panics from user code
+    /// to escape their execution (see the panic convention on `JobRef`).
     #[inline(always)]
     pub fn wait_for(&self, latch: &Latch) -> bool {
         loop {
@@ -1509,9 +1620,16 @@ impl Worker {
     /// before the job runs, then swaps it back to what it was before.
     #[inline(always)]
     fn execute(&self, job_ref: JobRef, migrated: bool) {
+        // We restore the flag in a drop guard in case `job_ref.execute` panics.
+        struct RestoreFlag<'a>(&'a Cell<bool>, bool);
+        impl Drop for RestoreFlag<'_> {
+            fn drop(&mut self) {
+                self.0.set(self.1);
+            }
+        }
         let outer_migrated = self.migrated.replace(migrated);
+        let _restore = RestoreFlag(&self.migrated, outer_migrated);
         job_ref.execute(self);
-        self.migrated.set(outer_migrated);
     }
 }
 
@@ -1540,10 +1658,14 @@ impl Worker {
     ///
     /// The panic behavior depends on the type of work being spawned:
     ///
-    /// * If a closure panics, it will be caught and ignored.
+    /// * If a closure panics, the panic has nowhere to propagate, so it is
+    ///   caught and passed to the pool's panic handler (see
+    ///   [`ThreadPool::set_panic_handler`]). If no handler is set, the
+    ///   process aborts.
     ///
-    /// * If a future panics, the [`Task`] will panic when awaited.
-    ///
+    /// * If a future panics, the panic is likewise passed to the panic
+    ///   handler. Awaiting the [`Task`] will then also panic, though not
+    ///   with the original payload.
     #[inline]
     pub fn spawn<M, S>(&self, work: S) -> S::Output
     where
@@ -1591,12 +1713,8 @@ impl Worker {
     ///
     /// # Panics
     ///
-    /// The panic behavior depends on the type of work being spawned:
-    ///
-    /// * If a closure panics, it will be caught and ignored.
-    ///
-    /// * If a future panics, the [`Task`] will panic when awaited.
-    ///
+    /// Panics are passed to the pool's panic handler, as described in
+    /// [`spawn`](Worker::spawn).
     #[inline]
     pub fn spawn_local<M, S>(&self, work: S) -> S::Output
     where
@@ -1807,6 +1925,10 @@ impl Worker {
     /// only the panic from the first argument is propagated and the panic from
     /// the other argument is dropped (this may cause program aborts in some
     /// situations).
+    ///
+    /// Unrelated jobs executed while `join` waits may also panic; those
+    /// panics are passed to the pool's panic handler (see
+    /// [`ThreadPool::set_panic_handler`]) and are never re-thrown by `join`.
     #[inline(always)]
     pub fn join<A, B, RA, RB>(&self, a: A, b: B) -> (RA, RB)
     where
@@ -1840,17 +1962,30 @@ impl Worker {
         //   If `recover_newest` returns `true`, then the `JobRef` must have
         //   been dropped without `execute` being called (satisfying B).
         //
-        //   If `recover_newest` returns `false`, then we call `wait_for`, which
-        //   will not allow the function to progress until `check` returns
-        //   something other than `Pending` (satisfying A).
+        //   If `recover_newest` returns `false`, then we call `wait_for`,
+        //   which will not allow the function to progress until `check`
+        //   returns something other than `Pending` (satisfying A).
         //
-        //   In either case, we cannot move or drop the `StackJob` until we pass
-        //   the branch marked with "(*)". We clearly do not.
+        //   In either case, we cannot move or drop the `StackJob` -- by
+        //   returning or by unwinding -- until we pass the branch marked with
+        //   "(*)". We clearly do not return early, and unwinding is ruled out
+        //   by the abort guard held from before the `JobRef` is pushed until
+        //   after that branch: a panic that would unwind this frame in that
+        //   region aborts the process instead. (Jobs executed while waiting
+        //   never allow panics to escape their execution -- see the panic
+        //   convention on `JobRef` -- so only unexpected panics can trip the
+        //   guard.)
         let job_ref = unsafe { stack_job.as_job_ref() };
 
         // Store the id of the `JobRef` for later, when we will need it to
         // safely recover the closure `a` for inline execution.
         let job_ref_id = job_ref.id();
+
+        // Once the job is pushed, other threads may hold references to
+        // `stack_job` until we pass the branch marked with "(*)". A panic
+        // must not unwind this frame in that region (see the safety comment
+        // above), so it aborts the process instead.
+        let abort_guard = unwind::AbortOnDrop;
 
         // Push the job onto the queue.
         self.lifo_queue.push_new(job_ref);
@@ -1891,6 +2026,10 @@ impl Worker {
                 result_a = Ok(output);
             }
         }
+
+        // The stack job was either recovered or completed, so panics may
+        // unwind freely again.
+        core::mem::forget(abort_guard);
 
         // Resume unwinding if either job panicked.
         match (result_a, result_b) {
@@ -2135,6 +2274,11 @@ impl Worker {
     /// If the operation panics on one or more threads, exactly one panic will
     /// be propagated, only after all threads have completed (or themselves
     /// panicked).
+    ///
+    /// Unrelated jobs executed while `broadcast` waits may also panic; those
+    /// panics are passed to the pool's panic handler (see
+    /// [`ThreadPool::set_panic_handler`]) and are never re-thrown by
+    /// `broadcast`.
     #[inline(always)]
     pub fn broadcast<F, T>(&self, f: F) -> Vec<T>
     where
@@ -2163,6 +2307,12 @@ impl Worker {
             })
             .collect();
 
+        // Once the jobs are sent, other threads hold references into `jobs`
+        // until every latch is set. A panic must not unwind this frame in
+        // that region (see the safety comment below), so it aborts the
+        // process instead.
+        let abort_guard = unwind::AbortOnDrop;
+
         // Send the broadcast to each member, and wake them up.
         for (member_index, job) in &jobs {
             // SAFETY: We are only allowed to create a `JobRef` for this
@@ -2181,8 +2331,15 @@ impl Worker {
             //
             //   We call `wait_for` on each job's latch (marked with a *). This
             //   does not allow the function to progress while `check` returns
-            //   `Pending`. No `StackJob` is moved or dropped until after this
-            //   function has been called on every `StackJob` and returned.
+            //   `Pending`, and control cannot leave this function -- by
+            //   returning or by unwinding -- before it has been called on
+            //   every `StackJob` and returned: unwinding is ruled out by the
+            //   abort guard held until every latch is set, which turns a
+            //   panic that would unwind this frame into an abort. (Jobs
+            //   executed while waiting never allow panics to escape their
+            //   execution -- see the panic convention on `JobRef` -- so only
+            //   unexpected panics can trip the guard.) No `StackJob` is moved
+            //   or dropped before then.
             let job_ref = unsafe { job.as_job_ref() };
             self.member_data.broadcasts[*member_index].push(job_ref);
             self.member_data.semaphores[*member_index].signal();
@@ -2193,6 +2350,9 @@ impl Worker {
             .iter()
             .map(|(_, job)| self.wait_for(job.completion_latch())) // (*)
             .collect();
+
+        // Every stack job is now complete, so panics may unwind freely again.
+        core::mem::forget(abort_guard);
 
         // Allow workers to leave the pool again.
         self.thread_pool.unfreeze_membership();
@@ -2224,7 +2384,8 @@ impl Worker {
     ///
     /// # Panics
     ///
-    /// Panics are not propagated.
+    /// Panics in the operation are passed to the pool's panic handler, as
+    /// described in [`Worker::spawn`].
     #[inline(always)]
     pub fn spawn_broadcast<F>(&self, f: F)
     where
@@ -2253,16 +2414,25 @@ impl Worker {
         // Send the broadcast to each member, and wake them up.
         for (i, member_index) in members.iter_bits().enumerate() {
             let func = Arc::clone(&f);
+            // Run the operation. A panic from it has nowhere to propagate,
+            // and must not unwind into the executing worker, so it is caught
+            // and passed to the pool's panic handler.
             let op = move |worker: &Worker| {
-                // Run the job
-                (*func)(Broadcast {
-                    worker,
-                    index: i,
-                    participants,
+                let result = unwind::halt_unwinding(|| {
+                    (*func)(Broadcast {
+                        worker,
+                        index: i,
+                        participants,
+                    });
                 });
+                if let Err(payload) = result {
+                    worker.thread_pool.handle_panic(payload);
+                }
             };
 
-            let job = HeapJob::new(op);
+            // SAFETY: `op` cannot unwind. All user code is wrapped in
+            // `halt_unwinding` and `handle_panic` does not unwind.
+            let job = unsafe { HeapJob::new(op) };
 
             // SAFETY: `HeapJob::into_job_ref` has two preconditions:
             //
@@ -2276,8 +2446,12 @@ impl Worker {
             // * If `F: !Send` then the `JobRef` must only be executed on this
             //   thread.
             //
-            //   `op` is `Send` (`Arc<F>: Send` because `F: Send + Sync`), so
-            //   this does not apply.
+            //   The `op` is `Send`, so this does not apply.
+            //
+            // * The function `op` must not unwind.
+            //
+            //   `op` catches panics from the broadcast operation and passes
+            //   them to `ThreadPool::handle_panic`, which never unwinds.
             let job_ref = unsafe { job.into_job_ref() };
             self.member_data.broadcasts[member_index].push(job_ref);
             self.member_data.semaphores[member_index].signal();
