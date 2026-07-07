@@ -629,7 +629,12 @@ struct ScopeFutureJob<'scope, 'env, S: for<'w> Scheduler<'w>, Fut> {
     /// to allow mutable access within an `Arc<T>`. The `state` field acts as a
     /// kind of mutex that ensures exclusive access by preventing the job from
     /// being queued or executed multiple times simultaneously.
-    future: UnsafeCell<Fut>,
+    ///
+    /// The future is wrapped in `ManuallyDrop` so the `Arc`'s drop glue never
+    /// runs its destructor. That lets a waker free the allocation on any thread
+    /// while `poll` remains the sole place the future is dropped, on its
+    /// confined thread.
+    future: UnsafeCell<ManuallyDrop<Fut>>,
     /// A scope pointer. This allows the job to interact with the scope, and
     /// also keeps the scope alive until the job is dropped.
     scope_ptr: ScopePtr<'scope, 'env>,
@@ -662,7 +667,7 @@ where
     ) -> Arc<Self> {
         let scope_ptr = ScopePtr::new(scope);
         Arc::new(Self {
-            future: UnsafeCell::new(future),
+            future: UnsafeCell::new(ManuallyDrop::new(future)),
             scope_ptr,
             // The job starts in the WOKEN state because we always queue it
             // after creating it.
@@ -770,7 +775,10 @@ where
         //   resources from being freed.
         //
         // * `drop` decrements the reference count, potentially allowing the job
-        //    to be freed.
+        //    to be freed. A waker is `Send`, so this may run on any thread, but
+        //    freeing the job does not run the future's destructor (it is
+        //    `ManuallyDrop`, dropped only by `poll` on the confined thread); the
+        //    remaining fields are `Send`, so freeing anywhere is sound.
         //
         let waker = unsafe { ManuallyDrop::new(Waker::from_raw(raw_waker)) };
 
@@ -819,7 +827,7 @@ where
         //
         //   The future does not move, because it is stored in a field within an
         //   `Arc`, which has a stable heap-allocated address.
-        let future = unsafe { Pin::new_unchecked(&mut *this.future.get()) };
+        let future = unsafe { Pin::new_unchecked(&mut **this.future.get()) };
 
         // Create a new context from the waker, and poll the future.
         let mut cx = Context::from_waker(&waker);
@@ -832,8 +840,11 @@ where
         match result {
             // The job completed without panicking.
             Ok(Poll::Ready(())) => {
-                // Drop the job without rescheduling it, leaving it in the
-                // LOCKED or WOKEN state so that it cannot be rescheduled.
+                // Drop the future here, on its confined thread. State stays
+                // LOCKED, so it is never re-polled and this runs once.
+                //
+                // SAFETY: The LOCKED state gives us exclusive access.
+                unsafe { ManuallyDrop::drop(&mut *this.future.get()) };
                 drop(this);
             }
             // The job is still pending, and has not yet panicked.
@@ -874,6 +885,11 @@ where
             // resumed later.
             Err(err) => {
                 this.scope_ptr.store_panic(err);
+                // Drop the future here, on its confined thread; see the Ready
+                // branch.
+                //
+                // SAFETY: The LOCKED state gives us exclusive access.
+                unsafe { ManuallyDrop::drop(&mut *this.future.get()) };
                 drop(this);
             }
         }
