@@ -16,7 +16,6 @@ use core::mem::ManuallyDrop;
 use core::ptr::NonNull;
 
 use crate::latch::Latch;
-use crate::platform::*;
 use crate::thread_pool::Worker;
 use crate::unwind;
 
@@ -357,13 +356,16 @@ where
     /// `Ok`.
     #[inline(always)]
     pub unsafe fn unwrap_output(mut self) -> T {
-        // Synchronize with the fence in `StackJob::execute`, establishing a
-        // happens-after relationship with the following read.
-        fence(Ordering::Acquire);
         // SAFETY: We have exclusive access to the active union field `output`.
         // We take `self` by value, so no other `unwrap_*` method can also hold
         // it, and `check` returned `Ok`, so `execute` ran. Since `execute` runs
         // at most once, it is no longer running and cannot alias `data`.
+        //
+        // The caller has observed `check` return `Ok`. This performs an
+        // `Acquire` load, which synchronizes with the `Release` store in the
+        // `Latch::set` call inside `execute`. Since `execute` writes the
+        // `output` field before that store, that write must happen-before this
+        // read. So there can be no data-race on this load.
         //
         // `output` is the active variant because `check` returning `Ok` means
         // `execute` called `set` with `error_flag == false`, which always
@@ -383,13 +385,16 @@ where
     /// `Error`.
     #[inline(always)]
     pub unsafe fn unwrap_error(mut self) -> Box<dyn Any + Send> {
-        // Synchronize with the fence in `StackJob::execute`, establishing a
-        // happens-after relationship with the following read.
-        fence(Ordering::Acquire);
         // SAFETY: We have exclusive access to the active union field `error`.
         // We take `self` by value, so no other `unwrap_*` method can also hold
         // it, and `check` returned `Error`, so `execute` ran. Since `execute`
         // runs at most once, it is no longer running and cannot alias `data`.
+        //
+        // The caller has observed `check` return `Error`. This performs an
+        // `Acquire` load, which synchronizes with the `Release` store in the
+        // `Latch::set` call inside `execute`. Since `execute` writes the
+        // `error` field before that store, that write must happen-before this
+        // read. So there can be no data-race on this load.
         //
         // `error` is the active variant because `check` returning `Error` means
         // `execute` called `set` with `error_flag == true`, which always
@@ -457,13 +462,10 @@ where
                 }
             }
         };
-        // This synchronizes with the `Acquire` fence within `unwrap_output` /
-        // `unwrap_error`, establishing a happens-before relationship that makes
-        // the preceding write to the `output`/`error` union field visible to
-        // the reader.
+        // This publishes the write of the `data` field with a `Release` store.
+        // Any following caller of `check` that observes a signal will
+        // thereafter be able to load the `data` field without a race.
         //
-        // This is required because latches do not synchronize memory.
-        fence(Ordering::Release);
         // SAFETY: This casts a reference to a raw pointer, which means the
         // pointer must be aligned, non-null, and point to an initialized latch.
         //

@@ -13,7 +13,7 @@ use crate::platform::*;
 // States
 
 /// The default state of a latch is `LOCKED`. When in the locked state, `check`
-/// returns `false` and `wait` blocks.
+/// returns `Pending` and `wait` blocks.
 const LOCKED: u32 = 0b000;
 
 /// The latch enters the `SIGNAL` state when it is set (with error flag false).
@@ -36,7 +36,7 @@ const ASLEEP: u32 = 0b100;
 /// The latch begins as *unset* (In the `LOCKED` state), and can later be *set*
 /// by any thread (entering the `SIGNAL`) state. Each latch is "owned" by a
 /// single thread at a time; other threads may set the latch, but only the
-/// owning thread may wait on it.
+/// owning thread may call `wait` or `check`.
 ///
 /// The general idea and spirit for latches (as well as some of the
 /// documentation) is due to rayon. However the implementation is specific to
@@ -44,9 +44,15 @@ const ASLEEP: u32 = 0b100;
 ///
 /// ## Memory Ordering
 ///
-/// Latches _do not synchronize memory_. They are only used for signaling. If
-/// the thread that sets a latch wishes to transmit a value to the thread
-/// waiting for that latch, explicit fences must be used.
+/// `set` stores the latch state with `Release` and `check` loads it with
+/// `Acquire`. A `check` that observes a set latch therefore *happens-after*
+/// the `set`.
+///
+/// Therefore, after the owning thread observes a signal through `check`:
+///
+/// 1. It may reclaim the latch (drop or `reset` it).
+///
+/// 2. It may access any writes ordered before the call to `set`.
 pub struct Latch {
     /// Holds the internal state of the latch. This tracks if the latch has been
     /// set or not.
@@ -70,10 +76,16 @@ impl Latch {
         }
     }
 
-    /// Checks to see if the latch has been set. Returns true if it has been.
+    /// Checks to see if the latch has been set.
+    ///
+    /// # Memory Ordering
+    ///
+    /// A call to `check` that observes a signal establishes a happens-after
+    /// relationship with the `set` that produced the signal, which can be used
+    /// to safely reclaim the latch or transmit values between threads.
     #[inline(always)]
     pub fn check(&self) -> Status {
-        match self.state.load(Ordering::Relaxed) {
+        match self.state.load(Ordering::Acquire) {
             SIGNAL => Status::Ok,
             ERROR => Status::Error,
             _ => Status::Pending,
@@ -87,10 +99,8 @@ impl Latch {
     ///
     /// # Memory Ordering
     ///
-    /// This does not synchronize memory. To synchronize memory with the thread
-    /// setting the latch, call `fence(Ordering::Acquire)` after this function.
-    /// The other thread must issue a corresponding `fence(Ordering::Release)`
-    /// call.
+    /// A call to `wait` does not synchronize memory, and so must be used in
+    /// conjunction with `check` (see the type-level "Memory Ordering" section).
     #[cold]
     pub fn wait(&self, seat_bitmask: u32, waiting_bitmask: &'static AtomicU32) {
         // First, check if the latch has been set.
@@ -120,9 +130,10 @@ impl Latch {
     ///
     /// # Memory Ordering
     ///
-    /// This does not synchronize memory. To synchronize memory with the waiting
-    /// thread, call `fence(Ordering::Release)` before this function. The other
-    /// thread must issue a corresponding `fence(Ordering::Acquire)` call.
+    /// A call to `check` that observes the signal produced by this `set`
+    /// establishes a happens-after relationship. Stores on this thread made
+    /// before this call will be visible to the owning thread after `check`
+    /// returns a status other than `Pending`.
     ///
     /// # Safety
     ///
@@ -136,7 +147,7 @@ impl Latch {
     ///
     ///   2. The latch has not been `set` since it was created or last `reset`,
     ///      calls to `set` do not race, and the latch will not be dropped or
-    ///      moved until after `check` returns something other than `Pending`.
+    ///      moved until after `check` returns a status other than `Pending`.
     #[inline(always)]
     pub unsafe fn set(latch: *const Latch, error: bool) {
         // First we store a reference to the semaphore (which is 'static) so
@@ -163,13 +174,16 @@ impl Latch {
         // In the event of a race with `wait`, this may cause `wait` to return.
         // Otherwise the other thread will sleep within `wait`.
         //
-        // SAFETY: The latch is still valid to access immutably, following the
-        // same logic as above.
+        // SAFETY: The latch must still be valid to dereference, up to the point
+        // where we begin this store, by the same reasoning as above.
         //
-        // NOTE: This store will mean `check` no longer returns `Pending`,
-        // invalidating the argument in Variant 2. The latch pointer therefore
-        // may become dangling after this line.
-        unsafe { (*latch).state.store(state, Ordering::Relaxed) };
+        // The `Release` store synchronizes with the `Acquire` load in `check`
+        // to supply the second half of the Variant 2 argument: the latch does
+        // not merely live *up to* this store, the store is also ordered
+        // *before* any later free. The owner may free the latch as soon as
+        // `check` reports non-`Pending`, and that check is ordered after this
+        // store, so there can be no data race.
+        unsafe { (*latch).state.store(state, Ordering::Release) };
         // Finally we try to signal the target thread on it's semaphore, just in
         // case it missed the notification and is currently waiting. This
         // guarantees that the other thread will make progress.
