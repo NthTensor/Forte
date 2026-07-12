@@ -731,8 +731,8 @@ where
     /// handing that to the job's own `scheduler`. The `worker` param should be
     /// the same as calling `Worker::with_current`.
     fn schedule(self: Arc<Self>, worker: Option<&Worker>) {
-        // Clone a strong reference so the allocation — and therefore the
-        // `scheduler` field — stays alive for the entire `schedule` call.
+        // Clone a strong reference so the allocation, and therefore the
+        // `scheduler` field, stays alive for the entire `schedule` call.
         //
         // `into_job_ref` consumes `self` via `Arc::into_raw`, moving our strong
         // reference into the `JobRef` *without* decrementing the count. The act
