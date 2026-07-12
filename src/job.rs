@@ -53,8 +53,11 @@ impl JobRef {
     ///
     /// The caller must ensure that:
     ///
-    /// * `JobRef::execute` will only be called on the returned `JobRef` when
-    ///   it would be sound to call `execute_fn` on `job_pointer`.
+    /// * `JobRef::execute` will only be called on the returned `JobRef` when it
+    ///   is sound to call `execute_fn` on `job_pointer`. Because a `JobRef` is
+    ///   `Send`, `execute` may run on any thread, so this must hold for whatever
+    ///   thread runs it (e.g. `!Send` job data must only be touched on its
+    ///   owning thread).
     ///
     /// * `execute_fn` will not unwind when called on `job_pointer`.
     #[inline(always)]
@@ -85,30 +88,22 @@ impl JobRef {
     }
 }
 
-// SAFETY: Every `JobRef` contains a function pointer and a data pointer.
-// Function pointers are always `Send`, but the data pointer may or may not be
-// valid for cross-thread access (the value it points to may or may not be
-// `Sync`).
+// SAFETY: A `JobRef` is a function pointer plus a type-erased data pointer.
+// Function pointers are `Send`; the data pointer may reference `!Send` data
+// (e.g. a `!Send` future whose waker lives on another thread), so `Send` cannot
+// be derived structurally. We nonetheless need it since, for instance, passing
+// a pointer to `!Send` job data between threads is how, an IO thread hands a
+// wakeup back to the thread that owns the future.
 //
-// However, even when this data is not thread-safe, `JobRef` still needs to be
-// `Send`. This is because we need to be able to pass pointers to `!Send` job
-// data between threads. For example, if we have a thread that owns a `Future`
-// that is `!Send`, and we receive a wakeup notification on an IO polling
-// thread, the IO thread must send the owning thread a `JobRef` containing a
-// pointer to that `!Send` future.
+// Sending a `JobRef` between threads is sound. The only operation that
+// dereferences the data pointer is `JobRef::execute`, and `JobRef::new`'s
+// contract already requires the caller to ensure `execute` is called only when
+// it is sound to do so *on the thread that runs it*. Moving the `JobRef` to
+// another thread therefore cannot introduce an unsound access the `new` caller
+// was not already obliged to rule out.
 //
-// This is only sound because the only method that can actually cause unsound
-// cross-thread memory access is `JobRef::execute`. This function is safe,
-// because the caller cannot know the soundness requirements of the underlying
-// job being pointed to (due to type-erasure). However, `JobRef::new` is
-// `unsafe`, and requires the caller to ensure that `execute` will only be
-// called if it is correct for the execute function to be called on the
-// job_pointer.
-//
-// Since every `JobRef` must be constructed with a call to `new`, it is not
-// possible for _entirely safe_ code to violate the `!Send` condition. It is
-// unfortunate that the soundness justification has to be squeezed into a single
-// function, but thus are the constraints of type-erasure.
+// The fields are private and `new` is the only constructor, so that obligation
+// always rests on an `unsafe` call. Entirely safe code cannot fabricate a `JobRef`.
 unsafe impl Send for JobRef {}
 
 // -----------------------------------------------------------------------------
@@ -120,6 +115,20 @@ unsafe impl Send for JobRef {}
 ///
 /// Note: This is !Sync because of the unsafe cell.
 pub struct JobQueue {
+    /// The queued jobs.
+    ///
+    /// Every method briefly takes `&mut *job_refs.get()` for a single
+    /// `VecDeque` operation. That `&mut` is sound because it is always unique:
+    ///
+    /// * `JobQueue` is `!Sync` (it holds an `UnsafeCell`), so only one thread
+    ///   ever accesses it.
+    ///
+    /// * No method returns a reference into `job_refs`, so no borrow escapes to
+    ///   overlap a later call.
+    ///
+    /// * No user code or `Drop` glue runs while the borrow is live — `JobRef`
+    ///   has no `Drop` impl, and `VecDeque`/`JobRef::id` never call back into
+    ///   the queue.
     job_refs: UnsafeCell<VecDeque<JobRef>>,
 }
 
@@ -133,40 +142,28 @@ impl JobQueue {
 
     /// Insert a job at the back of the queue (the side with the newest jobs).
     pub fn push_new(&self, job_ref: JobRef) {
-        // SAFETY: `JobQueue` is `!Sync`, so this can only be called from one
-        // thread. We ensure no other references to the inner value exist by not
-        // returning any references from this API, making this exclusive access
-        // sound.
+        // SAFETY: unique access to `job_refs` (see the field invariant).
         let job_refs = unsafe { &mut *self.job_refs.get() };
         job_refs.push_back(job_ref);
     }
 
     /// Insert a job at the front of the queue (the side with the oldest jobs).
     pub fn push_old(&self, job_ref: JobRef) {
-        // SAFETY: `JobQueue` is `!Sync`, so this can only be called from one
-        // thread. We ensure no other references to the inner value exist by not
-        // returning any references from this API, making this exclusive access
-        // sound.
+        // SAFETY: unique access to `job_refs` (see the field invariant).
         let job_refs = unsafe { &mut *self.job_refs.get() };
         job_refs.push_front(job_ref);
     }
 
     /// Removes the newest job in the queue.
     pub fn pop_newest(&self) -> Option<JobRef> {
-        // SAFETY: `JobQueue` is `!Sync`, so this can only be called from one
-        // thread. We ensure no other references to the inner value exist by not
-        // returning any references from this API, making this exclusive access
-        // sound.
+        // SAFETY: unique access to `job_refs` (see the field invariant).
         let job_refs = unsafe { &mut *self.job_refs.get() };
         job_refs.pop_back()
     }
 
     /// Removes the oldest job in the queue.
     pub fn pop_oldest(&self) -> Option<JobRef> {
-        // SAFETY: `JobQueue` is `!Sync`, so this can only be called from one
-        // thread. We ensure no other references to the inner value exist by not
-        // returning any references from this API, making this exclusive access
-        // sound.
+        // SAFETY: unique access to `job_refs` (see the field invariant).
         let job_refs = unsafe { &mut *self.job_refs.get() };
         job_refs.pop_front()
     }
@@ -174,10 +171,7 @@ impl JobQueue {
     /// Attempt to remove the given job-ref from the back of the queue.
     #[inline(always)]
     pub fn recover_newest(&self, id: (usize, usize)) -> bool {
-        // SAFETY: `JobQueue` is `!Sync`, so this can only be called from one
-        // thread. We ensure no other references to the inner value exist by not
-        // returning any references from this API, making this exclusive access
-        // sound.
+        // SAFETY: unique access to `job_refs` (see the field invariant).
         let job_refs = unsafe { &mut *self.job_refs.get() };
         if job_refs.back().map(JobRef::id) == Some(id) {
             let _ = job_refs.pop_back();
@@ -194,10 +188,7 @@ impl JobQueue {
     /// the newest jobs). Each chunk is of size `CHUNK_SIZE`. Afterwards, at most
     /// `CHUNK_SIZE` jobs will remain in the queue.
     pub fn split(&self) -> Vec<VecDeque<JobRef>> {
-        // SAFETY: `JobQueue` is `!Sync`, so this can only be called from one
-        // thread. We ensure no other references to the inner value exist by not
-        // returning any references from this API, making this exclusive access
-        // sound.
+        // SAFETY: unique access to `job_refs` (see the field invariant).
         let job_refs = unsafe { &mut *self.job_refs.get() };
         let mut len = job_refs.len();
         let num_chunks = len / Self::CHUNK_SIZE;
@@ -213,10 +204,7 @@ impl JobQueue {
     /// Appends a chunk of jobs (expected to be provided by `split`) to the
     /// queue. Jobs are added to the end (the side with the newest jobs).
     pub fn append(&self, mut split_refs: VecDeque<JobRef>) {
-        // SAFETY: `JobQueue` is `!Sync`, so this can only be called from one
-        // thread. We ensure no other references to the inner value exist by not
-        // returning any references from this API, making this exclusive access
-        // sound.
+        // SAFETY: unique access to `job_refs` (see the field invariant).
         let job_refs = unsafe { &mut *self.job_refs.get() };
         job_refs.append(&mut split_refs);
     }
