@@ -509,6 +509,8 @@ pub use async_task::Task;
 
 /// A trait for types that can be spawned onto a [`ThreadPool`].
 ///
+/// This trait is sealed and cannot be implemented outside of forte.
+///
 /// It is implemented for:
 ///
 /// * Closures that satisfy `for<'worker> FnOnce(&'worker Worker) + Send + 'static`.
@@ -537,7 +539,7 @@ pub use async_task::Task;
 /// THREAD_POOL.spawn(|_: &Worker| { });
 /// ```
 /// Hopefully rustc will fix this type inference failure eventually.
-pub trait Spawn<M>: 'static {
+pub trait Spawn<M>: crate::sealed::Sealed<M> + 'static {
     /// The handle returned when spawning this type.
     type Output: 'static;
 

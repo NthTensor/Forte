@@ -210,6 +210,22 @@ pub struct FnOnceMarker();
 pub struct FutureMarker();
 
 // -----------------------------------------------------------------------------
+// Trait sealing
+
+/// Seals [`Spawn`] and [`SpawnScoped`] so they cannot be implemented outside
+/// this crate.
+mod sealed {
+    use core::future::Future;
+
+    use crate::{FnOnceMarker, FutureMarker, Worker};
+
+    pub trait Sealed<M> {}
+
+    impl<F: FnOnce(&Worker)> Sealed<FnOnceMarker> for F {}
+    impl<Fut: Future> Sealed<FutureMarker> for Fut {}
+}
+
+// -----------------------------------------------------------------------------
 // Top-level exports
 
 pub use latch::Latch;
