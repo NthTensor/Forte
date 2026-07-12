@@ -1033,7 +1033,7 @@ impl Membership {
     /// # Panics
     ///
     /// If a panic occurs within the closure, it is captured and the worker is
-    /// safely torn down before the panic is re-emited. Panics within jobs run
+    /// safely torn down before the panic is re-emitted. Panics within jobs run
     /// by this worker are passed to the pool's panic handler, as described in
     /// [`Worker::spawn`].
     #[inline(always)]

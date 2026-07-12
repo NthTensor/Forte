@@ -335,8 +335,23 @@ impl<'scope, 'env> Scope<'scope, 'env> {
     /// `add_reference`, a direct `fetch_add` on the underlying counter, or the
     /// implicit initial increment the scope starts with.
     unsafe fn remove_reference(&self) {
-        let counter = self.count.fetch_sub(1, Ordering::Relaxed);
+        // This is `Release` so that this job's accesses to the scope are
+        // ordered before the decrement.
+        //
+        // The std-lib's `Arc` has the same basic pattern.
+        let counter = self.count.fetch_sub(1, Ordering::Release);
         if counter == 1 {
+            // This is the final decrement.
+            //
+            // The `Acquire` fence synchronizes with the release sequence formed
+            // by every other job's `Release` decrement of `count`, so all of
+            // their accesses to the scope happen-before this point. Combined
+            // with the `Release`/`Acquire` handshake in
+            // `Latch::set`/`Latch::check`, this orders every job's use of the
+            // scope before the owner returns from `complete` and frees it.
+            // Without it, remote jobs' atomic ops on `count` (and their reads
+            // and writes of `panic`) would race the owner's deallocation.
+            fence(Ordering::Acquire);
             // Alerts the owning thread that the scope has completed.
             //
             // This should never panic, because the counter can only go to zero
@@ -737,7 +752,7 @@ where
     ///
     /// This function does not unwind. Panics that occur while running the job
     /// are caught with `catch_unwind` and stored on the scope. Other panics,
-    /// such as those emited by drop-glue, may cause aborts.
+    /// such as those emitted by drop-glue, may cause aborts.
     ///
     /// # Safety
     ///
@@ -835,7 +850,7 @@ where
 
         // Update the job state depending on the outcome of polling the future.
         //
-        // Out of an abundance of causion, we add an abort guard here.
+        // Out of an abundance of caution, we add an abort guard here.
         let abort_guard = AbortOnDrop;
         match result {
             // The job completed without panicking.
@@ -902,7 +917,7 @@ where
         //
         // I view this as preferable to the alternative if there are no wakers
         // being held for the task the task will never wake and the scope will
-        // wait for it's latch indefinetly, and deadlock.
+        // wait for it's latch indefinitely, and deadlock.
     }
 
     /// Creates a new `RawWaker` from the provided pointer.
