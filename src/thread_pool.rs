@@ -146,9 +146,18 @@ impl MemberData {
 // threads one at a time, exactly as if the `Sharer` (which is `Send`) were
 // sent.
 //
-// The handoff is synchronized: a resigning worker makes a `Release` store to
-// the `claimed_bitmask`, and a joining worker makes an `Acquire` load of the
-// same variable. So the next owner of the seat sees a consistent `Sharer`.
+// The handoff is synchronized using the `claimed_bitmask` atomic. A resigning
+// worker clears its seat bit with a `Release` RMW on `claimed_bitmask`, and the
+// next worker to claim that seat does so with an `Acquire` RMW. When a worker
+// resigns their seat, and that seat is then claimed by a different thread, a
+// happens-before relationship is established, allowing ownership of the
+// `sharers` to be released by the resigning thread and acquired by the claiming
+// thread.
+//
+// This holds even when other seats are concurrently claimed and released in
+// between: every write to `claimed_bitmask` is an RMW, so a resignation heads
+// an unbroken release sequence, and the acquiring claim synchronizes with all
+// previous resignations.
 unsafe impl Sync for MemberData {}
 
 /// Represents a worker thread that is managed by the pool, as opposed to
@@ -881,16 +890,28 @@ impl ThreadPool {
     #[cold]
     pub fn try_enroll(&'static self) -> Option<Membership> {
         loop {
+            // This is only used to select a candidate seat; the seat may in
+            // fact be claimed by a concurrent call to `try_enroll` or
+            // `try_enroll_many`.
             let available_bitmask =
-                !self.claimed_bitmask.load(Ordering::Acquire);
+                !self.claimed_bitmask.load(Ordering::Relaxed);
             if available_bitmask == 0 {
                 return None;
             }
+
+            // Select the first free seat.
             let enrolled_index = available_bitmask.trailing_zeros() as usize; // TZCNT
             let enrolled_bitmask = 1 << enrolled_index;
+
+            // This RMW tries to atomically take ownership of the seat.
+            //
+            // We use `Acquire` ordering here to synchronize with the `Release`
+            // RMW any previous owner would make during resignation. If the
+            // returned bits show the seat was already taken, we lost a race and
+            // retry.
             if self
                 .claimed_bitmask
-                .fetch_or(enrolled_bitmask, Ordering::Relaxed)
+                .fetch_or(enrolled_bitmask, Ordering::Acquire)
                 & enrolled_bitmask
                 == 0
             {
@@ -910,7 +931,10 @@ impl ThreadPool {
         }
         let member_data = self.get_member_data();
         loop {
-            let claimed_bitmask = self.claimed_bitmask.load(Ordering::Acquire);
+            // This is only used to select candidate seats; any seat may in fact
+            // be claimed by a concurrent call to `try_enroll` or
+            // `try_enroll_many`.
+            let claimed_bitmask = self.claimed_bitmask.load(Ordering::Relaxed);
             if claimed_bitmask == u32::MAX {
                 return Vec::new();
             }
@@ -930,13 +954,21 @@ impl ThreadPool {
                 available_bitmask &= available_bitmask - 1;
             }
 
-            // Attempt to claim all selected seats in one atomic step.
+            // This RMW tries to atomically claim the selected seats all at
+            // once. Doing this in a single step keeps the batch claim atomic
+            // with respect to other concurrent `try_enroll_many` calls, and can
+            // prevent livelocks.
+            //
+            // We use `Acquire` ordering on success to synchronize with the
+            // `Release` RMW any previous owner would make during resignation.
+            // If the CAS fails we lost a race and retry; since we claimed
+            // nothing, the failure ordering can be `Relaxed`.
             if self
                 .claimed_bitmask
                 .compare_exchange(
                     claimed_bitmask,
                     claimed_bitmask | enrolled_bitmask,
-                    Ordering::Relaxed,
+                    Ordering::Acquire,
                     Ordering::Relaxed,
                 )
                 .is_ok()
