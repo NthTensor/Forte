@@ -126,7 +126,7 @@ pub struct JobQueue {
     /// * No method returns a reference into `job_refs`, so no borrow escapes to
     ///   overlap a later call.
     ///
-    /// * No user code or `Drop` glue runs while the borrow is live — `JobRef`
+    /// * No user code or `Drop` glue runs while the borrow is live. `JobRef`
     ///   has no `Drop` impl, and `VecDeque`/`JobRef::id` never call back into
     ///   the queue.
     job_refs: UnsafeCell<VecDeque<JobRef>>,
@@ -142,28 +142,32 @@ impl JobQueue {
 
     /// Insert a job at the back of the queue (the side with the newest jobs).
     pub fn push_new(&self, job_ref: JobRef) {
-        // SAFETY: unique access to `job_refs` (see the field invariant).
+        // SAFETY: We have unique access to `job_refs` (see the field
+        // invariant).
         let job_refs = unsafe { &mut *self.job_refs.get() };
         job_refs.push_back(job_ref);
     }
 
     /// Insert a job at the front of the queue (the side with the oldest jobs).
     pub fn push_old(&self, job_ref: JobRef) {
-        // SAFETY: unique access to `job_refs` (see the field invariant).
+        // SAFETY: We have unique access to `job_refs` (see the field
+        // invariant).
         let job_refs = unsafe { &mut *self.job_refs.get() };
         job_refs.push_front(job_ref);
     }
 
     /// Removes the newest job in the queue.
     pub fn pop_newest(&self) -> Option<JobRef> {
-        // SAFETY: unique access to `job_refs` (see the field invariant).
+        // SAFETY: We have unique access to `job_refs` (see the field
+        // invariant).
         let job_refs = unsafe { &mut *self.job_refs.get() };
         job_refs.pop_back()
     }
 
     /// Removes the oldest job in the queue.
     pub fn pop_oldest(&self) -> Option<JobRef> {
-        // SAFETY: unique access to `job_refs` (see the field invariant).
+        // SAFETY: We have unique access to `job_refs` (see the field
+        // invariant).
         let job_refs = unsafe { &mut *self.job_refs.get() };
         job_refs.pop_front()
     }
@@ -171,7 +175,8 @@ impl JobQueue {
     /// Attempt to remove the given job-ref from the back of the queue.
     #[inline(always)]
     pub fn recover_newest(&self, id: (usize, usize)) -> bool {
-        // SAFETY: unique access to `job_refs` (see the field invariant).
+        // SAFETY: We have unique access to `job_refs` (see the field
+        // invariant).
         let job_refs = unsafe { &mut *self.job_refs.get() };
         if job_refs.back().map(JobRef::id) == Some(id) {
             let _ = job_refs.pop_back();

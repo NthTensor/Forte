@@ -467,6 +467,8 @@ impl<'scope, 'env> Scope<'scope, 'env> {
 
 /// A trait for types that can be spawned onto a [`Scope`].
 ///
+/// This trait is sealed and cannot be implemented outside of forte.
+///
 /// It is implemented for:
 ///
 /// * Closures that satisfy `for<'worker> FnOnce(&'worker Worker) + Send + 'scope`.
@@ -495,7 +497,7 @@ impl<'scope, 'env> Scope<'scope, 'env> {
 /// });
 /// ```
 /// Hopefully rustc will fix this type inference failure eventually.
-pub trait SpawnScoped<'scope, M>: 'scope {
+pub trait SpawnScoped<'scope, M>: crate::sealed::Sealed<M> + 'scope {
     /// Similar to [`spawn`][crate::Worker::spawn] but adds the work to a
     /// [`Scope`]. This work will be polled to completion some-time before the
     /// scome completes, and may borrow data that outlives the scope.
