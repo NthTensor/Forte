@@ -1965,7 +1965,7 @@ impl Worker {
         // Allocate a job to run the closure `a` on the stack. It is vital to
         // the correctness of this function that this stack-job never move until
         // it is freed.
-        let stack_job = StackJob::new(a, self.new_latch());
+        let stack_job = StackJob::new(a, self);
 
         // SAFETY: We are only allowed to create a `JobRef` to this `StackJob`
         // if we can show that...
@@ -2039,14 +2039,14 @@ impl Worker {
             result_a = unwind::halt_unwinding(|| a(self));
         } else {
             // Wait for the job to complete.
-            if self.wait_for(stack_job.completion_latch()) {
-                // SAFETY: Since `wait_for` returned `true`, a `check` must have
-                // returned `Error`.
+            if stack_job.wait(self) {
+                // SAFETY: `wait` returned `true`, so the job completed with an
+                // error.
                 let error = unsafe { stack_job.unwrap_error() };
                 result_a = Err(error);
             } else {
-                // SAFETY: Since `wait_for` returned `false`, a `check` must have
-                // returned `Ok`.
+                // SAFETY: `wait` returned `false`, so the job completed with a
+                // value.
                 let output = unsafe { stack_job.unwrap_output() };
                 result_a = Ok(output);
             }
@@ -2328,7 +2328,7 @@ impl Worker {
                         participants,
                     })
                 };
-                (member_index, StackJob::new(op, self.new_latch()))
+                (member_index, StackJob::new(op, self))
             })
             .collect();
 
@@ -2373,7 +2373,7 @@ impl Worker {
         // Wait for each job to finish.
         let error_flags: Vec<_> = jobs
             .iter()
-            .map(|(_, job)| self.wait_for(job.completion_latch())) // (*)
+            .map(|(_, job)| job.wait(self)) // (*)
             .collect();
 
         // Every stack job is now complete, so panics may unwind freely again.
@@ -2387,13 +2387,13 @@ impl Worker {
             .zip(error_flags)
             .map(|((_, job), error_flag)| {
                 if error_flag {
-                    // SAFETY: If `error_flag` is `true` then `check` has
-                    // returned `Error`.
+                    // SAFETY: `error_flag` (from `wait`) is `true`, so the job
+                    // completed with an error.
                     let error = unsafe { job.unwrap_error() };
                     unwind::resume_unwinding(error);
                 } else {
-                    // SAFETY: If `error_flag` is `false` then `check` has
-                    // returned `Ok`.
+                    // SAFETY: `error_flag` (from `wait`) is `false`, so the job
+                    // completed with a value.
                     unsafe { job.unwrap_output() }
                 }
             })
@@ -2465,7 +2465,7 @@ impl Worker {
             //   `op`.
             //
             //   `op` owns an `Arc<F>` clone (`func`). Since `F: 'static`, that
-            //   `Arc` — and everything it keeps alive — is itself `'static`,
+            //   `Arc` and everything it keeps alive is itself `'static`,
             //   so it outlives the `JobRef` regardless of when the job runs.
             //
             // * If `F: !Send` then the `JobRef` must only be executed on this

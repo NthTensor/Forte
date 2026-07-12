@@ -12,6 +12,7 @@ use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use core::any::Any;
 use core::cell::UnsafeCell;
+use core::marker::PhantomData;
 use core::mem::ManuallyDrop;
 use core::ptr::NonNull;
 
@@ -240,8 +241,14 @@ union StackJobData<F, T> {
 ///
 /// This is analogous to the chili type `JobStack` and the rayon type `StackJob`.
 pub struct StackJob<F, T> {
+    /// Job-completion signal. Set only by this job's `execute`. The field is
+    /// private and never handed out as `&Latch`, so an observed completion
+    /// means `execute` has run.
     completed: Latch,
     data: UnsafeCell<StackJobData<F, T>>,
+    /// Makes this type `!Send`. Since `Worker` is also `!Send`, this ensures
+    /// `new` and `wait` are both given the same worker.
+    _not_send: PhantomData<*const ()>,
 }
 
 impl<F, T> StackJob<F, T>
@@ -249,14 +256,15 @@ where
     F: FnOnce(&Worker) -> T + Send,
     T: Send,
 {
-    /// Creates a new `StackJob` owned by the current worker.
+    /// Creates a new `StackJob` owned by the given worker.
     #[inline(always)]
-    pub fn new(func: F, latch: Latch) -> StackJob<F, T> {
+    pub fn new(func: F, worker: &Worker) -> StackJob<F, T> {
         StackJob {
             data: UnsafeCell::new(StackJobData {
                 func: ManuallyDrop::new(func),
             }),
-            completed: latch,
+            completed: worker.new_latch(),
+            _not_send: PhantomData,
         }
     }
 
@@ -272,8 +280,7 @@ where
     /// * After this call, the `StackJob` will not be moved or dropped until one
     ///   of these conditions is met:
     ///
-    ///   * (A) A call to `check` on the `StackJob`'s latch returns something
-    ///     other than `Pending`.
+    ///   * (A) `wait` reports that the job has completed.
     ///
     ///   * (B) The `JobRef` has been dropped without `execute` being called.
     #[inline(always)]
@@ -287,17 +294,15 @@ where
         // defined by the safety comment for this function. Then:
         //
         // * `this` is an aligned pointer to an initialized `StackJob<F, T>`,
-        //   which will not be invalidated until a `check` on the latch it
-        //   contains returns something other than `Pending`.
+        //   which will not be invalidated until `wait` reports the job complete.
         //
         //   We created `job_pointer` from a ref to `self`, which is a
         //   `StackJob`, so it must have pointed to an aligned `StackJob` at
         //   some point.
         //
         //   If the caller allows the `JobRef` to be executed, they must also
-        //   ensure that the pointer will not be invalidated unless a call to
-        //   `check` on the job's `Latch` has returned something other than
-        //   `Pending`.
+        //   ensure the pointer stays valid until `wait` has reported the job
+        //   complete.
         //
         // * `StackJob::execute` is called at most once on any `StackJob`.
         //
@@ -313,10 +318,14 @@ where
         unsafe { JobRef::new(job_pointer, Self::execute) }
     }
 
-    /// Returns a reference to the latch embedded in this stack job.
+    /// Waits for this job to complete, running other work on `worker`
+    /// meanwhile. Returns `true` if the job completed with an error.
     #[inline(always)]
-    pub fn completion_latch(&self) -> &Latch {
-        &self.completed
+    pub fn wait(&self, worker: &Worker) -> bool {
+        // Note: This really only works if `&Worker` is the same worker that was
+        // used to create this job. Since `Worker` and `StackJob` are both
+        // `!Send + !Sync`, we will just assume this is the case.
+        worker.wait_for(&self.completed)
     }
 
     /// Unwraps the stack job back into a closure. This allows the closure to be
@@ -352,22 +361,23 @@ where
     ///
     /// # Safety
     ///
-    /// This may only be called if a `check` on the enclosed latch has returned
-    /// `Ok`.
+    /// May only be called after `wait` has returned `false`, meaning the job completed
+    /// with a value.
     #[inline(always)]
     pub unsafe fn unwrap_output(mut self) -> T {
         // SAFETY: We have exclusive access to the active union field `output`.
         // We take `self` by value, so no other `unwrap_*` method can also hold
-        // it, and `check` returned `Ok`, so `execute` ran. Since `execute` runs
-        // at most once, it is no longer running and cannot alias `data`.
+        // it, and `wait` returned `false`, so `execute` ran (by the invariant on
+        // `completed`, only `execute` sets the latch). Since `execute` runs at
+        // most once, it is no longer running and cannot alias `data`.
         //
-        // The caller has observed `check` return `Ok`. This performs an
-        // `Acquire` load, which synchronizes with the `Release` store in the
-        // `Latch::set` call inside `execute`. Since `execute` writes the
-        // `output` field before that store, that write must happen-before this
-        // read. So there can be no data-race on this load.
+        // The caller has observed completion via `wait`, whose `Acquire` load
+        // synchronizes with the `Release` store in the `Latch::set` call inside
+        // `execute`. Since `execute` writes the `output` field before that
+        // store, that write must happen-before this read. So there can be no
+        // data-race on this load.
         //
-        // `output` is the active variant because `check` returning `Ok` means
+        // `output` is the active variant because `wait` returning `false` means
         // `execute` called `set` with `error_flag == false`, which always
         // follows a write of the `output` field, after which the union is not
         // written again.
@@ -381,22 +391,23 @@ where
     ///
     /// # Safety
     ///
-    /// This may only be called if a `check` on the enclosed latch has returned
-    /// `Error`.
+    /// May only be called after `wait` has returned `true`, meaning the job completed
+    /// with an error.
     #[inline(always)]
     pub unsafe fn unwrap_error(mut self) -> Box<dyn Any + Send> {
         // SAFETY: We have exclusive access to the active union field `error`.
         // We take `self` by value, so no other `unwrap_*` method can also hold
-        // it, and `check` returned `Error`, so `execute` ran. Since `execute`
-        // runs at most once, it is no longer running and cannot alias `data`.
+        // it, and `wait` returned `true`, so `execute` ran (by the invariant on
+        // `completed`, only `execute` sets the latch). Since `execute` runs at
+        // most once, it is no longer running and cannot alias `data`.
         //
-        // The caller has observed `check` return `Error`. This performs an
-        // `Acquire` load, which synchronizes with the `Release` store in the
-        // `Latch::set` call inside `execute`. Since `execute` writes the
-        // `error` field before that store, that write must happen-before this
-        // read. So there can be no data-race on this load.
+        // The caller has observed completion via `wait`, whose `Acquire` load
+        // synchronizes with the `Release` store in the `Latch::set` call inside
+        // `execute`. Since `execute` writes the `error` field before that store,
+        // that write must happen-before this read. So there can be no data-race
+        // on this load.
         //
-        // `error` is the active variant because `check` returning `Error` means
+        // `error` is the active variant because `wait` returning `true` means
         // `execute` called `set` with `error_flag == true`, which always
         // follows a write of the `error` field, after which the union is not
         // written again.
@@ -413,8 +424,7 @@ where
     /// The caller must ensure that:
     ///
     /// * `this` is an aligned pointer to an initialized `StackJob<F, T>`, which
-    ///   will not be invalidated until a `check` on the latch it contains
-    ///   returns something other than `Pending`.
+    ///   will not be invalidated until `wait` reports the job complete.
     ///
     /// * This function is called at most once on any `StackJob`.
     #[inline(always)]
@@ -462,9 +472,9 @@ where
                 }
             }
         };
-        // This publishes the write of the `data` field with a `Release` store.
-        // Any following caller of `check` that observes a signal will
-        // thereafter be able to load the `data` field without a race.
+        // This publishes the write to `data` with a `Release` store, so any
+        // thread that later observes completion through `wait` can load `data`
+        // without a race.
         //
         // SAFETY: This casts a reference to a raw pointer, which means the
         // pointer must be aligned, non-null, and point to an initialized latch.
@@ -474,17 +484,15 @@ where
         // * The latch has not been `set` since it was created or last `reset`,
         //   and calls to `set` do not race.
         //
-        //   This is the only place where this latch is set, and the caller
-        //   ensures this is called at most once. Therefore `set` cannot have
-        //   been called already, and there can be no other calls to `set` that
-        //   would race with this one.
+        //   By the invariant on `completed`, only this `execute` sets the latch,
+        //   and it runs at most once, so no prior or racing `set` exists.
         //
         // * The latch will not be dropped or moved until after `check` returns
         //   something other than `Pending`.
         //
-        //   The caller ensures that this `StackJob` is not dropped until a
-        //   `check` on the latch returns something other than `Pending`, and
-        //   nothing removes the latch from the `StackJob`.
+        //   The owner does not drop the `StackJob` until `wait` returns, which
+        //   happens only once the latch is set, and nothing removes the latch
+        //   from the `StackJob`.
         unsafe { Latch::set(&this.completed, error_flag) };
         // Forget the abort guard, re-enabling panics.
         core::mem::forget(abort_guard);
