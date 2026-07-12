@@ -625,6 +625,10 @@ unsafe fn execute_runnable(this: NonNull<()>, worker: &Worker) {
     // Poll the task. This will drop the future if the task is
     // canceled or the future completes.
     //
+    // Polling (and dropping) a `!Send` future here is sound because the second
+    // clause of this function's safety contract requires the caller to call
+    // `execute_runnable` only on the thread the `Runnable` was created on.
+    //
     // A panic from the future propagates out of `run`, has nowhere else to
     // propagate, and must not unwind into the executing worker, so it is
     // caught and passed to the pool's panic handler.
@@ -681,11 +685,17 @@ where
         // SAFETY: `spawn_unchecked` has four obligations:
         //
         // * If `Self` is `!Send`, its `Runnable` must be used and dropped on
-        //   the original thread. The `Runnable` is wrapped in a `JobRef` and
-        //   handed to `scheduler`.
+        //   the original thread.
         //
-        //   The second clause of the `Spawn<M>::spawn` safety contract
-        //   requires the caller to ensure this.
+        //   The second clause of the `Spawn<M>::spawn` safety contract requires
+        //   the caller to confine `scheduler` to the original thread, so
+        //   `execute_runnable`, and by extension the `Runnable`, only
+        //   ever run there.
+        //
+        //   A `JobRef` has no `Drop` impl, so a `JobRef` that is never executed
+        //   leaks its `Runnable` instead of dropping it. The `Runnable` is thus
+        //   only ever dropped inside `execute_runnable` which, again, only runs
+        //   on the correct original.
         //
         // * If `Self` is `!'static`, borrowed variables must outlive its
         //   `Runnable`.
