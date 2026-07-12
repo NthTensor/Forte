@@ -469,8 +469,9 @@ where
         // thread that later observes completion through `wait` can load `data`
         // without a race.
         //
-        // SAFETY: This casts a reference to a raw pointer, which means the
-        // pointer must be aligned, non-null, and point to an initialized latch.
+        // SAFETY: The pointer is derived from `&this.completed`, a valid
+        // reference, so it is non-null, aligned, and points to an initialized
+        // `Latch`.
         //
         // We also meet Variant 2 of the `set` safety contract:
         //

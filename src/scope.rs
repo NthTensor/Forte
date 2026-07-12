@@ -557,8 +557,8 @@ where
         //   will not outlive `'scope`.
         //
         //   This is ensured via the scope's lifetime extension logic: the scope
-        //   will not complete so long as the `scope_ptr` is held, extending the
-        //   lifetime of `'scope` until after `self` the job executes and is
+        //   will not complete so long as the `scope_ptr` is held, extending
+        //   `'scope` until after the job has executed and `self` has been
         //   dropped.
         //
         // * If `op` is `!Send` then `JobRef::execute` will only be called
@@ -1026,8 +1026,10 @@ mod scope_ptr {
     /// reference scope from being deallocated.
     pub struct ScopePtr<'scope, 'env>(*const Scope<'scope, 'env>);
 
-    // SAFETY: Transferring ownership of the `*const Scope` is sound because the
-    // pointee is reached only bia atomic ops and is kept alive by the refcount.
+    // SAFETY: Sending the `*const Scope` is sound because the pointee outlives
+    // every `ScopePtr` (the refcount is held until drop), all cross-thread
+    // mutation of the `Scope` goes through atomics, and its remaining fields are
+    // written only during construction, so shared reads cannot race.
     unsafe impl Send for ScopePtr<'_, '_> {}
 
     impl<'scope, 'env> ScopePtr<'scope, 'env> {
