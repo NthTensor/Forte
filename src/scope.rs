@@ -358,11 +358,16 @@ impl<'scope, 'env> Scope<'scope, 'env> {
             // once, when the scope has been dropped and all work has been
             // completed.
             //
-            // SAFETY: The owning thread must call `Scope::complete` before
-            // dropping any `Scope`, and `Scope::complete` does not return until
-            // the latch is set, which happens only here, after the count
-            // reaches zero. Therefore, the `completed` field of this `Scope`
-            // must still be a live latch.
+            // SAFETY: We meet Variant 2 of the `Latch::set` safety contract:
+            //
+            // * The count reaches zero exactly once, so this branch runs
+            //   exactly once, and this is the only place the latch is set. So
+            //   no other call to `set` can race with this one, and `set` cannot
+            //   have already been called.
+            //
+            // * This latch will not be dropped until `complete` returns, and
+            //   `complete` will not return until it observes the signal we are
+            //   about to send.
             unsafe { Latch::set(&self.completed, false) };
         }
     }
@@ -926,11 +931,15 @@ where
     ///
     /// # Safety
     ///
-    /// Must be called with a pointer created by calling `Arc::into_raw` on an
-    /// instance of `Arc<Self>` that is still alive.
+    /// `this` must be a pointer produced by `Arc::into_raw` on an `Arc<Self>`.
+    ///
+    /// This call borrows the reference: the caller must keep one strong
+    /// reference count alive for the duration of the call. It does not consume
+    /// a count.
     unsafe fn clone_as_waker(this: *const ()) -> RawWaker {
-        // SAFETY: This is called on a pointer created by `Arc::into_raw` on an
-        // instance of `Arc<Self>`.
+        // SAFETY: `this` came from `Arc::into_raw` and the caller keeps a strong
+        // reference alive (per the contract), so incrementing the count for the
+        // cloned waker is sound.
         unsafe { Arc::increment_strong_count(this.cast::<Self>()) };
         RawWaker::new(this, &Self::VTABLE)
     }
@@ -939,11 +948,15 @@ where
     ///
     /// # Safety
     ///
-    /// Must be called with a pointer created by calling `Arc::into_raw` on an
-    /// instance of `Arc<Self>` that is still alive.
+    /// `this` must be a pointer produced by `Arc::into_raw` on an `Arc<Self>`.
+    ///
+    /// This call takes ownership of exactly one strong reference count for that
+    /// allocation, consuming it via `Arc::from_raw` internally. The caller must
+    /// hold "ownership" of one such strong reference.
     unsafe fn wake(this: *const ()) {
-        // SAFETY: This is called on a pointer created by `Arc::into_raw` on an
-        // instance of `Arc<Self>`.
+        // SAFETY: `this` came from `Arc::into_raw` and the caller transfers
+        // ownership of one strong count (per the contract), so `from_raw` may
+        // reclaim it.
         let this = unsafe { Arc::from_raw(this.cast::<Self>()) };
 
         if this.state.swap(WOKEN, Ordering::Relaxed) == READY {
@@ -955,14 +968,18 @@ where
     ///
     /// # Safety
     ///
-    /// Must be called with a pointer created by calling `Arc::into_raw` on an
-    /// instance of `Arc<Self>` that is still alive.
+    /// `this` must be a pointer produced by `Arc::into_raw` on an `Arc<Self>`.
+    ///
+    /// This call borrows the reference: the caller must keep one strong
+    /// reference count alive for the duration of the call. It does not consume
+    /// a count.
     unsafe fn wake_by_ref(this: *const ()) {
         // We use manually drop here to prevent us from consuming the arc on
         // drop. This functions like an `&Arc<Self>` rather than an `Arc<Self>`.
         //
-        // SAFETY: This is called on a pointer created by `Arc::into_raw` on an
-        // instance of `Arc<Self>`.
+        // SAFETY: `this` came from `Arc::into_raw` and the caller keeps a strong
+        // reference alive (per the contract). Wrapping in `ManuallyDrop` borrows
+        // that count rather than consuming it.
         let this =
             unsafe { ManuallyDrop::new(Arc::from_raw(this.cast::<Self>())) };
 
@@ -977,14 +994,18 @@ where
     ///
     /// # Safety
     ///
-    /// Must be called with a pointer created by calling `Arc::into_raw` on an
-    /// instance of `Arc<Self>` that is still alive.
+    /// `this` must be a pointer produced by `Arc::into_raw` on an `Arc<Self>`.
+    ///
+    /// This call takes ownership of exactly one strong reference count for that
+    /// allocation, releasing it via `Arc::decrement_strong_count` internally.
+    /// The caller must hold "ownership" of one such strong reference.
     unsafe fn drop_as_waker(this: *const ()) {
         // Rather than converting back into an arc, we can just decrement the
         // counter here.
         //
-        // SAFETY: This is called on a pointer created by `Arc::into_raw` on an
-        // instance of `Arc<Self>`.
+        // SAFETY: `this` came from `Arc::into_raw` and the caller transfers
+        // ownership of one strong count (per the contract), so decrementing it
+        // is sound.
         unsafe { Arc::decrement_strong_count(this.cast::<Self>()) };
     }
 }
