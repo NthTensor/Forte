@@ -228,7 +228,6 @@ mod sealed {
 // -----------------------------------------------------------------------------
 // Top-level exports
 
-pub use latch::Latch;
 pub use scope::Scope;
 pub use scope::SpawnScoped;
 pub use thread_pool::Broadcast;
@@ -248,6 +247,19 @@ pub use thread_pool::scope;
 pub use thread_pool::spawn;
 pub use thread_pool::spawn_broadcast;
 pub use thread_pool::spawn_on;
+
+// -----------------------------------------------------------------------------
+// Internal primitives
+
+/// Low-level scheduling primitives for building custom executors on forte.
+///
+/// These are fully public but `#[doc(hidden)]`. You can use this API, but it's
+/// not advisable, and most of it is very unsafe.
+#[doc(hidden)]
+pub mod internals {
+    pub use crate::job::{HeapJob, JobQueue, JobRef, StackJob};
+    pub use crate::latch::{Latch, Semaphore, Status};
+}
 
 // -----------------------------------------------------------------------------
 // Platform Support

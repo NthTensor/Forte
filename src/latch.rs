@@ -61,9 +61,14 @@ pub struct Latch {
     semaphore: &'static Semaphore,
 }
 
+/// The result of a [`Latch::check`]: whether the latch has been set, and if so
+/// whether it was set with an error.
 pub enum Status {
+    /// The latch has not been set.
     Pending,
+    /// The latch was set without an error.
     Ok,
+    /// The latch was set with an error.
     Error,
 }
 
