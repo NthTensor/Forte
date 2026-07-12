@@ -559,9 +559,12 @@ where
         //   function, so `JobRef::execute` and hence `HeapJob::execute` can
         //   only be called during that interval.
         //
-        // * Accessing `f` will not violate a `!Send` requirement.
+        // * Using or dropping `f` will not violate a `!Send` requirement.
         //
-        //   This is ensured by the executability condition.
+        //   This function's `!Send` safety clause confines `execute` (the only
+        //   code that uses or drops `f`) to the construction thread. An
+        //   unexecuted `JobRef` leaks the `HeapJob` (no `Drop` impl), so `f` is
+        //   never dropped elsewhere.
         //
         // `JobRef::new` also requires that the execute function not unwind.
         // This is left to the caller of `HeapJob::new` to ensure.
@@ -574,7 +577,8 @@ where
     ///
     /// The caller must ensure that:
     ///
-    /// * `this` is an aligned pointer to an initialized `HeapJob<F>`.
+    /// * `this` was produced by `Box::into_raw` on a `Box<HeapJob<F>>`, and this
+    ///   call takes ownership of that allocation.
     ///
     /// * This function is called at most once on any `HeapJob`.
     ///
@@ -584,11 +588,9 @@ where
     ///   the `HeapJob` was constructed.
     #[inline(always)]
     unsafe fn execute(this: NonNull<()>, worker: &Worker) {
-        // SAFETY: The caller ensures that:
-        //
-        // * `this` was created by `Box::into_raw`.
-        //
-        // * This function is called at most once.
+        // SAFETY: The first clause satisfies the creation and
+        // allocation-ownership requirements of `Box::from_raw`, and the
+        // at-most-once clause rules out a prior reclaim.
         let this = unsafe { Box::from_raw(this.cast::<Self>().as_ptr()) };
         // Run the job.
         (this.f)(worker);
