@@ -220,7 +220,7 @@ pub struct Semaphore {
 
 impl Semaphore {
     /// Creates a new signal.
-    pub const fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         Semaphore {
             state: AtomicU32::new(LOCKED),
         }

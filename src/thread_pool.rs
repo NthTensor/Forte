@@ -1090,8 +1090,8 @@ impl Membership {
         let worker = Worker {
             migrated: Cell::new(false),
             membership: self,
-            fifo_queue: JobQueue::new(),
-            lifo_queue: JobQueue::new(),
+            fifo_queue: JobQueue::default(),
+            lifo_queue: JobQueue::default(),
             nonsend_fifo_queue: Arc::new(SegQueue::new()),
             rng: XorShift64Star::new(),
             last_promote_tick: Cell::new(0),
