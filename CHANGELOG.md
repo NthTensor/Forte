@@ -14,14 +14,34 @@ This project is currently in early [pre-release], and there may be arbitrary bre
 
 ## [Unreleased]
 
+## [1.0.0-beta.1]
+
 ### Added
 
-- `Scope::spawn_on` as a scoped version of `Worker::spawn_on`
-- `Scope::spawn_local` as a scoped version of `Worker::spawn_local`
+- The top-level `spawn_on` function, `ThreadPool::spawn_on`, and `Worker::spawn_on` for sending work to a specific member thread by index.
+- `Scope::spawn_local` as a scoped version of `Worker::spawn_local`, for spawning `!Send` work on a given worker.
+- `ThreadPool::set_panic_handler` and `ThreadPool::handle_panic`, plus the `PanicHandler` type, for disposing of panics that have nowhere to propagate.
+- A hidden `internals` module exposing low-level scheduling primitive.
+- The `Scheduler` trait, abstracting the scheduling backend used by spawns and scopes.
 
 ### Changed
 
-- `Worker::spawn_on` now accepts a member number, and sends work to that thread.
+- `Scope::spawn_on` now takes a member index instead of a `&Worker`.
+- Panics from jobs that have nowhere to propagate now invoke the pool's panic handler, or abort the process if none is registered.
+- `Spawn` and `SpawnScoped` are now sealed traits and cannot be implemented outside the crate.
+
+### Removed
+
+- The `SpawnLocal` trait; its role is now covered by `Spawn`.
+
+### Fixed
+
+- Fixed several panic-safety holes that could cause undefined behavior.
+- Corrected atomic memory ordering for latches and in the worker enroll/resign (ABA) logic.
+- Corrected atomic ordering in `ScopeFutureJob::poll`.
+- Local scoped spawns are now dropped on the thread that owns them.
+- Scoped spawn-broadcast now captures its environment with the correct lifetime.
+- Improved the scheduling soundness of scoped futures.
 
 ## [1.0.0-alpha.5]
 
