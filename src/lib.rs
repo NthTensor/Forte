@@ -178,7 +178,6 @@
 //! * *Block on.* Waits for a future to complete (outside of an async context).
 //! * *Broadcast.* Runs the same operation across all workers.
 //!
-//!
 
 #![no_std]
 
@@ -217,7 +216,9 @@ pub struct FutureMarker();
 mod sealed {
     use core::future::Future;
 
-    use crate::{FnOnceMarker, FutureMarker, Worker};
+    use crate::FnOnceMarker;
+    use crate::FutureMarker;
+    use crate::Worker;
 
     pub trait Sealed<M> {}
 
@@ -257,8 +258,13 @@ pub use thread_pool::spawn_on;
 /// not advisable, and most of it is very unsafe.
 #[doc(hidden)]
 pub mod internals {
-    pub use crate::job::{HeapJob, JobQueue, JobRef, StackJob};
-    pub use crate::latch::{Latch, Semaphore, Status};
+    pub use crate::job::HeapJob;
+    pub use crate::job::JobQueue;
+    pub use crate::job::JobRef;
+    pub use crate::job::StackJob;
+    pub use crate::latch::Latch;
+    pub use crate::latch::Semaphore;
+    pub use crate::latch::Status;
 }
 
 // -----------------------------------------------------------------------------
@@ -269,22 +275,19 @@ pub mod internals {
 // future.
 mod platform {
 
+    pub use alloc::sync::Arc;
     pub use core::sync::atomic::AtomicBool;
     pub use core::sync::atomic::AtomicPtr;
     pub use core::sync::atomic::AtomicU32;
     pub use core::sync::atomic::AtomicUsize;
     pub use core::sync::atomic::Ordering;
     pub use core::sync::atomic::fence;
-
-    pub use alloc::sync::Arc;
+    use std::sync::LazyLock;
     pub use std::sync::Mutex;
     pub use std::thread::Builder as ThreadBuilder;
     pub use std::thread::JoinHandle;
-    pub use std::thread_local;
-
     pub use std::thread::available_parallelism;
-
-    use std::sync::LazyLock;
+    pub use std::thread_local;
     pub struct Lazy<T>(LazyLock<T>);
 
     impl<T> Lazy<T> {
