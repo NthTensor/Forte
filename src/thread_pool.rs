@@ -141,10 +141,11 @@ impl MemberData {
 // SAFETY: The only `!Sync` field of `MemberData` is `sharers`. This is a
 // `Sharer` (aka `st3::Worker`).
 //
-// Each `sharers[i]` is only ever touched by the single thread that currently
-// holds seat `i`, and seat ownership is exclusive. Ownership thus moves between
-// threads one at a time, exactly as if the `Sharer` (which is `Send`) were
-// sent.
+// Each `sharers[i]` is only ever reached through `sharing_queue()`, which
+// indexes by the owner's `member_index`, so it is touched only by the single
+// thread that currently holds seat `i`, and seat ownership is exclusive.
+// Ownership thus moves between threads one at a time, exactly as if the
+// `Sharer` (which is `Send`) were sent.
 //
 // The handoff is synchronized using the `claimed_bitmask` atomic. A resigning
 // worker clears its seat bit with a `Release` RMW on `claimed_bitmask`, and the
@@ -580,7 +581,8 @@ where
             }
         };
 
-        // SAFETY: `op` cannot not unwind.
+        // SAFETY: `op` wraps the user closure in `halt_unwinding` and routes any
+        // panic to `handle_panic`, which never unwinds, so `op` cannot unwind.
         let job = unsafe { HeapJob::new(op) };
 
         // Turn the job into an "owning" `JobRef` so it can be queued.
@@ -1321,13 +1323,13 @@ impl Worker {
             // SAFETY: `WORKER_PTR` is a thread-local `Cell` holding a raw
             // pointer to a `Worker`. It is only written to by
             // `Membership::activate`, which stores the address of a `Worker`
-            // allocated within it's own stack frame. Before it returns,
+            // allocated within its own stack frame. Before it returns,
             // `activate` restores the previous value of `WORKER_PTR` (and it
             // aborts on panic, so this reset is guaranteed to occur). So the
-            // `WORKER_PTR` is either null or pointer to a live, immovable
+            // `WORKER_PTR` is either null or a pointer to a live, immovable
             // `Worker`.
             //
-            // If the pointer is non-null, it is therefore valid to dereference
+            // If the pointer is non-null, it is therefore sound to dereference
             // as a shared reference. Forming a `'static` reference is avoided
             // by passing the value into a closure, which bounds the reference's
             // lifetime to the closure body and prevents callers from retaining
@@ -1352,10 +1354,10 @@ impl Worker {
             // SAFETY: `WORKER_PTR` is a thread-local `Cell` holding a raw
             // pointer to a `Worker`. It is only written to by
             // `Membership::activate`, which stores the address of a `Worker`
-            // allocated within it's own stack frame. Before it returns,
+            // allocated within its own stack frame. Before it returns,
             // `activate` restores the previous value of `WORKER_PTR` (and it
             // aborts on panic, so this reset is guaranteed to occur). So the
-            // `WORKER_PTR` is either null or pointer to a live, immovable
+            // `WORKER_PTR` is either null or a pointer to a live, immovable
             // `Worker`
             //
             // If the pointer is non-null, it is therefore sound to dereference
@@ -1440,7 +1442,8 @@ impl Worker {
             let op = move |worker: &Worker| {
                 worker.fifo_queue.append(job_refs);
             };
-            // SAFETY: `op` cannot unwind.
+            // SAFETY: `op` only calls `VecDeque::append` on `JobRef`s, which
+            // cannot panic. So this cannot unwind.
             let batch_job = unsafe { HeapJob::new(op) };
             // SAFETY: `HeapJob::into_job_ref` requires:
             //

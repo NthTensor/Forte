@@ -81,9 +81,10 @@ impl JobRef {
     /// Executes the `JobRef` by passing the execute function on the job pointer.
     #[inline(always)]
     pub fn execute(self, worker: &Worker) {
-        // SAFETY: The caller of `JobRef::new` defines the conditions under
-        // which this call is sound, and must ensure that this will not be
-        // called unless these conditions are met.
+        // SAFETY: `self` is consumed, so this is the one execution of this
+        // `JobRef`. Its `execute_fn`/`job_pointer` came from `JobRef::new`
+        // (the only constructor), whose contract requires the caller to ensure
+        // this call will be sound on whatever thread this is.
         unsafe { (self.execute_fn)(self.job_pointer, worker) }
     }
 }
@@ -92,15 +93,17 @@ impl JobRef {
 // Function pointers are `Send`; the data pointer may reference `!Send` data
 // (e.g. a `!Send` future whose waker lives on another thread), so `Send` cannot
 // be derived structurally. We nonetheless need it since, for instance, passing
-// a pointer to `!Send` job data between threads is how, an IO thread hands a
+// a pointer to `!Send` job data between threads is how an IO thread hands a
 // wakeup back to the thread that owns the future.
 //
 // Sending a `JobRef` between threads is sound. The only operation that
-// dereferences the data pointer is `JobRef::execute`, and `JobRef::new`'s
-// contract already requires the caller to ensure `execute` is called only when
-// it is sound to do so *on the thread that runs it*. Moving the `JobRef` to
-// another thread therefore cannot introduce an unsound access the `new` caller
-// was not already obliged to rule out.
+// dereferences the data pointer is `JobRef::execute`: `JobRef` has no `Drop`
+// impl (so transfer-then-drop leaks the pointee rather than touching it), and
+// `id` only reads the pointer's address as a `usize`. `JobRef::new`'s contract
+// already requires the caller to ensure `execute` is called only when it is
+// sound to do so *on the thread that runs it*, so moving the `JobRef` to
+// another thread cannot introduce an unsound access the `new` caller was not
+// already obliged to rule out.
 //
 // The fields are private and `new` is the only constructor, so that obligation
 // always rests on an `unsafe` call. Entirely safe code cannot fabricate a `JobRef`.
@@ -193,7 +196,8 @@ impl JobQueue {
     /// the newest jobs). Each chunk is of size `CHUNK_SIZE`. Afterwards, at most
     /// `CHUNK_SIZE` jobs will remain in the queue.
     pub fn split(&self) -> Vec<VecDeque<JobRef>> {
-        // SAFETY: unique access to `job_refs` (see the field invariant).
+        // SAFETY: We have unique access to `job_refs` (see the field
+        // invariant).
         let job_refs = unsafe { &mut *self.job_refs.get() };
         let mut len = job_refs.len();
         let num_chunks = len / Self::CHUNK_SIZE;
@@ -209,7 +213,8 @@ impl JobQueue {
     /// Appends a chunk of jobs (expected to be provided by `split`) to the
     /// queue. Jobs are added to the end (the side with the newest jobs).
     pub fn append(&self, mut split_refs: VecDeque<JobRef>) {
-        // SAFETY: unique access to `job_refs` (see the field invariant).
+        // SAFETY: We have unique access to `job_refs` (see the field
+        // invariant).
         let job_refs = unsafe { &mut *self.job_refs.get() };
         job_refs.append(&mut split_refs);
     }
@@ -364,11 +369,12 @@ where
         // `completed`, only `execute` sets the latch). Since `execute` runs at
         // most once, it is no longer running and cannot alias `data`.
         //
-        // The caller has observed completion via `wait`, whose `Acquire` load
-        // synchronizes with the `Release` store in the `Latch::set` call inside
-        // `execute`. Since `execute` writes the `output` field before that
-        // store, that write must happen-before this read. So there can be no
-        // data-race on this load.
+        // The caller observed completion via `wait`, which loops on
+        // `Latch::check`, an `Acquire` load that synchronizes with the
+        // `Release` store in the `Latch::set` call inside `execute`. Since
+        // `execute` writes the `output` field before that store, that write
+        // must happen-before this read. So there can be no data-race on this
+        // load.
         //
         // `output` is the active variant because `wait` returning `false` means
         // `execute` called `set` with `error_flag == false`, which always
@@ -394,11 +400,11 @@ where
         // `completed`, only `execute` sets the latch). Since `execute` runs at
         // most once, it is no longer running and cannot alias `data`.
         //
-        // The caller has observed completion via `wait`, whose `Acquire` load
-        // synchronizes with the `Release` store in the `Latch::set` call inside
-        // `execute`. Since `execute` writes the `error` field before that store,
-        // that write must happen-before this read. So there can be no data-race
-        // on this load.
+        // The caller observed completion via `wait`, which loops on
+        // `Latch::check`, an `Acquire` load that synchronizes with the
+        // `Release` store in the `Latch::set` call inside `execute`. Since
+        // `execute` writes the `error` field before that store, that write must
+        // happen-before this read. So there can be no data-race on this load.
         //
         // `error` is the active variant because `wait` returning `true` means
         // `execute` called `set` with `error_flag == true`, which always
@@ -425,9 +431,12 @@ where
         // SAFETY: The pointer `this` is non-null, aligned, and the caller
         // ensures it points to an initialized `StackJob`.
         //
-        // `StackJobs` are always accessed immutably except for `unwrap_func`,
+        // `StackJob`s are always accessed immutably except for `unwrap_func`,
         // `unwrap_output`, and `unwrap_error`. The caller ensures these will not
-        // race this call, so the pointer is valid for immutable access.
+        // race this call, so the pointer is valid for immutable access. The
+        // `&Self` stays valid for the whole body: the only field mutated below
+        // is `data`, an `UnsafeCell`, so forming `&mut` from `data.get()` does
+        // not alias-violate this shared reference.
         let this = unsafe { this.cast::<Self>().as_ref() };
         // Create an abort guard. If the closure panics, this will convert the
         // panic into an abort. Doing so prevents use-after-free for other
@@ -436,10 +445,12 @@ where
         // Run the function and record the result. Produces a boolean flag that
         // is true in the event of a panic.
         let error_flag = {
-            // SAFETY: Only `unwrap_func`, `unwrap_output` and `unwrap_error`
-            // access `data`. Due to their individual safety contracts, they can
-            // only be called in a way that will not race with this function, so
-            // we must have unique access.
+            // SAFETY: `data` is an `UnsafeCell`, so the outer `&Self` does not
+            // alias it. `execute` runs at most once (per this function's
+            // contract), so no other `execute` races it, and
+            // `unwrap_func`/`unwrap_output`/`unwrap_error` cannot race it (per
+            // their contracts). This `&mut` is therefore unique for its
+            // lifetime.
             let data_ref = unsafe { &mut *this.data.get() };
             // SAFETY: Each `StackJob` is constructed using field `func`, and
             // this is the only place we write to the union after construction.
@@ -594,7 +605,11 @@ where
         // allocation-ownership requirements of `Box::from_raw`, and the
         // at-most-once clause rules out a prior reclaim.
         let this = unsafe { Box::from_raw(this.cast::<Self>().as_ptr()) };
-        // Run the job.
+        // Run the job. Reading whatever `f` captures is sound because they are
+        // still live (per the third clause of the safety contract). `f` runs
+        // and is dropped on this thread, which the fourth clause requires to be
+        // the construction thread when `f` is `!Send`. `f` does not unwind, per
+        // `HeapJob::new`'s contract.
         (this.f)(worker);
     }
 }
