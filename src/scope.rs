@@ -564,7 +564,10 @@ where
         // * If `op` is `!Send` then `JobRef::execute` will only be called
         //   on this thread.
         //
-        //   `op` is unconditionally `Send`.
+        //   Since its only non-`Copy` captures are an instance of `F` and the
+        //   `Send` `scope_ptr`, `op` is `Send` iff `F` is. If `F: Send` the
+        //   clause is vacuous. If `F: !Send`, `op` is `!Send`, and the caller's
+        //   `spawn_scoped` safety contract confines execution to this thread.
         let job_ref = unsafe { job.into_job_ref() };
 
         // Send the job to a queue to be executed.
@@ -816,8 +819,8 @@ where
         // is the case, and abort the program if it is not.
         //
         // We use Acquire ordering here to ensure we have the current state of
-        // the future. This synchronizes with the fence in the Poll::Pending
-        // branch.
+        // the future. This synchronizes with the previous poll's `Release`
+        // `compare_exchange` (see the SAFETY comment below).
         if this.state.swap(LOCKED, Ordering::Acquire) != WOKEN {
             // We abort because this function needs to be panic safe.
             abort();
@@ -837,13 +840,23 @@ where
         //   swap, and cause an abort. Exclusive access is therefore
         //   guaranteed.
         //
-        //   In the event that `poll` has been called previously, the `Acquire`
-        //   ordering synchronizes with the call to
+        //   Exclusive access is not enough on its own: a previous poll's writes
+        //   to the future must also be visible here, with no data race. There
+        //   are two cases, by how this poll was scheduled:
         //
-        //       fence(Ordering::Release)
+        //   - Woken after returning `Pending`: the previous poll published its
+        //     writes with the `Release` `compare_exchange(LOCKED, READY)` below.
+        //     A `wake` reads `READY` and reschedules; its `swap(WOKEN, Relaxed)`
+        //     is an RMW, so it stays within that `Release` store's release
+        //     sequence. This `swap(LOCKED, Acquire)` reads `WOKEN` from it and
+        //     therefore synchronizes-with the previous poll's `Release` store,
+        //     ordering that poll's writes before ours.
         //
-        //   later in this function. This ensures that we are not racing with
-        //   another mutable reference to the same value.
+        //   - Woken while running: the previous poll's `compare_exchange` failed
+        //     (the state was already `WOKEN`), so that poll rescheduled the job
+        //     itself. Its writes are sequenced before its `schedule` push, which
+        //     the job queue orders (`Release`) before this poll's dequeue
+        //     (`Acquire`).
         //
         // * The future will not move.
         //
