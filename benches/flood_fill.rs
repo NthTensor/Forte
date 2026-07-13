@@ -83,7 +83,7 @@ fn forte(bencher: Bencher, size: usize) {
         // Visit the y - 1 square
         if y > 0 {
             if visited.insert((x, y - 1)) {
-                scope.spawn_on(worker, move |worker: &Worker| {
+                scope.spawn(move |worker: &Worker| {
                     visit(size, visited, x, y - 1, scope, worker)
                 });
             }
@@ -92,7 +92,7 @@ fn forte(bencher: Bencher, size: usize) {
         // Visit the y + 1 square
         if y < size - 1 {
             if visited.insert((x, y + 1)) {
-                scope.spawn_on(worker, move |worker: &Worker| {
+                scope.spawn(move |worker: &Worker| {
                     visit(size, visited, x, y + 1, scope, worker)
                 });
             }
@@ -101,7 +101,7 @@ fn forte(bencher: Bencher, size: usize) {
         // Visit the x - 1 square
         if x > 0 {
             if visited.insert((x - 1, y)) {
-                scope.spawn_on(worker, move |worker: &Worker| {
+                scope.spawn(move |worker: &Worker| {
                     visit(size, visited, x - 1, y, scope, worker)
                 });
             }
@@ -110,7 +110,7 @@ fn forte(bencher: Bencher, size: usize) {
         // Visit the x + 1 square
         if x < size - 1 {
             if visited.insert((x + 1, y)) {
-                scope.spawn_on(worker, move |worker: &Worker| {
+                scope.spawn(move |worker: &Worker| {
                     visit(size, visited, x + 1, y, scope, worker)
                 });
             }
