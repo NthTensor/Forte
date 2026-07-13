@@ -106,13 +106,13 @@ pub type PanicHandler =
 /// A public interface that can be temporarily claimed and used by a thread.
 /// Claiming a seat allows a thread to participate in the thread pool as a
 /// worker.
-pub struct MemberData {
+pub(crate) struct MemberData {
     /// The sharing side of each seat's work-stealing queue. These should only
     /// ever be accessed by the thread that currently owns the lease for this
     /// seat (to ensure the `!Sync` bound is respected).
-    sharers: [Sharer<JobRef>; 32],
+    pub sharers: [Sharer<JobRef>; 32],
     /// The stealing side of each seat's work-stealing queue.
-    stealers: [Stealer<JobRef>; 32],
+    pub stealers: [Stealer<JobRef>; 32],
     /// A set of queues used for transmitting work that must be executed on a
     /// particular worker. Used for broadcasts and cross-thread nonsend worker
     /// wakeups.
@@ -488,8 +488,13 @@ impl ThreadPool {
 // -----------------------------------------------------------------------------
 // Schedulers
 
+/// Something that can queue a `JobRef` for execution.
 pub trait Scheduler<'w>: Send + Sync {
-    // Is passed the result of `Worker::with_current`
+    /// Queues a job ref.
+    ///
+    /// This is passed the job ref that should be queued, and the outcome of
+    /// `Worker::with_current` in the current context. The worker parameter does
+    /// not have to be used, it is simply provided to avoid a lookup.
     fn schedule(&self, job_ref: JobRef, worker: Option<&'w Worker>);
 }
 
@@ -879,7 +884,7 @@ pub struct Membership {
 
 impl ThreadPool {
     /// Returns member data, initializing it on the first call.
-    pub fn get_member_data(&'static self) -> &'static MemberData {
+    pub(crate) fn get_member_data(&'static self) -> &'static MemberData {
         self.member_data.get()
     }
 
