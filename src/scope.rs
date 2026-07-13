@@ -396,7 +396,7 @@ impl<'scope, 'env> Scope<'scope, 'env> {
             // If the write fails, another panic must have already occurred, and
             // we don't need to synchronize memory (the previous call to
             // `store_panic` handles the synchronization for it's panic data).
-            if !self
+            if self
                 .panic
                 .compare_exchange(
                     nil,
@@ -404,7 +404,7 @@ impl<'scope, 'env> Scope<'scope, 'env> {
                     Ordering::Release,
                     Ordering::Relaxed,
                 )
-                .is_ok()
+                .is_err()
             {
                 // Another panic raced in ahead of us, so we need to drop this
                 // error. Dropping the payload may itself panic, but this will

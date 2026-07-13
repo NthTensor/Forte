@@ -117,6 +117,7 @@ unsafe impl Send for JobRef {}
 /// conventions.
 ///
 /// Note: This is !Sync because of the unsafe cell.
+#[derive(Default)]
 pub struct JobQueue {
     /// The queued jobs.
     ///
@@ -136,13 +137,6 @@ pub struct JobQueue {
 }
 
 impl JobQueue {
-    /// Creates a new job queue.
-    pub fn new() -> JobQueue {
-        JobQueue {
-            job_refs: UnsafeCell::new(VecDeque::new()),
-        }
-    }
-
     /// Insert a job at the back of the queue (the side with the newest jobs).
     pub fn push_new(&self, job_ref: JobRef) {
         // SAFETY: We have unique access to `job_refs` (see the field

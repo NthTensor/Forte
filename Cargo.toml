@@ -7,9 +7,6 @@ description = "Low-overhead parallel and async work scheduler"
 repository = "https://github.com/NthTensor/Forte"
 rust-version = "1.96.0"
 
-# Lie to cargo
-links = "forte"
-
 [workspace]
 resolver = "2"
 members = ["ci"]
