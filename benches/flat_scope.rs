@@ -40,7 +40,7 @@ fn forte(bencher: Bencher, size: usize) {
         bencher.bench_local(|| {
             worker.scope(|scope| {
                 for i in 0..size {
-                    scope.spawn_on(worker, move |_: &Worker| {
+                    scope.spawn(move |_: &Worker| {
                         for j in 0..200 {
                             let mut s = DefaultHasher::new();
                             i.hash(&mut s);
