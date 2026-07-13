@@ -265,6 +265,7 @@ pub mod internals {
     pub use crate::latch::Latch;
     pub use crate::latch::Semaphore;
     pub use crate::latch::Status;
+    pub use crate::thread_pool::Scheduler;
 }
 
 // -----------------------------------------------------------------------------
@@ -274,7 +275,6 @@ pub mod internals {
 // Currently there are no alternative implementations, but there may be in
 // future.
 mod platform {
-
     pub use alloc::sync::Arc;
     pub use core::sync::atomic::AtomicBool;
     pub use core::sync::atomic::AtomicPtr;
