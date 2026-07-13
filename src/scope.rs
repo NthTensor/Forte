@@ -875,23 +875,26 @@ where
         match result {
             // The job completed without panicking.
             Ok(Poll::Ready(())) => {
-                // Drop the future here, on its confined thread. State stays
-                // LOCKED, so it is never re-polled and this runs once.
+                // Drop the future in place. State stays LOCKED, so it is never
+                // re-polled and this runs exactly once.
                 //
-                // SAFETY: The LOCKED state gives us exclusive access.
+                // SAFETY: The LOCKED state gives us exclusive access. Dropping
+                // a `!Send` future here is sound because `poll` only runs where
+                // the scheduler enqueues it, and `spawn_local` (the only entry
+                // for `!Send` work) confines every (re)schedule to the origin
+                // worker's thread, so this drop happens on that thread.
                 unsafe { ManuallyDrop::drop(&mut *this.future.get()) };
                 drop(this);
             }
             // The job is still pending, and has not yet panicked.
             Ok(Poll::Pending) => {
-                // Try to set the state back back idle so other threads can
+                // Try to set the state back to `READY` so other threads can
                 // schedule it again. This will only fail if the job was woken
                 // while running, and is already in the WOKEN state.
                 //
-                // If successful, this releases our exclusive ownership of the
-                // future and synchronizes with the `Acquire` swap at the start
-                // of this function. This establishes a "happens before"
-                // relaationship with each poll of the future.
+                // On success this publishes the poll's writes with `Release`; a
+                // later poll's opening `Acquire` swap synchronizes with it (see
+                // the SAFETY comment above), ordering this poll before the next.
                 let rescheduled = this
                     .state
                     .compare_exchange(
@@ -935,9 +938,9 @@ where
         // reference count, freeing the task if no wakers for it are being
         // held.
         //
-        // I view this as preferable to the alternative if there are no wakers
-        // being held for the task the task will never wake and the scope will
-        // wait for it's latch indefinitely, and deadlock.
+        // I view this as preferable to the alternative: if no wakers are held
+        // for the task, the task will never wake and the scope will wait for
+        // its latch indefinitely, and deadlock.
     }
 
     /// Creates a new `RawWaker` from the provided pointer.
@@ -972,6 +975,11 @@ where
         // reclaim it.
         let this = unsafe { Arc::from_raw(this.cast::<Self>()) };
 
+        // This wake publishes no data of its own; it only needs the READY ->
+        // WOKEN transition to be atomic so exactly one waker enqueues the job.
+        // Hence the `Relaxed` ordering. The future's state is ordered by the
+        // poll's `Release` store and the enqueue/dequeue handoff, not by this
+        // swap.
         if this.state.swap(WOKEN, Ordering::Relaxed) == READY {
             Worker::with_current(|worker| this.schedule(worker));
         }
@@ -996,6 +1004,10 @@ where
         let this =
             unsafe { ManuallyDrop::new(Arc::from_raw(this.cast::<Self>())) };
 
+        // As in `wake`, this publishes no data of its own; it only needs the
+        // READY -> WOKEN transition to be atomic. Hence, again, the `Relaxed`
+        // ordering. The future's state is ordered by the poll's `Release` store
+        // and the enqueue/dequeue handoff, not by this swap.
         if this.state.swap(WOKEN, Ordering::Relaxed) == READY {
             // Clone the waker, convert it into a job-ref and queue it.
             let this = ManuallyDrop::into_inner(this.clone());

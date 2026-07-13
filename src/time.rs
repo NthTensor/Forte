@@ -8,7 +8,8 @@ pub fn ticks() -> u64 {
     use core::arch::asm;
     let cnt: u64;
     // SAFETY: `mrs cntvct_el0` only reads the architectural virtual counter
-    // register and does not touch memory or the stack.
+    // register: it touches neither memory (`nomem`) nor the stack (`nostack`),
+    // and writes no condition flags (`preserves_flags`).
     unsafe {
         asm!(
             "mrs {}, cntvct_el0",
