@@ -470,7 +470,7 @@ checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
 
 [[package]]
 name = "forte"
-version = "1.0.0-dev"
+version = "1.0.0-beta.1"
 dependencies = [
  "async-task",
  "atomic-wait",

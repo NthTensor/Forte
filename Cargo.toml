@@ -1,6 +1,6 @@
 [package]
 name = "forte"
-version = "1.0.0-dev"
+version = "1.0.0-beta.1"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "Low-overhead parallel and async work scheduler"
