@@ -78,13 +78,12 @@ fn forte(bencher: Bencher, size: usize) {
         x: usize,
         y: usize,
         scope: &'scope Scope<'scope, 'env>,
-        worker: &Worker,
     ) {
         // Visit the y - 1 square
         if y > 0 {
             if visited.insert((x, y - 1)) {
-                scope.spawn_on(worker, move |worker: &Worker| {
-                    visit(size, visited, x, y - 1, scope, worker)
+                scope.spawn(move |_worker: &Worker| {
+                    visit(size, visited, x, y - 1, scope)
                 });
             }
         }
@@ -92,8 +91,8 @@ fn forte(bencher: Bencher, size: usize) {
         // Visit the y + 1 square
         if y < size - 1 {
             if visited.insert((x, y + 1)) {
-                scope.spawn_on(worker, move |worker: &Worker| {
-                    visit(size, visited, x, y + 1, scope, worker)
+                scope.spawn(move |_worker: &Worker| {
+                    visit(size, visited, x, y + 1, scope)
                 });
             }
         }
@@ -101,8 +100,8 @@ fn forte(bencher: Bencher, size: usize) {
         // Visit the x - 1 square
         if x > 0 {
             if visited.insert((x - 1, y)) {
-                scope.spawn_on(worker, move |worker: &Worker| {
-                    visit(size, visited, x - 1, y, scope, worker)
+                scope.spawn(move |_worker: &Worker| {
+                    visit(size, visited, x - 1, y, scope)
                 });
             }
         }
@@ -110,8 +109,8 @@ fn forte(bencher: Bencher, size: usize) {
         // Visit the x + 1 square
         if x < size - 1 {
             if visited.insert((x + 1, y)) {
-                scope.spawn_on(worker, move |worker: &Worker| {
-                    visit(size, visited, x + 1, y, scope, worker)
+                scope.spawn(move |_worker: &Worker| {
+                    visit(size, visited, x + 1, y, scope)
                 });
             }
         }
@@ -128,7 +127,7 @@ fn forte(bencher: Bencher, size: usize) {
             let visited = DashSet::new();
 
             worker.scope(|scope| {
-                visit(size, &visited, size / 2, size / 2, scope, worker);
+                visit(size, &visited, size / 2, size / 2, scope);
             });
         });
     });
