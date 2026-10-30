@@ -1671,16 +1671,30 @@ impl Worker {
     /// before the job runs, then swaps it back to what it was before.
     #[inline(always)]
     fn execute(&self, job_ref: JobRef, migrated: bool) {
-        // We restore the flag in a drop guard in case `job_ref.execute` panics.
-        struct RestoreFlag<'a>(&'a Cell<bool>, bool);
-        impl Drop for RestoreFlag<'_> {
-            fn drop(&mut self) {
-                self.0.set(self.1);
-            }
-        }
         let outer_migrated = self.migrated.replace(migrated);
         let _restore = RestoreFlag(&self.migrated, outer_migrated);
         job_ref.execute(self);
+    }
+
+    /// Runs `f` inline, as a job created on this thread: [`migrated`] is false
+    /// while it runs, then restored.
+    ///
+    /// [`migrated`]: Worker::migrated
+    #[inline(always)]
+    fn run_inline<R>(&self, f: impl FnOnce(&Worker) -> R) -> R {
+        let outer_migrated = self.migrated.replace(false);
+        let _restore = RestoreFlag(&self.migrated, outer_migrated);
+        f(self)
+    }
+}
+
+/// Sets a worker's migration flag back to the saved value when dropped, so the
+/// flag is restored even if the job it was set for panics.
+struct RestoreFlag<'a>(&'a Cell<bool>, bool);
+
+impl Drop for RestoreFlag<'_> {
+    fn drop(&mut self) {
+        self.0.set(self.1);
     }
 }
 
@@ -2055,7 +2069,7 @@ impl Worker {
 
         // Run the second closure directly.
         let result_a;
-        let result_b = unwind::halt_unwinding(|| b(self));
+        let result_b = unwind::halt_unwinding(|| self.run_inline(b));
 
         // Attempt to recover the job from the queue. It should still be there
         // if we didn't share it.
@@ -2068,7 +2082,7 @@ impl Worker {
             let a = unsafe { stack_job.unwrap_func() };
             // Execute the closure directly and return the results. This is
             // allows the compiler to inline and optimize `a`.
-            result_a = unwind::halt_unwinding(|| a(self));
+            result_a = unwind::halt_unwinding(|| self.run_inline(a));
         } else {
             // Wait for the job to complete.
             if stack_job.wait(self) {
@@ -2866,5 +2880,35 @@ mod tests {
         assert_eq!(vals, vec![1; 65_536]);
 
         THREAD_POOL.depopulate();
+    }
+
+    #[test]
+    fn inline_join_halves_are_not_migrated() {
+        static THREAD_POOL: ThreadPool = ThreadPool::new();
+
+        let outer = AtomicBool::new(false);
+        let halves = [AtomicBool::new(true), AtomicBool::new(true)];
+        THREAD_POOL.with_worker(|worker| {
+            // With no other workers, both halves of the join run inline.
+            let op = |worker: &Worker| {
+                outer.store(worker.migrated(), Ordering::SeqCst);
+                worker.join(
+                    |w| halves[0].store(w.migrated(), Ordering::SeqCst),
+                    |w| halves[1].store(w.migrated(), Ordering::SeqCst),
+                );
+            };
+            // SAFETY: `op` does not unwind.
+            let job = unsafe { HeapJob::new(op) };
+            // SAFETY: The job runs below, before anything it borrows is dropped,
+            // on this thread.
+            let job_ref = unsafe { job.into_job_ref() };
+            // Run the job as if it had been stolen from another worker.
+            worker.execute(job_ref, true);
+            assert!(!worker.migrated());
+        });
+
+        assert!(outer.load(Ordering::SeqCst));
+        assert!(!halves[0].load(Ordering::SeqCst));
+        assert!(!halves[1].load(Ordering::SeqCst));
     }
 }
