@@ -39,6 +39,7 @@ use crate::latch::Status;
 use crate::platform::*;
 use crate::scope::Scope;
 use crate::scope::with_scope;
+use crate::time;
 use crate::time::ticks;
 use crate::unwind;
 use crate::util::IterBits;
@@ -1100,6 +1101,7 @@ impl Membership {
             nonsend_fifo_queue: Arc::new(SegQueue::new()),
             rng: XorShift64Star::new(),
             last_promote_tick: Cell::new(0),
+            heartbeat_ticks: time::duration_to_ticks(time::HEARTBEAT),
             _phantom: PhantomData,
         };
 
@@ -1284,6 +1286,8 @@ pub struct Worker {
     /// The CPU tick when work was last promoted from local to shared. This has
     /// no absolute relation to time.
     last_promote_tick: Cell<u64>,
+    /// [`time::HEARTBEAT`] in ticks.
+    heartbeat_ticks: u64,
     /// Set to true when executing a job that came from a different thread.
     migrated: Cell<bool>,
     // Make non-send. A `Worker` represents the local state of a particular
@@ -1387,19 +1391,21 @@ impl Worker {
     /// amount a worker can make available for stealing at once.
     const STEAL_QUEUE_CAPACITY: usize = 32;
 
-    /// The minimum number of CPU ticks between calls to [`Worker::promote_cold`].
-    /// Approximately 5μs at 3 GHz.
-    const PROMOTE_TICK_INTERVAL: u64 = 15_000;
-
-    /// Try to promote the oldest task in the queue.
+    /// Shares locally queued work with sibling workers, at most once per
+    /// [`time::HEARTBEAT`]. Between heartbeats it is just a clock read and
+    /// a comparison.
+    ///
+    /// Long-running code that rarely calls `join` or `spawn`, such as the body
+    /// of a parallel iterator's leaf, can call this periodically so that the
+    /// work queued above it is shared without waiting for it to finish.
     #[inline(always)]
-    fn promote(&self) {
+    pub fn promote(&self) {
         // Promotions are fairly costly, so we limit their frequency using the
-        // cpu's instruction counter. Promote is called at a high frequency, and
+        // hardware tick counter. Promote is called at a high frequency, and
         // actually doing the promotion is probably a cold path.
         let current_tick = ticks();
         if current_tick.wrapping_sub(self.last_promote_tick.get())
-            >= Self::PROMOTE_TICK_INTERVAL
+            >= self.heartbeat_ticks
         {
             // This should ideally become a conditional jump.
             self.promote_cold(current_tick);
@@ -1719,7 +1725,13 @@ impl Worker {
     {
         let thread_pool = self.thread_pool;
         let scheduler = |job_ref, worker: Option<&Worker>| match worker {
-            Some(worker) => worker.fifo_queue.push_new(job_ref),
+            Some(worker) => {
+                worker.fifo_queue.push_new(job_ref);
+                // Poll the heartbeat so spawned work is shared with idle
+                // siblings on the next heartbeat, instead of waiting until this
+                // worker next reaches `join` or `yield_now`.
+                worker.promote();
+            }
             None => thread_pool.push_shared_job(job_ref),
         };
         // SAFETY: `Spawn::spawn`'s contract requires that `!Send` work only be
