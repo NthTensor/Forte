@@ -61,7 +61,19 @@ unsafe_op_in_unsafe_fn = "warn"
 unused_qualifications = "warn"
 
 [[bench]]
-name = "fork_join"
+name = "deep_tree"
+harness = false
+
+[[bench]]
+name = "shallow_wide"
+harness = false
+
+[[bench]]
+name = "unbalanced"
+harness = false
+
+[[bench]]
+name = "coarse"
 harness = false
 
 [[bench]]

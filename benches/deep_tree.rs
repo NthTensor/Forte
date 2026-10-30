@@ -1,4 +1,8 @@
-//! A benchmark for fork-join workloads adapted from `chili`.
+//! A deep, balanced, *fine-grained* fork/join workload (a binary tree sum,
+//! one add per node), adapted from `chili`. This is the regime where a
+//! scheduler must stay mostly inline — the per-node work is trivial, so any
+//! eager work-sharing is pure overhead. Contrast with `shallow_wide`,
+//! `unbalanced`, and `coarse`.
 
 use chili::Scope;
 use divan::Bencher;
