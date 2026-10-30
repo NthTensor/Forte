@@ -14,6 +14,29 @@ This project is currently in early [pre-release], and there may be arbitrary bre
 
 ## [Unreleased]
 
+## [1.0.0-beta.2]
+
+### Added
+
+- `Job`, `ScopedJob`, and `JobStorage`, for spawning jobs by reference without allocating. A `&'static JobStorage` can be spawned onto a pool or worker, and a `&'scope JobStorage` onto a scope.
+- `Worker::search_until`, which asks a worker to keep searching for work instead of parking until a deadline.
+- `Worker::share_now`, which shares queued `join` work with idle workers without waiting for the next heartbeat.
+- `TreeAge`, which tracks how long a tree of `join`s has run and keeps the end of a long tree busy.
+- `Worker::promote` is now public, so long-running work can share queued work without returning to the scheduler.
+- A hidden `time` module with the tick counter, the measured tick rate, and the heartbeat interval.
+
+### Changed
+
+- The heartbeat interval is now a duration (`time::HEARTBEAT`, 10µs) rather than a fixed number of ticks.
+- Each heartbeat shares as many `join` subtrees as there are idle workers, capped by a limit that grows the longer the current tree has run, and spawned work is shared in up to 16 equal chunks.
+- `join` runs both closures inline once enough work is already queued locally.
+- One idle worker searches for work for up to 50µs before parking.
+- `Worker::spawn` and `Scope::spawn` poll the heartbeat after queuing work.
+
+### Fixed
+
+- The closures of a `join` that run inline no longer report `Worker::migrated` as true when the `join` itself was called from a stolen job.
+
 ## [1.0.0-beta.1]
 
 ### Added
