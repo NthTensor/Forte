@@ -164,7 +164,13 @@ impl<'scope, 'env> Scope<'scope, 'env> {
     {
         let thread_pool = self.thread_pool;
         let scheduler = |job_ref, worker: Option<&Worker>| match worker {
-            Some(worker) => worker.fifo_queue.push_new(job_ref),
+            Some(worker) => {
+                worker.fifo_queue.push_new(job_ref);
+                // Poll the heartbeat so spawned work is shared with idle
+                // siblings on the next heartbeat, instead of waiting until this
+                // worker next reaches `join` or `yield_now`.
+                worker.promote();
+            }
             None => thread_pool.push_shared_job(job_ref),
         };
         // SAFETY: `spawn_scoped` requires that `!Send` work only be scheduled
