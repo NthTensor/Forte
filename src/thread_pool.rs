@@ -1101,6 +1101,7 @@ impl Membership {
             nonsend_fifo_queue: Arc::new(SegQueue::new()),
             rng: XorShift64Star::new(),
             last_promote_tick: Cell::new(0),
+            join_start: Cell::new(0),
             heartbeat_ticks: time::duration_to_ticks(time::HEARTBEAT),
             _phantom: PhantomData,
         };
@@ -1286,6 +1287,10 @@ pub struct Worker {
     /// The CPU tick when work was last promoted from local to shared. This has
     /// no absolute relation to time.
     last_promote_tick: Cell<u64>,
+    /// The tick of the last `join` entered while this worker's `join` queue was
+    /// empty, used to share more of the queued work the longer it has been
+    /// building up.
+    join_start: Cell<u64>,
     /// [`time::HEARTBEAT`] in ticks.
     heartbeat_ticks: u64,
     /// Set to true when executing a job that came from a different thread.
@@ -1424,10 +1429,15 @@ impl Worker {
         // Update the promote tick so that `promote` won't call this again soon.
         self.last_promote_tick.set(current_tick);
 
-        // Early out if it seems like all workers are already awake.
-        let waiting_bitmask =
-            self.thread_pool().waiting_bitmask.load(Ordering::Relaxed);
-        if waiting_bitmask == 0 {
+        let idle = self
+            .thread_pool
+            .waiting_bitmask
+            .load(Ordering::Relaxed)
+            .count_ones();
+
+        // Early out if no sibling is idle and nobody has taken the work we
+        // already shared.
+        if idle == 0 && self.sharing_queue().spare_capacity() == 0 {
             return;
         }
         cold_path();
@@ -1435,22 +1445,45 @@ impl Worker {
         // Track if we actually managed to share work.
         let mut shared_job = false;
 
-        // Share work from the lifo queue. This is shared bit-by-bit, with old
-        // (and therefore theoretically "large") tasks shared first.
-        if let Some(job_ref) = self.lifo_queue.pop_oldest() {
+        // Share work from the lifo queue, with old (and therefore theoretically
+        // "large") tasks shared first. We share no more tasks than there are
+        // idle siblings to take them, and no more than a limit that starts at
+        // one and doubles each heartbeat the current tree of joins has run, so
+        // short-lived work mostly stays local.
+        let intervals = current_tick.wrapping_sub(self.join_start.get())
+            / self.heartbeat_ticks.max(1);
+        let limit = 1u32 << intervals.min(31);
+        for _ in 0..idle.min(limit) {
+            let Some(job_ref) = self.lifo_queue.pop_oldest() else {
+                break;
+            };
             // Push into our own steal queue so siblings can steal it.
-            if let Err(job_ref) = self.sharing_queue().push(job_ref) {
+            match self.sharing_queue().push(job_ref) {
+                Ok(()) => shared_job = true,
                 // If the queue is full, that indicates that the pool is
                 // probably under high-load and we should continue local-first
                 // operation.
-                self.lifo_queue.push_old(job_ref);
-            } else {
-                shared_job = true;
+                Err(job_ref) => {
+                    self.lifo_queue.push_old(job_ref);
+                    break;
+                }
             }
         }
 
-        // Share work from the fifo queue. Offload the newest jobs in a series of
-        // small chunks.
+        // Share work from the fifo queue, even if no sibling is parked.
+        shared_job |= self.share_fifo();
+
+        // If we added work to the steal queue, wake siblings to steal it from
+        // us, while we do other work.
+        if shared_job {
+            self.wake_for_shared_work();
+        }
+    }
+
+    /// Shares work from the fifo queue. Returns whether any work was shared.
+    fn share_fifo(&self) -> bool {
+        let mut shared_job = false;
+        // Offload the newest jobs in a series of small chunks.
         for job_refs in self.fifo_queue.split() {
             // Create a new job that will insert a chunk of jobs into the
             // runner's fifo queue when executed.
@@ -1484,29 +1517,38 @@ impl Worker {
                 shared_job = true;
             }
         }
-
-        // If we added work to the steal queue, wake a random sibling to steal
-        // it from us, while we do other work.
-        if shared_job {
-            self.signal_random(waiting_bitmask);
-        }
+        shared_job
     }
 
-    /// Tries to wake a random sleeping worker. Expects to be given a bitset of
-    /// sleeping workers.
-    #[inline(always)]
-    fn signal_random(&self, sleeping: u32) {
+    /// Tries to wake up to `max` random sleeping workers. Expects to be given a
+    /// bitset of sleeping workers.
+    #[inline]
+    fn wake_up_to(&self, max: u32, sleeping: u32) {
+        if max == 0 || sleeping == 0 {
+            return;
+        }
+        let mut remaining = max;
         let offset = self.rng.next_usize(32) as u32;
         let mut randomized_sleeping = sleeping.rotate_right(offset);
         while randomized_sleeping != 0 {
             let index = (randomized_sleeping.trailing_zeros() + offset) % 32;
             randomized_sleeping &= randomized_sleeping - 1; // Clear the lowest bit
-            let woken =
-                self.membership.member_data.semaphores[index as usize].signal();
-            if woken {
-                return;
+            if self.member_data.semaphores[index as usize].signal() {
+                remaining -= 1;
+                if remaining == 0 {
+                    return;
+                }
             }
         }
+    }
+
+    /// Wakes one sleeping worker per job in this worker's steal queue.
+    #[inline]
+    pub(crate) fn wake_for_shared_work(&self) {
+        let sharer = self.sharing_queue();
+        let exposed = (sharer.capacity() - sharer.spare_capacity()) as u32;
+        let waiting = self.thread_pool.waiting_bitmask.load(Ordering::Relaxed);
+        self.wake_up_to(exposed, waiting);
     }
 
     /// Create a new latch owned by the worker.
@@ -2018,7 +2060,12 @@ impl Worker {
         // workers to take, skip the stack job (no push, no recover) and run both
         // closures inline. Both always run to completion, and if either panics
         // the first panic is propagated, as on the parallel path below.
-        if self.lifo_queue.len() >= Self::INLINE_DEPTH {
+        let depth = self.lifo_queue.len();
+        if depth == 0 {
+            // A new tree of joins starts here.
+            self.join_start.set(ticks());
+        }
+        if depth >= Self::INLINE_DEPTH {
             // Keep polling the heartbeat, so the subtrees already queued keep
             // being shared during a long inline run. Sharing one lets nested
             // joins start exposing work again.
@@ -2086,9 +2133,9 @@ impl Worker {
         // Push the job onto the queue.
         self.lifo_queue.push_new(job_ref);
 
-        // If we have received a heartbeat, we remove the oldest item in the
-        // local queue and push it into the shared queue. This causes work to be
-        // shared in "breadth-first" order (as opposed to the "depth-first"
+        // If we have received a heartbeat, we remove the oldest items in the
+        // local queue and push them into the shared queue. This causes work to
+        // be shared in "breadth-first" order (as opposed to the "depth-first"
         // order we use when executing).
         self.promote();
 

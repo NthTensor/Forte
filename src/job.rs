@@ -183,22 +183,29 @@ impl JobQueue {
         }
     }
 
-    /// The size of a chunk of jobs.
-    const CHUNK_SIZE: usize = 16;
+    /// The maximum number of chunks the queue is split into.
+    pub(crate) const MAX_CHUNKS: usize = 16;
 
-    /// Splits off a series of chunks from the end of the queue (the side with
-    /// the newest jobs). Each chunk is of size `CHUNK_SIZE`. Afterwards, at most
-    /// `CHUNK_SIZE` jobs will remain in the queue.
+    /// Splits the queue into a series of chunks, taken from the end of the
+    /// queue (the side with the newest jobs). There are at most `MAX_CHUNKS`
+    /// chunks, of nearly equal size, and afterwards the queue is empty.
     pub fn split(&self) -> Vec<VecDeque<JobRef>> {
         // SAFETY: We have unique access to `job_refs` (see the field
         // invariant).
         let job_refs = unsafe { &mut *self.job_refs.get() };
-        let mut len = job_refs.len();
-        let num_chunks = len / Self::CHUNK_SIZE;
+        let len = job_refs.len();
+        let num_chunks = len.min(Self::MAX_CHUNKS);
+        if num_chunks == 0 {
+            return Vec::new();
+        }
+        let base = len / num_chunks;
+        let extra = len % num_chunks;
+        let mut remaining = len;
         (0..num_chunks)
-            .map(|_| {
-                let chunk = job_refs.split_off(len - Self::CHUNK_SIZE);
-                len -= Self::CHUNK_SIZE;
+            .map(|i| {
+                let size = base + usize::from(i < extra);
+                let chunk = job_refs.split_off(remaining - size);
+                remaining -= size;
                 chunk
             })
             .collect()
