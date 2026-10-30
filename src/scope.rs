@@ -22,9 +22,12 @@ use scope_ptr::ScopePtr;
 
 use crate::FnOnceMarker;
 use crate::FutureMarker;
+use crate::JobMarker;
 use crate::ThreadPool;
 use crate::job::HeapJob;
+use crate::job::Job;
 use crate::job::JobRef;
+use crate::job::JobStorage;
 use crate::latch::Latch;
 use crate::platform::*;
 use crate::thread_pool::Broadcast;
@@ -486,6 +489,9 @@ impl<'scope, 'env> Scope<'scope, 'env> {
 ///
 /// * Futures that satisfy `Future<Output = ()> + Send + 'scope`.
 ///
+/// * References to [`JobStorage`] that outlive `'scope`, which run the stored
+///   [`ScopedJob`] (every [`Job`] is one) without allocating.
+///
 /// Due to a bug in rustc, you may be given errors when using closures
 /// with inferred types. If you encounter the following:
 ///
@@ -578,6 +584,115 @@ where
 
         // Send the job to a queue to be executed.
         Worker::with_current(|worker| scheduler.schedule(job_ref, worker));
+    }
+}
+
+/// Work that can be stored in a [`JobStorage`] and spawned onto a [`Scope`],
+/// with access to that scope while it runs.
+///
+/// Every [`Job`] is a `ScopedJob` that ignores the scope. Implement this
+/// directly when the job needs to spawn more work onto the scope it runs in,
+/// such as other job storage.
+pub trait ScopedJob<'scope>: Send {
+    /// Runs the job. This is called once each time the [`JobStorage`] holding
+    /// the job is spawned onto a scope.
+    fn run<'env>(
+        &mut self,
+        scope: &'scope Scope<'scope, 'env>,
+        worker: &Worker,
+    );
+}
+
+impl<'scope, T: Job> ScopedJob<'scope> for T {
+    #[inline(always)]
+    fn run<'env>(&mut self, _: &'scope Scope<'scope, 'env>, worker: &Worker) {
+        Job::run(self, worker);
+    }
+}
+
+impl<'scope, T> SpawnScoped<'scope, JobMarker> for &'scope JobStorage<T>
+where
+    T: ScopedJob<'scope> + 'scope,
+{
+    #[inline]
+    unsafe fn spawn_scoped<'env, S: for<'w> Scheduler<'w>>(
+        self,
+        scope: &'scope Scope<'scope, 'env>,
+        scheduler: S,
+    ) {
+        // Record the scope in the storage, so the job can find it while it
+        // runs.
+        self.claim(ptr::from_ref(scope).cast_mut().cast());
+        // Keep the scope open until the job has run. The pointer recorded by
+        // the claim doubles as this reference: `ScopedJobStorage::execute`
+        // rebuilds the `ScopePtr` from it with `ScopePtr::from_raw`. The
+        // reference is taken only after the claim succeeds, because `claim`
+        // panics if the storage is already pending, and a reference taken
+        // before that would leak and keep the scope from ever completing.
+        let _ = ScopePtr::new(scope).into_raw();
+
+        // SAFETY: `JobStorage::as_job_ref` requires:
+        //
+        // * That `JobRef::execute` is only called when it is sound to call
+        //   `ScopedJobStorage::<'scope, 'env, T>::execute` on this storage. The
+        //   storage is borrowed for `'scope`, and the scope reference taken
+        //   above keeps the scope (and so `'scope`) from ending until the job
+        //   has run. We hold the claim made above, which records this scope and
+        //   which `JobRef::execute` (called at most once) passes to
+        //   `ScopedJobStorage::execute`, along with the scope reference. The
+        //   job is `Send` (`ScopedJob: Send`), so it may run on any thread.
+        //
+        // * That `ScopedJobStorage::execute` does not unwind. It catches
+        //   panics from the job and stores them on the scope.
+        let job_ref = unsafe {
+            self.as_job_ref(ScopedJobStorage::<'scope, 'env, T>::execute)
+        };
+        Worker::with_current(|worker| scheduler.schedule(job_ref, worker));
+    }
+}
+
+/// Names the lifetimes of a scoped `JobStorage<T>`'s spawn, so its execute
+/// function can be instantiated with them.
+struct ScopedJobStorage<'scope, 'env, T>(
+    PhantomData<(&'scope Scope<'scope, 'env>, T)>,
+);
+
+impl<'scope, 'env, T: ScopedJob<'scope>> ScopedJobStorage<'scope, 'env, T> {
+    /// Runs the job in a scoped `JobStorage<T>`, releases its claim, and then
+    /// releases the scope reference taken when it was spawned.
+    ///
+    /// # Safety
+    ///
+    /// `this` must point to a `JobStorage<T>` that lives for `'scope`, whose
+    /// claim the caller holds and passes to this call. The claim must have
+    /// recorded a `Scope<'scope, 'env>`, and the reference to it taken with
+    /// `ScopePtr::into_raw` when spawning must also be passed to this call.
+    unsafe fn execute(this: NonNull<()>, worker: &Worker) {
+        // SAFETY: Per the safety contract, `this` points to a `JobStorage<T>`
+        // that lives for `'scope`.
+        let storage = unsafe { this.cast::<JobStorage<T>>().as_ref() };
+        // SAFETY: We hold the claim, which recorded the scope.
+        let scope_raw: *const Scope<'scope, 'env> =
+            unsafe { storage.claimed() }.cast_const().cast();
+        // SAFETY: The scope reference passed to this call keeps the scope from
+        // completing (and so from being freed) until we drop it below, so the
+        // scope is live for all of `'scope` as seen by the job.
+        let scope = unsafe { &*scope_raw };
+        // SAFETY: We hold the claim, and this is its only run.
+        let result =
+            unsafe { storage.run_claimed(|job| job.run(scope, worker)) };
+        // SAFETY: We hold the claim, and do not use the job after this.
+        unsafe { storage.release() };
+        // SAFETY: The claim recorded the scope that the spawn took a reference
+        // to with `ScopePtr::into_raw`, and that reference is passed to this
+        // call.
+        let scope_ptr = unsafe { ScopePtr::from_raw(scope_raw) };
+        if let Err(err) = result {
+            scope_ptr.store_panic(err);
+        }
+        // Dropping the scope reference may complete the scope. Neither the
+        // storage nor the scope is used after this.
+        drop(scope_ptr);
     }
 }
 
@@ -1073,6 +1188,27 @@ mod scope_ptr {
             ScopePtr(scope)
         }
 
+        /// Converts the pointer into a raw scope pointer, keeping its reference
+        /// to the scope.
+        pub fn into_raw(self) -> *const Scope<'scope, 'env> {
+            let ptr = self.0;
+            core::mem::forget(self);
+            ptr
+        }
+
+        /// Recreates a scope pointer from [`ScopePtr::into_raw`], taking back
+        /// its reference to the scope.
+        ///
+        /// # Safety
+        ///
+        /// `ptr` must come from `ScopePtr::into_raw`, and each call to
+        /// `into_raw` may be matched by at most one call to this.
+        pub unsafe fn from_raw(
+            ptr: *const Scope<'scope, 'env>,
+        ) -> ScopePtr<'scope, 'env> {
+            ScopePtr(ptr)
+        }
+
         /// Stores a panic in the scope that can be resumed later.
         pub fn store_panic(&self, err: Box<dyn Any + Send + 'static>) {
             // SAFETY: This was created using an immutable scope reference, and
@@ -1117,7 +1253,12 @@ mod tests {
     use std::vec;
     use std::vec::Vec;
 
+    use std::sync::OnceLock;
+
     use super::Scope;
+    use super::ScopedJob;
+    use crate::Job;
+    use crate::JobStorage;
     use crate::ThreadPool;
     use crate::Worker;
     use crate::scope;
@@ -1772,6 +1913,143 @@ mod tests {
         let counter = AtomicUsize::new(0);
         increment(&[&counter; 100]);
         assert_eq!(counter.into_inner(), 100);
+
+        THREAD_POOL.depopulate();
+    }
+
+    /// Tests that job storage can be spawned on a scope, and spawned again
+    /// once its job has run.
+    #[test]
+    fn scope_job_storage() {
+        static THREAD_POOL: ThreadPool = ThreadPool::new();
+        THREAD_POOL.resize_to_available();
+
+        struct Count(u32);
+        impl Job for Count {
+            fn run(&mut self, _: &Worker) {
+                self.0 += 1;
+            }
+        }
+
+        let mut jobs: Vec<JobStorage<Count>> =
+            (0..64).map(|_| JobStorage::new(Count(0))).collect();
+        for _ in 0..3 {
+            THREAD_POOL.scope(|scope| {
+                for job in &jobs {
+                    scope.spawn(job);
+                }
+            });
+        }
+
+        for job in &mut jobs {
+            assert!(!job.is_pending());
+            assert_eq!(job.get_mut().0, 3);
+        }
+
+        THREAD_POOL.depopulate();
+    }
+
+    /// Tests that spawning job storage whose job is still pending panics,
+    /// without affecting the pending job.
+    #[test]
+    fn scope_job_storage_double_spawn_panics() {
+        static THREAD_POOL: ThreadPool = ThreadPool::new();
+        THREAD_POOL.resize_to_available();
+
+        let release = &AtomicU8::new(0);
+        let runs = &AtomicUsize::new(0);
+        let job = JobStorage::new(move |_: &Worker| {
+            // Stay pending until the second spawn has been attempted.
+            while release.load(Ordering::Acquire) == 0 {
+                std::thread::yield_now();
+            }
+            runs.fetch_add(1, Ordering::SeqCst);
+        });
+
+        let result = unwind::halt_unwinding(|| {
+            THREAD_POOL.scope(|scope| {
+                scope.spawn(&job);
+                let second = unwind::halt_unwinding(|| scope.spawn(&job));
+                release.store(1, Ordering::Release);
+                assert!(second.is_err());
+            });
+        });
+
+        assert!(result.is_ok());
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+        assert!(!job.is_pending());
+
+        THREAD_POOL.depopulate();
+    }
+
+    /// Tests that a panicking job propagates its panic out of the scope, and
+    /// leaves the storage idle.
+    #[test]
+    fn scope_job_storage_panic() {
+        static THREAD_POOL: ThreadPool = ThreadPool::new();
+        THREAD_POOL.resize_to_available();
+
+        let job = JobStorage::new(|_: &Worker| panic!("job panicked"));
+        let result = unwind::halt_unwinding(|| {
+            THREAD_POOL.scope(|scope| scope.spawn(&job));
+        });
+
+        assert!(result.is_err());
+        assert!(!job.is_pending());
+
+        THREAD_POOL.depopulate();
+    }
+
+    /// Tests that a scoped job can spawn other job storage onto the scope it
+    /// runs in.
+    #[test]
+    fn scope_scoped_job_spawns_more() {
+        static THREAD_POOL: ThreadPool = ThreadPool::new();
+        THREAD_POOL.resize_to_available();
+
+        /// A node of a binary tree, stored with all the others in one `Vec`.
+        /// Counts itself, then spawns its children.
+        struct Node<'a> {
+            index: usize,
+            nodes: &'a OnceLock<Vec<JobStorage<Node<'a>>>>,
+            counter: &'a AtomicUsize,
+        }
+
+        impl<'scope, 'a: 'scope> ScopedJob<'scope> for Node<'a> {
+            fn run<'env>(
+                &mut self,
+                scope: &'scope Scope<'scope, 'env>,
+                _: &Worker,
+            ) {
+                self.counter.fetch_add(1, Ordering::SeqCst);
+                let nodes: &'a [JobStorage<Node<'a>>] =
+                    self.nodes.get().unwrap();
+                let children = (2 * self.index + 1)..=(2 * self.index + 2);
+                for child in children.filter_map(|i| nodes.get(i)) {
+                    scope.spawn(child);
+                }
+            }
+        }
+
+        const NODES: usize = 1000;
+        let counter = AtomicUsize::new(0);
+        let cell = OnceLock::new();
+        let nodes = (0..NODES)
+            .map(|index| {
+                JobStorage::new(Node {
+                    index,
+                    nodes: &cell,
+                    counter: &counter,
+                })
+            })
+            .collect();
+        let _ = cell.set(nodes);
+        let nodes = cell.get().unwrap();
+
+        for runs in 1..=2 {
+            THREAD_POOL.scope(|scope| scope.spawn(&nodes[0]));
+            assert_eq!(counter.load(Ordering::SeqCst), runs * NODES);
+        }
 
         THREAD_POOL.depopulate();
     }

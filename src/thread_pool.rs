@@ -29,9 +29,12 @@ use st3::lifo::Worker as Sharer;
 
 use crate::FnOnceMarker;
 use crate::FutureMarker;
+use crate::JobMarker;
 use crate::job::HeapJob;
+use crate::job::Job;
 use crate::job::JobQueue;
 use crate::job::JobRef;
+use crate::job::JobStorage;
 use crate::job::StackJob;
 use crate::latch::Latch;
 use crate::latch::Semaphore;
@@ -529,7 +532,11 @@ pub use async_task::Task;
 ///
 /// * Futures that satisfy `Future<Output = T> + Send + 'static` where `T: Send + 'static`.
 ///
-/// Closures return `()` when spawned, but futures return a [`Task`].
+/// * References to `'static` [`JobStorage`], which run the stored [`Job`]
+///   without allocating.
+///
+/// Closures and job storage return `()` when spawned, but futures return a
+/// [`Task`].
 ///
 /// # Compile Errors
 ///
@@ -736,6 +743,55 @@ where
 
         // Return the task.
         task
+    }
+}
+
+impl<T> Spawn<JobMarker> for &'static JobStorage<T>
+where
+    T: Job + 'static,
+{
+    type Output = ();
+
+    #[inline]
+    unsafe fn spawn<S>(self, scheduler: S, worker: Option<&Worker>)
+    where
+        S: for<'w> Scheduler<'w> + 'static,
+    {
+        self.claim(JobStorage::<T>::UNSCOPED);
+
+        // SAFETY: `JobStorage::as_job_ref` requires:
+        //
+        // * That `JobRef::execute` is only called when it is sound to call
+        //   `execute_job_storage::<T>` on this storage. The storage is
+        //   `'static`, so it is live whenever the `JobRef` runs, and we hold
+        //   the claim made above, which `JobRef::execute` (called at most once)
+        //   passes to `execute_job_storage`. The job is `Send` (`Job: Send`),
+        //   so it may run on any thread.
+        //
+        // * That `execute_job_storage` does not unwind. It catches panics from
+        //   the job and passes them to `handle_panic`, which never unwinds.
+        let job_ref = unsafe { self.as_job_ref(execute_job_storage::<T>) };
+        scheduler.schedule(job_ref, worker);
+    }
+}
+
+/// Runs the job in a `&'static JobStorage<T>`, then releases its claim.
+///
+/// # Safety
+///
+/// `this` must point to a `JobStorage<T>` that lives for `'static`, whose claim
+/// the caller holds and passes to this call.
+unsafe fn execute_job_storage<T: Job>(this: NonNull<()>, worker: &Worker) {
+    // SAFETY: Per the safety contract, `this` points to a live `JobStorage<T>`.
+    let storage = unsafe { this.cast::<JobStorage<T>>().as_ref() };
+    // SAFETY: We hold the claim, and this is its only run.
+    let result = unsafe { storage.run_claimed(|job| job.run(worker)) };
+    // SAFETY: We hold the claim, and do not use the job after this.
+    unsafe { storage.release() };
+    // Panics may not unwind out of the job, so are sent to the thread pool's
+    // handler.
+    if let Err(payload) = result {
+        worker.thread_pool.handle_panic(payload);
     }
 }
 
@@ -3030,5 +3086,28 @@ mod tests {
         assert!(outer.load(Ordering::SeqCst));
         assert!(!halves[0].load(Ordering::SeqCst));
         assert!(!halves[1].load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn spawn_static_job_storage() {
+        static THREAD_POOL: ThreadPool = ThreadPool::new();
+        THREAD_POOL.resize_to_available();
+
+        static RUNS: AtomicUsize = AtomicUsize::new(0);
+        fn count(_: &Worker) {
+            RUNS.fetch_add(1, Ordering::SeqCst);
+        }
+        static JOB: JobStorage<fn(&Worker)> = JobStorage::new(count);
+
+        // Once the job has run, the storage can be spawned again.
+        for expected in 1..=3 {
+            THREAD_POOL.spawn(&JOB);
+            while JOB.is_pending() {
+                std::thread::yield_now();
+            }
+            assert_eq!(RUNS.load(Ordering::SeqCst), expected);
+        }
+
+        THREAD_POOL.depopulate();
     }
 }

@@ -209,6 +209,9 @@ pub struct FnOnceMarker();
 #[doc(hidden)]
 pub struct FutureMarker();
 
+#[doc(hidden)]
+pub struct JobMarker();
+
 // -----------------------------------------------------------------------------
 // Trait sealing
 
@@ -219,18 +222,24 @@ mod sealed {
 
     use crate::FnOnceMarker;
     use crate::FutureMarker;
+    use crate::JobMarker;
+    use crate::JobStorage;
     use crate::Worker;
 
     pub trait Sealed<M> {}
 
     impl<F: FnOnce(&Worker)> Sealed<FnOnceMarker> for F {}
     impl<Fut: Future> Sealed<FutureMarker> for Fut {}
+    impl<T> Sealed<JobMarker> for &JobStorage<T> {}
 }
 
 // -----------------------------------------------------------------------------
 // Top-level exports
 
+pub use job::Job;
+pub use job::JobStorage;
 pub use scope::Scope;
+pub use scope::ScopedJob;
 pub use scope::SpawnScoped;
 pub use thread_pool::Broadcast;
 pub use thread_pool::DEFAULT_POOL;

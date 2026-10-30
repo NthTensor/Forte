@@ -1,7 +1,8 @@
 //! This module defines an executable unit of work called a "Job". Jobs are
-//! what get scheduled on the thread pool. There are two core job types:
-//! [`StackJob`] and [`HeapJob`]. There is no unifying `Job` trait. Instead,
-//! what makes these both jobs is their ability to yield a [`JobRef`].
+//! what get scheduled on the thread pool. There are three job types:
+//! [`StackJob`], [`HeapJob`], and the public [`JobStorage`]. What makes these
+//! all jobs is their ability to yield a [`JobRef`]. The public [`Job`] trait
+//! describes only the work a [`JobStorage`] holds.
 //!
 //! After a job is allocated, we typically refer to it by a [`JobRef`]. Job refs
 //! are type-erased, and can be sent between threads without moving the
@@ -14,9 +15,13 @@ use core::any::Any;
 use core::cell::UnsafeCell;
 use core::marker::PhantomData;
 use core::mem::ManuallyDrop;
+use core::ptr;
 use core::ptr::NonNull;
+use std::thread;
 
 use crate::latch::Latch;
+use crate::platform::AtomicPtr;
+use crate::platform::Ordering;
 use crate::thread_pool::Worker;
 use crate::unwind;
 
@@ -628,5 +633,169 @@ where
         // the construction thread when `f` is `!Send`. `f` does not unwind, per
         // `HeapJob::new`'s contract.
         (this.f)(worker);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Job storage
+
+/// Work that can be stored in a [`JobStorage`] and spawned by reference.
+///
+/// This is implemented for every `FnMut(&Worker) + Send` closure, including
+/// plain `fn(&Worker)` pointers.
+pub trait Job: Send {
+    /// Runs the job. This is called once each time the [`JobStorage`] holding
+    /// the job is spawned.
+    fn run(&mut self, worker: &Worker);
+}
+
+impl<F> Job for F
+where
+    F: FnMut(&Worker) + Send,
+{
+    #[inline(always)]
+    fn run(&mut self, worker: &Worker) {
+        self(worker);
+    }
+}
+
+/// Caller-owned storage for a [`Job`], which can be spawned by reference
+/// without allocating.
+///
+/// A `&'scope JobStorage<T>` can be spawned onto a [`Scope`][crate::Scope]
+/// when `T` is a [`ScopedJob`][crate::ScopedJob] (which every [`Job`] is), and
+/// a `&'static JobStorage<T>` onto a [`ThreadPool`][crate::ThreadPool] or
+/// [`Worker`] when `T` is a [`Job`]. The job runs in place, and once it has run
+/// the storage can be spawned again.
+///
+/// # Panics
+///
+/// Spawning storage whose job is still pending (spawned, but not yet run)
+/// panics.
+///
+/// A panic while running the job is handled like a panic in any other spawned
+/// work. The storage becomes idle again, and the job is left in whatever state
+/// `run` reached before panicking.
+pub struct JobStorage<T> {
+    /// Null while idle. While a spawn is pending, a value recorded by that
+    /// spawn: the scope it was spawned on, or [`JobStorage::UNSCOPED`].
+    pending: AtomicPtr<()>,
+    job: UnsafeCell<T>,
+}
+
+// SAFETY: A shared `&JobStorage<T>` only reaches `job` through `run_claimed`,
+// whose caller must hold the claim made by `claim`. `claim` swaps `pending`
+// from null, and only `release` sets it back, so at most one claim exists at a
+// time and at most one thread accesses `job` at once. The job is therefore
+// only ever moved between threads, never shared, so `T: Send` suffices.
+unsafe impl<T: Send> Sync for JobStorage<T> {}
+
+impl<T> JobStorage<T> {
+    /// The value recorded in `pending` by unscoped spawns. Scopes are never
+    /// stored at this address, so it cannot be mistaken for one.
+    pub(crate) const UNSCOPED: *mut () = ptr::dangling_mut();
+
+    /// Creates storage holding `job`.
+    pub const fn new(job: T) -> JobStorage<T> {
+        JobStorage {
+            pending: AtomicPtr::new(ptr::null_mut()),
+            job: UnsafeCell::new(job),
+        }
+    }
+
+    /// Returns whether the job has been spawned and has not finished running.
+    /// Storage that is not pending can be spawned again.
+    pub fn is_pending(&self) -> bool {
+        !self.pending.load(Ordering::Relaxed).is_null()
+    }
+
+    /// Returns a mutable reference to the job.
+    pub fn get_mut(&mut self) -> &mut T {
+        self.job.get_mut()
+    }
+
+    /// Consumes the storage, returning the job.
+    pub fn into_inner(self) -> T {
+        self.job.into_inner()
+    }
+
+    /// Claims the storage for a spawn, recording `pending` until the claim is
+    /// released.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the storage is already claimed.
+    pub(crate) fn claim(&self, pending: *mut ()) {
+        // `Acquire` synchronizes with the `Release` in `release`, so the
+        // previous run's accesses to the job happen-before this claim's run.
+        if self
+            .pending
+            .compare_exchange(
+                ptr::null_mut(),
+                pending,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            )
+            .is_err()
+        {
+            panic!("spawned a `JobStorage` whose job is still pending");
+        }
+    }
+
+    /// Releases the claim, returning the value recorded by `claim`.
+    ///
+    /// # Safety
+    ///
+    /// The caller must hold the claim, and must not use the job through this
+    /// claim afterwards.
+    pub(crate) unsafe fn release(&self) -> *mut () {
+        // `Release` orders this claim's accesses to the job before the next
+        // claim (see `claim`).
+        self.pending.swap(ptr::null_mut(), Ordering::Release)
+    }
+
+    /// Returns a `JobRef` that calls `execute_fn` on this storage.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that `JobRef::execute` will only be called on
+    /// the returned `JobRef` when it is sound to call `execute_fn` on a
+    /// pointer to this storage, and that `execute_fn` does not unwind.
+    pub(crate) unsafe fn as_job_ref(
+        &self,
+        execute_fn: unsafe fn(NonNull<()>, &Worker),
+    ) -> JobRef {
+        // SAFETY: The caller upholds both clauses of the `JobRef::new` safety
+        // contract.
+        unsafe { JobRef::new(NonNull::from(self).cast(), execute_fn) }
+    }
+
+    /// Returns the value recorded by the current claim.
+    ///
+    /// # Safety
+    ///
+    /// The caller must hold the claim.
+    pub(crate) unsafe fn claimed(&self) -> *mut () {
+        // The claim was made before the `JobRef` holding it was queued, and
+        // queueing synchronizes with whoever runs the job, so a relaxed load
+        // sees the value recorded by the claim.
+        self.pending.load(Ordering::Relaxed)
+    }
+
+    /// Calls `f` with the job, catching any panic.
+    ///
+    /// # Safety
+    ///
+    /// The caller must hold the claim, and must not have run the job through
+    /// it already.
+    pub(crate) unsafe fn run_claimed(
+        &self,
+        f: impl FnOnce(&mut T),
+    ) -> thread::Result<()> {
+        // SAFETY: Holding the claim gives exclusive access to the job (see the
+        // `Sync` impl), so no other reference to it exists while this one is
+        // live.
+        let job = unsafe { &mut *self.job.get() };
+        unwind::halt_unwinding(|| f(job))
     }
 }
