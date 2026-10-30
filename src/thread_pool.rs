@@ -95,9 +95,9 @@ pub struct ThreadPool {
     /// A bitmask that tracks which members are waiting on their semaphore
     /// signal.
     waiting_bitmask: CachePadded<AtomicU32>,
-    /// Whether a worker is spinning while it looks for work (see
-    /// [`Worker::spin_for_work`]). At most one worker spins at a time.
-    spinning: CachePadded<AtomicBool>,
+    /// Number of workers searching for work instead of parking (see
+    /// [`Worker::search_for_work`]).
+    searching: CachePadded<AtomicU32>,
     /// Holds controls for threads spawned and managed by the pool. Initialized
     /// on first call to `activate`, to allow for some non-static constructors.
     managed_workers: Mutex<Vec<ManagedWorker>>,
@@ -199,7 +199,7 @@ impl ThreadPool {
             resignations: CachePadded::new(AtomicU32::new(0)),
             claimed_bitmask: CachePadded::new(AtomicU32::new(0)),
             waiting_bitmask: CachePadded::new(AtomicU32::new(0)),
-            spinning: CachePadded::new(AtomicBool::new(false)),
+            searching: CachePadded::new(AtomicU32::new(0)),
             wants_to_resign: CachePadded::new(AtomicU32::new(0)),
             managed_workers: Mutex::new(Vec::new()),
             panic_handler: Mutex::new(None),
@@ -278,10 +278,10 @@ impl ThreadPool {
     pub fn push_shared_job(&'static self, job_ref: JobRef) {
         self.shared_queue.push(job_ref);
         // Try to wake up a worker to execute this job. This is relatively cheap
-        // if no workers are waiting. A spinning worker will find the job without
-        // being woken.
+        // if no workers are waiting. A searching worker will find the job
+        // without being woken.
         let waiting_bitmask = self.waiting_bitmask.load(Ordering::Relaxed);
-        if waiting_bitmask != 0 && !self.spinning.load(Ordering::Relaxed) {
+        if waiting_bitmask != 0 && self.searching.load(Ordering::Relaxed) == 0 {
             let i = waiting_bitmask.trailing_zeros() as usize;
             self.get_member_data().semaphores[i].signal();
         }
@@ -1163,6 +1163,7 @@ impl Membership {
             rng: XorShift64Star::new(),
             last_promote_tick: Cell::new(0),
             join_start: Cell::new(0),
+            search_until: Cell::new(0),
             heartbeat_ticks: time::duration_to_ticks(time::HEARTBEAT),
             spin_ticks: time::duration_to_ticks(Worker::SPIN_DURATION),
             _phantom: PhantomData,
@@ -1353,6 +1354,9 @@ pub struct Worker {
     /// empty, used to share more of the queued work the longer it has been
     /// building up.
     join_start: Cell<u64>,
+    /// The tick until which this worker searches for work instead of parking
+    /// when it runs out (see [`Worker::search_until`]).
+    search_until: Cell<u64>,
     /// [`time::HEARTBEAT`] in ticks.
     heartbeat_ticks: u64,
     /// [`Worker::SPIN_DURATION`] in ticks.
@@ -1467,8 +1471,8 @@ impl Worker {
     /// more would only add bookkeeping.
     const INLINE_DEPTH: usize = 4;
 
-    /// How long an idle worker spins looking for work before it parks, if no
-    /// other worker is already spinning (see [`Worker::spin_for_work`]).
+    /// How long an idle worker searches for work before it parks, if no other
+    /// worker is already searching (see [`Worker::search_for_work`]).
     const SPIN_DURATION: Duration = Duration::from_micros(50);
 
     /// Shares locally queued work with sibling workers, at most once per
@@ -1499,8 +1503,8 @@ impl Worker {
         self.last_promote_tick.set(current_tick);
 
         let waiting = self.thread_pool.waiting_bitmask.load(Ordering::Relaxed);
-        let spinning = self.thread_pool.spinning.load(Ordering::Relaxed);
-        let idle = waiting.count_ones() + u32::from(spinning);
+        let searching = self.thread_pool.searching.load(Ordering::Relaxed);
+        let idle = waiting.count_ones() + searching;
 
         // Early out if no sibling is idle and nobody has taken the work we
         // already shared.
@@ -1610,49 +1614,109 @@ impl Worker {
     }
 
     /// Wakes one sleeping worker per job in this worker's steal queue, less one
-    /// if a worker is spinning, since it will take a job without being woken.
+    /// for each worker that is searching, since those will take a job without
+    /// being woken.
     #[inline]
     pub(crate) fn wake_for_shared_work(&self) {
         let sharer = self.sharing_queue();
         let exposed = (sharer.capacity() - sharer.spare_capacity()) as u32;
-        let spinning = self.thread_pool.spinning.load(Ordering::Relaxed);
+        let searching = self.thread_pool.searching.load(Ordering::Relaxed);
         let waiting = self.thread_pool.waiting_bitmask.load(Ordering::Relaxed);
-        self.wake_up_to(exposed.saturating_sub(u32::from(spinning)), waiting);
+        self.wake_up_to(exposed.saturating_sub(searching), waiting);
     }
 
-    /// Spins looking for work, if no other worker is spinning already. Returns
-    /// `true` if it found and ran a job, and `false` if another worker was
-    /// spinning or none turned up within [`Worker::SPIN_DURATION`].
+    /// Shares queued `join` work with idle siblings right away, rather than at
+    /// the next heartbeat: up to one subtree for each sibling that is parked,
+    /// or searching. For callers that know their remaining work is
+    /// large enough to be worth spreading, such as a long parallel iterator.
+    pub fn share_now(&self) {
+        let pool = self.thread_pool;
+        let idle = pool.waiting_bitmask.load(Ordering::Relaxed).count_ones()
+            + pool.searching.load(Ordering::Relaxed);
+        if idle == 0 {
+            return;
+        }
+        let mut shared = false;
+        for _ in 0..idle {
+            let Some(job_ref) = self.lifo_queue.pop_oldest() else {
+                break;
+            };
+            match self.sharing_queue().push(job_ref) {
+                Ok(()) => shared = true,
+                Err(job_ref) => {
+                    self.lifo_queue.push_old(job_ref);
+                    break;
+                }
+            }
+        }
+        if shared {
+            self.wake_for_shared_work();
+        }
+    }
+
+    /// Asks this worker to keep searching for work, rather than parking, if it
+    /// runs out before `tick` (a [`time::ticks`] value). For callers that know
+    /// more work is likely to be shared soon, such as a parallel iterator with
+    /// items still outstanding.
+    #[inline]
+    pub fn search_until(&self, tick: u64) {
+        if tick > self.search_until.get() {
+            self.search_until.set(tick);
+        }
+    }
+
+    /// Searches for work instead of parking, until the deadline set by
+    /// [`Worker::search_until`] or until `latch` is set. A worker in the pool's
+    /// idle loop (with no `latch`) also searches for [`Worker::SPIN_DURATION`]
+    /// if no other worker is searching. Returns `true` if it ran a job or the
+    /// latch was set, and `false` if it should park.
     ///
     /// Waking a parked worker takes far longer than handing work to one that is
     /// already looking, so keeping one idle worker briefly awake lets new work
-    /// start sooner. Only one worker spins at a time, so idle workers cost at
-    /// most one core.
-    fn spin_for_work(&self) -> bool {
-        let spinning = &self.thread_pool.spinning;
-        if spinning.swap(true, Ordering::Relaxed) {
+    /// start sooner, while idle workers cost at most one core unless a caller
+    /// asks them to search for longer.
+    fn search_for_work(&self, latch: Option<&Latch>) -> bool {
+        let now = ticks();
+        let search_until = self.search_until.get();
+        // Waiting on a latch, only search when asked to with `search_until`.
+        if latch.is_some() && now >= search_until {
             return false;
         }
-        let start = ticks();
+        let searching = &self.thread_pool.searching;
+        // The first worker to start searching from the idle loop also searches
+        // for `SPIN_DURATION`.
+        let first = searching.fetch_add(1, Ordering::Relaxed) == 0;
+        let mut until = search_until;
+        if latch.is_none() && first {
+            until = until.max(now.wrapping_add(self.spin_ticks));
+        }
+        if now >= until {
+            searching.fetch_sub(1, Ordering::Relaxed);
+            return false;
+        }
         let found = loop {
+            if latch
+                .is_some_and(|latch| !matches!(latch.check(), Status::Pending))
+            {
+                break None;
+            }
             if let Some(found) = self.find_work() {
                 break Some(found);
             }
-            if ticks().wrapping_sub(start) >= self.spin_ticks {
-                break None;
+            if ticks() >= until {
+                self.search_until.set(0);
+                searching.fetch_sub(1, Ordering::Relaxed);
+                return false;
             }
             core::hint::spin_loop();
         };
-        // Stop spinning before running the job, so another idle worker can take
-        // over.
-        spinning.store(false, Ordering::Relaxed);
-        match found {
-            Some((job_ref, migrated)) => {
-                self.execute(job_ref, migrated);
-                true
-            }
-            None => false,
+        // Stop searching before running the job, so another idle worker can
+        // take over.
+        searching.fetch_sub(1, Ordering::Relaxed);
+        if let Some((job_ref, migrated)) = found {
+            self.execute(job_ref, migrated);
         }
+        true
     }
 
     /// Create a new latch owned by the worker.
@@ -1673,7 +1737,9 @@ impl Worker {
         loop {
             match latch.check() {
                 Status::Pending => {
-                    if self.yield_now() == Yield::Idle {
+                    if self.yield_now() == Yield::Idle
+                        && !self.search_for_work(Some(latch))
+                    {
                         let member_bitmask = 1 << self.membership.member_index;
                         let waiting_bitmask =
                             &self.membership.thread_pool.waiting_bitmask;
@@ -2932,7 +2998,9 @@ fn managed_worker(membership: Membership, halt: Arc<AtomicBool>) {
     // Register as the indicated worker, and work until we are told to halt.
     membership.activate(|worker| {
         while !halt.load(Ordering::Relaxed) {
-            if worker.yield_now() == Yield::Idle && !worker.spin_for_work() {
+            if worker.yield_now() == Yield::Idle
+                && !worker.search_for_work(None)
+            {
                 worker.wait();
             }
         }
@@ -3106,6 +3174,33 @@ mod tests {
                 std::thread::yield_now();
             }
             assert_eq!(RUNS.load(Ordering::SeqCst), expected);
+        }
+
+        THREAD_POOL.depopulate();
+    }
+
+    #[test]
+    fn searching_and_shared_joins_complete() {
+        static THREAD_POOL: ThreadPool = ThreadPool::new();
+        THREAD_POOL.resize_to_available();
+
+        fn sum(worker: &Worker, range: core::ops::Range<u64>) -> u64 {
+            if range.end - range.start <= 64 {
+                worker.share_now();
+                let search = time::duration_to_ticks(Duration::from_micros(50));
+                worker.search_until(ticks() + search);
+                return range.sum();
+            }
+            let mid = range.start + (range.end - range.start) / 2;
+            let (a, b) = worker
+                .join(|w| sum(w, range.start..mid), |w| sum(w, mid..range.end));
+            a + b
+        }
+
+        for _ in 0..10 {
+            let total =
+                THREAD_POOL.with_worker(|worker| sum(worker, 0..100_000));
+            assert_eq!(total, (0..100_000).sum::<u64>());
         }
 
         THREAD_POOL.depopulate();
