@@ -92,6 +92,9 @@ pub struct ThreadPool {
     /// A bitmask that tracks which members are waiting on their semaphore
     /// signal.
     waiting_bitmask: CachePadded<AtomicU32>,
+    /// Whether a worker is spinning while it looks for work (see
+    /// [`Worker::spin_for_work`]). At most one worker spins at a time.
+    spinning: CachePadded<AtomicBool>,
     /// Holds controls for threads spawned and managed by the pool. Initialized
     /// on first call to `activate`, to allow for some non-static constructors.
     managed_workers: Mutex<Vec<ManagedWorker>>,
@@ -193,6 +196,7 @@ impl ThreadPool {
             resignations: CachePadded::new(AtomicU32::new(0)),
             claimed_bitmask: CachePadded::new(AtomicU32::new(0)),
             waiting_bitmask: CachePadded::new(AtomicU32::new(0)),
+            spinning: CachePadded::new(AtomicBool::new(false)),
             wants_to_resign: CachePadded::new(AtomicU32::new(0)),
             managed_workers: Mutex::new(Vec::new()),
             panic_handler: Mutex::new(None),
@@ -271,9 +275,10 @@ impl ThreadPool {
     pub fn push_shared_job(&'static self, job_ref: JobRef) {
         self.shared_queue.push(job_ref);
         // Try to wake up a worker to execute this job. This is relatively cheap
-        // if no workers are waiting.
+        // if no workers are waiting. A spinning worker will find the job without
+        // being woken.
         let waiting_bitmask = self.waiting_bitmask.load(Ordering::Relaxed);
-        if waiting_bitmask != 0 {
+        if waiting_bitmask != 0 && !self.spinning.load(Ordering::Relaxed) {
             let i = waiting_bitmask.trailing_zeros() as usize;
             self.get_member_data().semaphores[i].signal();
         }
@@ -1103,6 +1108,7 @@ impl Membership {
             last_promote_tick: Cell::new(0),
             join_start: Cell::new(0),
             heartbeat_ticks: time::duration_to_ticks(time::HEARTBEAT),
+            spin_ticks: time::duration_to_ticks(Worker::SPIN_DURATION),
             _phantom: PhantomData,
         };
 
@@ -1293,6 +1299,8 @@ pub struct Worker {
     join_start: Cell<u64>,
     /// [`time::HEARTBEAT`] in ticks.
     heartbeat_ticks: u64,
+    /// [`Worker::SPIN_DURATION`] in ticks.
+    spin_ticks: u64,
     /// Set to true when executing a job that came from a different thread.
     migrated: Cell<bool>,
     // Make non-send. A `Worker` represents the local state of a particular
@@ -1302,6 +1310,7 @@ pub struct Worker {
 }
 
 use core::ops::Deref;
+use core::time::Duration;
 
 impl Deref for Worker {
     type Target = Membership;
@@ -1402,6 +1411,10 @@ impl Worker {
     /// more would only add bookkeeping.
     const INLINE_DEPTH: usize = 4;
 
+    /// How long an idle worker spins looking for work before it parks, if no
+    /// other worker is already spinning (see [`Worker::spin_for_work`]).
+    const SPIN_DURATION: Duration = Duration::from_micros(50);
+
     /// Shares locally queued work with sibling workers, at most once per
     /// [`time::HEARTBEAT`]. Between heartbeats it is just a clock read and
     /// a comparison.
@@ -1429,11 +1442,9 @@ impl Worker {
         // Update the promote tick so that `promote` won't call this again soon.
         self.last_promote_tick.set(current_tick);
 
-        let idle = self
-            .thread_pool
-            .waiting_bitmask
-            .load(Ordering::Relaxed)
-            .count_ones();
+        let waiting = self.thread_pool.waiting_bitmask.load(Ordering::Relaxed);
+        let spinning = self.thread_pool.spinning.load(Ordering::Relaxed);
+        let idle = waiting.count_ones() + u32::from(spinning);
 
         // Early out if no sibling is idle and nobody has taken the work we
         // already shared.
@@ -1542,13 +1553,50 @@ impl Worker {
         }
     }
 
-    /// Wakes one sleeping worker per job in this worker's steal queue.
+    /// Wakes one sleeping worker per job in this worker's steal queue, less one
+    /// if a worker is spinning, since it will take a job without being woken.
     #[inline]
     pub(crate) fn wake_for_shared_work(&self) {
         let sharer = self.sharing_queue();
         let exposed = (sharer.capacity() - sharer.spare_capacity()) as u32;
+        let spinning = self.thread_pool.spinning.load(Ordering::Relaxed);
         let waiting = self.thread_pool.waiting_bitmask.load(Ordering::Relaxed);
-        self.wake_up_to(exposed, waiting);
+        self.wake_up_to(exposed.saturating_sub(u32::from(spinning)), waiting);
+    }
+
+    /// Spins looking for work, if no other worker is spinning already. Returns
+    /// `true` if it found and ran a job, and `false` if another worker was
+    /// spinning or none turned up within [`Worker::SPIN_DURATION`].
+    ///
+    /// Waking a parked worker takes far longer than handing work to one that is
+    /// already looking, so keeping one idle worker briefly awake lets new work
+    /// start sooner. Only one worker spins at a time, so idle workers cost at
+    /// most one core.
+    fn spin_for_work(&self) -> bool {
+        let spinning = &self.thread_pool.spinning;
+        if spinning.swap(true, Ordering::Relaxed) {
+            return false;
+        }
+        let start = ticks();
+        let found = loop {
+            if let Some(found) = self.find_work() {
+                break Some(found);
+            }
+            if ticks().wrapping_sub(start) >= self.spin_ticks {
+                break None;
+            }
+            core::hint::spin_loop();
+        };
+        // Stop spinning before running the job, so another idle worker can take
+        // over.
+        spinning.store(false, Ordering::Relaxed);
+        match found {
+            Some((job_ref, migrated)) => {
+                self.execute(job_ref, migrated);
+                true
+            }
+            None => false,
+        }
     }
 
     /// Create a new latch owned by the worker.
@@ -2828,7 +2876,7 @@ fn managed_worker(membership: Membership, halt: Arc<AtomicBool>) {
     // Register as the indicated worker, and work until we are told to halt.
     membership.activate(|worker| {
         while !halt.load(Ordering::Relaxed) {
-            if worker.yield_now() == Yield::Idle {
+            if worker.yield_now() == Yield::Idle && !worker.spin_for_work() {
                 worker.wait();
             }
         }
