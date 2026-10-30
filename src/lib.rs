@@ -195,7 +195,8 @@ mod job;
 mod latch;
 mod scope;
 mod thread_pool;
-mod time;
+#[doc(hidden)]
+pub mod time;
 mod unwind;
 mod util;
 
