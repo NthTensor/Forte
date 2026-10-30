@@ -212,6 +212,22 @@ impl JobQueue {
         let job_refs = unsafe { &mut *self.job_refs.get() };
         job_refs.append(&mut split_refs);
     }
+    /// The number of jobs currently in the queue.
+    #[inline(always)]
+    pub fn len(&self) -> usize {
+        // SAFETY: We have unique access to `job_refs` (see the field
+        // invariant). This borrow is read-only and returns no reference into the
+        // queue, so it cannot overlap another access.
+        let job_refs = unsafe { &*self.job_refs.get() };
+        job_refs.len()
+    }
+    /// Whether the queue is empty.
+    #[inline(always)]
+    pub fn is_empty(&self) -> bool {
+        // SAFETY: as in `len`.
+        let job_refs = unsafe { &*self.job_refs.get() };
+        job_refs.is_empty()
+    }
 }
 
 // -----------------------------------------------------------------------------

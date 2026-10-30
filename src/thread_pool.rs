@@ -1391,6 +1391,12 @@ impl Worker {
     /// amount a worker can make available for stealing at once.
     const STEAL_QUEUE_CAPACITY: usize = 32;
 
+    /// The local `join` queue depth at which [`Worker::join`] stops exposing
+    /// work and runs both closures inline. Once this many subtrees are queued
+    /// locally there is enough work for other workers to take, so exposing
+    /// more would only add bookkeeping.
+    const INLINE_DEPTH: usize = 4;
+
     /// Shares locally queued work with sibling workers, at most once per
     /// [`time::HEARTBEAT`]. Between heartbeats it is just a clock read and
     /// a comparison.
@@ -2008,6 +2014,25 @@ impl Worker {
         RA: Send,
         RB: Send,
     {
+        // Inline fast path. If enough work is already queued locally for other
+        // workers to take, skip the stack job (no push, no recover) and run both
+        // closures inline. Both always run to completion, and if either panics
+        // the first panic is propagated, as on the parallel path below.
+        if self.lifo_queue.len() >= Self::INLINE_DEPTH {
+            // Keep polling the heartbeat, so the subtrees already queued keep
+            // being shared during a long inline run. Sharing one lets nested
+            // joins start exposing work again.
+            self.promote();
+            let result_a = unwind::halt_unwinding(|| self.run_inline(a));
+            let result_b = unwind::halt_unwinding(|| self.run_inline(b));
+            return match (result_a, result_b) {
+                (Err(error), _) | (_, Err(error)) => {
+                    unwind::resume_unwinding(error)
+                }
+                (Ok(value_a), Ok(value_b)) => (value_a, value_b),
+            };
+        }
+
         // Allocate a job to run the closure `a` on the stack. It is vital to
         // the correctness of this function that this stack-job never move until
         // it is freed.
