@@ -32,6 +32,7 @@ This project is currently in early [pre-release], and there may be arbitrary bre
 - `join` runs both closures inline once enough work is already queued locally.
 - One idle worker searches for work for up to 50µs before parking.
 - `Worker::spawn` and `Scope::spawn` poll the heartbeat after queuing work.
+- A worker waiting for the other half of a `join` no longer runs spawned work or work from the global queue, so a long spawned job cannot delay the `join`.
 
 ### Fixed
 

@@ -22,6 +22,7 @@ use std::thread;
 use crate::latch::Latch;
 use crate::platform::AtomicPtr;
 use crate::platform::Ordering;
+use crate::thread_pool::WaitType;
 use crate::thread_pool::Worker;
 use crate::unwind;
 
@@ -346,6 +347,13 @@ where
         // used to create this job. Since `Worker` and `StackJob` are both
         // `!Send + !Sync`, we will just assume this is the case.
         worker.wait_for(&self.completed)
+    }
+
+    /// Like [`StackJob::wait`], for a `join` waiting on its other half. Runs
+    /// only work that keeps the `join` short, not other spawned work.
+    #[inline(always)]
+    pub(crate) fn wait_join(&self, worker: &Worker) -> bool {
+        worker.wait_for_type(&self.completed, WaitType::Join)
     }
 
     /// Unwraps the stack job back into a closure. This allows the closure to be

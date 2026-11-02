@@ -1380,6 +1380,17 @@ impl Deref for Worker {
     }
 }
 
+/// Which work a waiting worker may run while it waits (see
+/// [`Worker::wait_for_type`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WaitType {
+    /// Any work.
+    Any,
+    /// For a `join`: skips spawned work and the global queue, so a long job
+    /// doesn't hold up the `join`.
+    Join,
+}
+
 /// Describes the outcome of a call to [`Worker::yield_now`] or
 /// [`Worker::yield_local`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1693,7 +1704,7 @@ impl Worker {
     /// already looking, so keeping one idle worker briefly awake lets new work
     /// start sooner, while idle workers cost at most one core unless a caller
     /// asks them to search for longer.
-    fn search_for_work(&self, latch: Option<&Latch>) -> bool {
+    fn search_for_work(&self, latch: Option<&Latch>, wait: WaitType) -> bool {
         let now = ticks();
         let search_until = self.search_until.get();
         // Waiting on a latch, only search when asked to with `search_until`.
@@ -1718,7 +1729,7 @@ impl Worker {
             {
                 break None;
             }
-            if let Some(found) = self.find_work() {
+            if let Some(found) = self.find_work(wait) {
                 break Some(found);
             }
             if ticks() >= until {
@@ -1752,11 +1763,16 @@ impl Worker {
     /// to escape their execution (see the panic convention on `JobRef`).
     #[inline(always)]
     pub fn wait_for(&self, latch: &Latch) -> bool {
+        self.wait_for_type(latch, WaitType::Any)
+    }
+
+    /// Like [`Worker::wait_for`], but only runs the work that `wait` allows.
+    pub(crate) fn wait_for_type(&self, latch: &Latch, wait: WaitType) -> bool {
         loop {
             match latch.check() {
                 Status::Pending => {
-                    if self.yield_now() == Yield::Idle
-                        && !self.search_for_work(Some(latch))
+                    if self.yield_now_type(wait) == Yield::Idle
+                        && !self.search_for_work(Some(latch), wait)
                     {
                         let member_bitmask = 1 << self.membership.member_index;
                         let waiting_bitmask =
@@ -1782,12 +1798,17 @@ impl Worker {
     /// 3. Pull from the broadcast queue (`broadcast` and `spawn_on` calls)
     /// 4. Pull from the regular FIFO queue (`spawn` calls)
     /// 5. Reclaim work shared by this worker
+    ///
+    /// A [`WaitType::Join`] skips the regular FIFO queue.
     #[inline(always)]
-    fn find_local_work(&self) -> Option<JobRef> {
+    fn find_local_work(&self, wait: WaitType) -> Option<JobRef> {
         (self.lifo_queue.pop_newest())
             .or_else(|| self.nonsend_fifo_queue.pop())
             .or_else(|| self.broadcast_queue().pop())
-            .or_else(|| self.fifo_queue.pop_oldest())
+            .or_else(|| match wait {
+                WaitType::Any => self.fifo_queue.pop_oldest(),
+                WaitType::Join => None,
+            })
             .or_else(|| self.sharing_queue().pop())
     }
 
@@ -1799,13 +1820,16 @@ impl Worker {
     /// 3. Read from the global queue (external calls)
     ///
     /// If work is found in the last two cases, it is treated as having been
-    /// "migrated" to this thread.
+    /// "migrated" to this thread. A [`WaitType::Join`] skips the global queue.
     #[inline(always)]
-    fn find_work(&self) -> Option<(JobRef, bool)> {
-        (self.find_local_work().map(|job| (job, false)))
+    fn find_work(&self, wait: WaitType) -> Option<(JobRef, bool)> {
+        (self.find_local_work(wait).map(|job| (job, false)))
             .or_else(|| self.steal_from_siblings().map(|job| (job, true)))
-            .or_else(|| {
-                self.thread_pool.shared_queue.pop().map(|job| (job, true))
+            .or_else(|| match wait {
+                WaitType::Any => {
+                    self.thread_pool.shared_queue.pop().map(|job| (job, true))
+                }
+                WaitType::Join => None,
             })
     }
 
@@ -1860,7 +1884,7 @@ impl Worker {
     pub fn yield_local(&self) -> Yield {
         // We use LIFO order here, pulling the newest work from the queue. This
         // is just for consistency with yield_now/find_work.
-        match self.find_local_work() {
+        match self.find_local_work(WaitType::Any) {
             Some(job_ref) => {
                 self.execute(job_ref, false);
                 Yield::Executed
@@ -1885,8 +1909,14 @@ impl Worker {
     /// to significantly spike CPU usage and waste resources.
     #[inline(always)]
     pub fn yield_now(&self) -> Yield {
+        self.yield_now_type(WaitType::Any)
+    }
+
+    /// Like [`Worker::yield_now`], but only runs the work that `wait` allows.
+    #[inline(always)]
+    fn yield_now_type(&self, wait: WaitType) -> Yield {
         self.promote();
-        match self.find_work() {
+        match self.find_work(wait) {
             Some((job_ref, migrated)) => {
                 self.execute(job_ref, migrated);
                 Yield::Executed
@@ -2345,7 +2375,7 @@ impl Worker {
             result_a = unwind::halt_unwinding(|| self.run_inline(a));
         } else {
             // Wait for the job to complete.
-            if stack_job.wait(self) {
+            if stack_job.wait_join(self) {
                 // SAFETY: `wait` returned `true`, so the job completed with an
                 // error.
                 let error = unsafe { stack_job.unwrap_error() };
@@ -3017,7 +3047,7 @@ fn managed_worker(membership: Membership, halt: Arc<AtomicBool>) {
     membership.activate(|worker| {
         while !halt.load(Ordering::Relaxed) {
             if worker.yield_now() == Yield::Idle
-                && !worker.search_for_work(None)
+                && !worker.search_for_work(None, WaitType::Any)
             {
                 worker.wait();
             }
