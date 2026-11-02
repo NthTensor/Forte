@@ -197,9 +197,9 @@ mod scope;
 mod thread_pool;
 #[doc(hidden)]
 pub mod time;
-mod tree_age;
 mod unwind;
 mod util;
+mod workload_hint;
 
 // -----------------------------------------------------------------------------
 // Trait markers
@@ -259,7 +259,7 @@ pub use thread_pool::scope;
 pub use thread_pool::spawn;
 pub use thread_pool::spawn_broadcast;
 pub use thread_pool::spawn_on;
-pub use tree_age::TreeAge;
+pub use workload_hint::WorkloadHint;
 
 // -----------------------------------------------------------------------------
 // Internal primitives

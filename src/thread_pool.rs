@@ -1475,6 +1475,11 @@ impl Worker {
     /// worker is already searching (see [`Worker::search_for_work`]).
     const SPIN_DURATION: Duration = Duration::from_micros(50);
 
+    /// How long a worker keeps searching for work after completing a part of a
+    /// long workload (see [`WorkloadHint`](crate::WorkloadHint)). About the time
+    /// it takes to wake a parked thread.
+    pub(crate) const SEARCH_DURATION: Duration = Duration::from_micros(25);
+
     /// Shares locally queued work with sibling workers, at most once per
     /// [`time::HEARTBEAT`]. Between heartbeats it is just a clock read and
     /// a comparison.
@@ -1652,6 +1657,19 @@ impl Worker {
         if shared {
             self.wake_for_shared_work();
         }
+    }
+
+    /// The tick of this worker's most recent heartbeat check, which is at most
+    /// about one heartbeat old while the worker is busy.
+    #[inline(always)]
+    pub(crate) fn last_heartbeat_check(&self) -> u64 {
+        self.last_promote_tick.get()
+    }
+
+    /// [`time::HEARTBEAT`] in ticks.
+    #[inline(always)]
+    pub(crate) fn heartbeat_ticks(&self) -> u64 {
+        self.heartbeat_ticks
     }
 
     /// Asks this worker to keep searching for work, rather than parking, if it
