@@ -21,6 +21,8 @@ This project is currently in early [pre-release], and there may be arbitrary bre
 - `Job`, `ScopedJob`, and `JobStorage`, for spawning jobs by reference without allocating. A `&'static JobStorage` can be spawned onto a pool or worker, and a `&'scope JobStorage` onto a scope.
 - `Worker::search_until`, which asks a worker to keep searching for work instead of parking until a deadline.
 - `Worker::share_now`, which shares queued `join` work with idle workers without waiting for the next heartbeat.
+- `Worker::share_up_to`, which is like `share_now` but shares at most a given number of `join` subtrees.
+- `Worker::first_in_tree`, which returns `true` the first time it is called during the current tree of `join`s on a worker.
 - `WorkloadHint`, which keeps workers from parking near the end of a long parallel workload.
 - `Worker::promote` is now public, so long-running work can share queued work without returning to the scheduler.
 - A hidden `time` module with the tick counter, the measured tick rate, and the heartbeat interval.

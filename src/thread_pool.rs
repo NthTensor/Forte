@@ -1165,6 +1165,7 @@ impl Membership {
             rng: XorShift64Star::new(),
             last_promote_tick: Cell::new(0),
             join_start: Cell::new(0),
+            tree_seen: Cell::new(false),
             search_until: Cell::new(0),
             heartbeat_ticks: time::duration_to_ticks(time::HEARTBEAT),
             spin_ticks: time::duration_to_ticks(Worker::SPIN_DURATION),
@@ -1356,6 +1357,9 @@ pub struct Worker {
     /// empty, used to share more of the queued work the longer it has been
     /// building up.
     join_start: Cell<u64>,
+    /// Whether [`Worker::first_in_tree`] has been called since the current
+    /// tree of joins started.
+    tree_seen: Cell<bool>,
     /// The tick until which this worker searches for work instead of parking
     /// when it runs out (see [`Worker::search_until`]).
     search_until: Cell<u64>,
@@ -1664,6 +1668,12 @@ impl Worker {
     /// or searching. For callers that know their remaining work is
     /// large enough to be worth spreading, such as a long parallel iterator.
     pub fn share_now(&self) {
+        self.share_up_to(u32::MAX);
+    }
+
+    /// Like [`Worker::share_now`], but shares at most `max` subtrees, oldest
+    /// first.
+    pub fn share_up_to(&self, max: u32) {
         let pool = self.thread_pool;
         let idle = pool.waiting_bitmask.load(Ordering::Relaxed).count_ones()
             + searchers(pool.searching.load(Ordering::Relaxed));
@@ -1671,7 +1681,7 @@ impl Worker {
             return;
         }
         let mut shared = false;
-        for _ in 0..idle {
+        for _ in 0..idle.min(max) {
             let Some(job_ref) = self.lifo_queue.pop_oldest() else {
                 break;
             };
@@ -1686,6 +1696,13 @@ impl Worker {
         if shared {
             self.wake_for_shared_work();
         }
+    }
+
+    /// Returns `true` the first time it is called during the current tree of
+    /// [`join`](Worker::join)s on this worker, and `false` after that.
+    #[inline(always)]
+    pub fn first_in_tree(&self) -> bool {
+        !self.tree_seen.replace(true)
     }
 
     /// The tick of this worker's most recent heartbeat check, which is at most
@@ -2331,6 +2348,7 @@ impl Worker {
             } else {
                 self.join_start.set(now);
             }
+            self.tree_seen.set(false);
         }
         if depth >= Self::INLINE_DEPTH {
             // Keep polling the heartbeat, so the subtrees already queued keep
