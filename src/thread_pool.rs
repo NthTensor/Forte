@@ -2812,11 +2812,10 @@ impl Worker {
                     // completed with an error.
                     let error = unsafe { job.unwrap_error() };
                     unwind::resume_unwinding(error);
-                } else {
-                    // SAFETY: `error_flag` (from `wait`) is `false`, so the job
-                    // completed with a value.
-                    unsafe { job.unwrap_output() }
                 }
+                // SAFETY: `error_flag` (from `wait`) is `false`, so the job
+                // completed with a value.
+                unsafe { job.unwrap_output() }
             })
             .collect()
     }
