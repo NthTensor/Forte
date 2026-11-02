@@ -432,6 +432,14 @@ impl ThreadPool {
                     // It's possible we may be trying to terminate ourselves, in
                     // which case we can skip the thread-join.
                     if Some(worker.member_index) != own_member_index {
+                        // A worker can miss the signal above and park again, so
+                        // keep signaling it until it exits.
+                        let semaphore =
+                            &member_data.semaphores[worker.member_index];
+                        while !worker.control.handle.is_finished() {
+                            std::thread::sleep(Duration::from_micros(100));
+                            semaphore.signal();
+                        }
                         let _ = worker.control.handle.join();
                     }
                 }
