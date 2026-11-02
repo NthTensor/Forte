@@ -125,7 +125,7 @@ pub(crate) struct MemberData {
     /// wakeups.
     pub broadcasts: [SegQueue<JobRef>; 32],
     /// A binary semaphore for each seat, used for signaling.
-    pub semaphores: [Semaphore; 32],
+    pub semaphores: [CachePadded<Semaphore>; 32],
 }
 
 impl MemberData {
@@ -135,7 +135,7 @@ impl MemberData {
         let stealers: [Stealer<JobRef>; 32] =
             array::from_fn(|i| sharers[i].stealer());
         let broadcasts = array::from_fn(|_| SegQueue::new());
-        let semaphores = array::from_fn(|_| Semaphore::new());
+        let semaphores = array::from_fn(|_| CachePadded::new(Semaphore::new()));
         MemberData {
             sharers,
             stealers,
