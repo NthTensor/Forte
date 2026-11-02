@@ -10,9 +10,8 @@ use crate::time;
 /// parts may wait for a parked worker to wake. To avoid this, create a hint
 /// when the workload starts, copy it into each part, and call
 /// [`WorkloadHint::complete_part`] when a part finishes. If the workload has
-/// run for a long time, `complete_part` shares the worker's queued work and
-/// keeps the worker searching instead of parking (see [`Worker::share_now`]
-/// and [`Worker::search_until`]).
+/// run for a long time, `complete_part` keeps the worker searching instead of
+/// parking (see [`Worker::search_until`]).
 ///
 /// ```
 /// # use forte::{ThreadPool, WorkloadHint, Worker};
@@ -43,8 +42,8 @@ impl WorkloadHint {
     const UNIT_SHIFT: u32 = 6;
 
     /// How many heartbeats a workload must run before
-    /// [`WorkloadHint::complete_part`] shares work and keeps the worker
-    /// searching. Both cost CPU time, so they are kept for long workloads.
+    /// [`WorkloadHint::complete_part`] keeps the worker searching. Searching
+    /// costs CPU time, so it is kept for long workloads.
     const LONG_HEARTBEATS: u64 = 8;
 
     /// Marks the start of a workload. Reads the clock.
@@ -70,12 +69,10 @@ impl WorkloadHint {
     }
 
     /// Call when a part of the workload finishes on `worker`. If the workload
-    /// is long, shares the worker's queued work and asks it to keep searching
-    /// rather than park.
+    /// is long, asks it to keep searching rather than park.
     #[inline]
     pub fn complete_part(self, worker: &Worker) {
         if self.is_long(worker) {
-            worker.share_now();
             worker.search_until(
                 time::ticks()
                     + time::duration_to_ticks(Worker::SEARCH_DURATION),
