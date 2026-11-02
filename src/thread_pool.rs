@@ -1857,9 +1857,9 @@ impl Worker {
             bits &= bits - 1;
             let stealer = &stealers[idx as usize];
             // `steal_and_pop` returns one job directly and moves up to half the
-            // remaining items into our steal queue for later use.
+            // remaining items (rounded up) into our steal queue for later use.
             loop {
-                match stealer.steal_and_pop(my_sharer, |n| n / 2) {
+                match stealer.steal_and_pop(my_sharer, |n| n.div_ceil(2)) {
                     Ok((job, _)) => return Some(job),
                     Err(StealError::Busy) => {} // transient; retry
                     Err(StealError::Empty) => break,

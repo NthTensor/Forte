@@ -1672,8 +1672,9 @@ mod tests {
     /// Ported from rayon.
     #[test]
     fn scope_linear_stack_growth() {
+        // A single-member pool, so every task runs on this thread's stack and
+        // the measured depths are comparable.
         static THREAD_POOL: ThreadPool = ThreadPool::new();
-        THREAD_POOL.resize_to_available();
 
         THREAD_POOL.with_worker(|_| {
             let mut max_diff = Mutex::new(0);

@@ -36,6 +36,7 @@ This project is currently in early [pre-release], and there may be arbitrary bre
 
 ### Fixed
 
+- A worker can now steal from a sibling that has shared only one job.
 - The closures of a `join` that run inline no longer report `Worker::migrated` as true when the `join` itself was called from a stolen job.
 
 ## [1.0.0-beta.1]
