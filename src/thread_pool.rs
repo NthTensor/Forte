@@ -95,8 +95,9 @@ pub struct ThreadPool {
     /// A bitmask that tracks which members are waiting on their semaphore
     /// signal.
     waiting_bitmask: CachePadded<AtomicU32>,
-    /// Number of workers searching for work instead of parking (see
-    /// [`Worker::search_for_work`]).
+    /// Workers searching for work instead of parking (see
+    /// [`Worker::search_for_work`]). The low 16 bits count all of them, and the
+    /// high 16 bits those waiting on a `join`.
     searching: CachePadded<AtomicU32>,
     /// Holds controls for threads spawned and managed by the pool. Initialized
     /// on first call to `activate`, to allow for some non-static constructors.
@@ -279,9 +280,10 @@ impl ThreadPool {
         self.shared_queue.push(job_ref);
         // Try to wake up a worker to execute this job. This is relatively cheap
         // if no workers are waiting. A searching worker will find the job
-        // without being woken.
+        // without being woken, unless it is waiting on a `join`.
         let waiting_bitmask = self.waiting_bitmask.load(Ordering::Relaxed);
-        if waiting_bitmask != 0 && self.searching.load(Ordering::Relaxed) == 0 {
+        let searching = self.searching.load(Ordering::Relaxed);
+        if waiting_bitmask != 0 && searchers(searching) == searching >> 16 {
             let i = waiting_bitmask.trailing_zeros() as usize;
             self.get_member_data().semaphores[i].signal();
         }
@@ -1380,6 +1382,12 @@ impl Deref for Worker {
     }
 }
 
+/// The total number of searching workers in a [`ThreadPool::searching`] value.
+#[inline(always)]
+fn searchers(searching: u32) -> u32 {
+    searching & 0xFFFF
+}
+
 /// Which work a waiting worker may run while it waits (see
 /// [`Worker::wait_for_type`]).
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1491,6 +1499,11 @@ impl Worker {
     /// it takes to wake a parked thread.
     pub(crate) const SEARCH_DURATION: Duration = Duration::from_micros(25);
 
+    /// A `join` whose inline half ran for at most this many heartbeats searches
+    /// for [`Worker::SEARCH_DURATION`] before it parks to wait for its other
+    /// half. A longer `join` parks right away: one wake adds little to it.
+    const SHORT_JOIN_HEARTBEATS: u64 = 8;
+
     /// Shares locally queued work with sibling workers, at most once per
     /// [`time::HEARTBEAT`]. Between heartbeats it is just a clock read and
     /// a comparison.
@@ -1519,7 +1532,8 @@ impl Worker {
         self.last_promote_tick.set(current_tick);
 
         let waiting = self.thread_pool.waiting_bitmask.load(Ordering::Relaxed);
-        let searching = self.thread_pool.searching.load(Ordering::Relaxed);
+        let searching =
+            searchers(self.thread_pool.searching.load(Ordering::Relaxed));
         let idle = waiting.count_ones() + searching;
 
         // Early out if no sibling is idle and nobody has taken the work we
@@ -1636,7 +1650,8 @@ impl Worker {
     pub(crate) fn wake_for_shared_work(&self) {
         let sharer = self.sharing_queue();
         let exposed = (sharer.capacity() - sharer.spare_capacity()) as u32;
-        let searching = self.thread_pool.searching.load(Ordering::Relaxed);
+        let searching =
+            searchers(self.thread_pool.searching.load(Ordering::Relaxed));
         let waiting = self.thread_pool.waiting_bitmask.load(Ordering::Relaxed);
         self.wake_up_to(exposed.saturating_sub(searching), waiting);
     }
@@ -1648,7 +1663,7 @@ impl Worker {
     pub fn share_now(&self) {
         let pool = self.thread_pool;
         let idle = pool.waiting_bitmask.load(Ordering::Relaxed).count_ones()
-            + pool.searching.load(Ordering::Relaxed);
+            + searchers(pool.searching.load(Ordering::Relaxed));
         if idle == 0 {
             return;
         }
@@ -1712,15 +1727,20 @@ impl Worker {
             return false;
         }
         let searching = &self.thread_pool.searching;
+        let unit = match wait {
+            WaitType::Any => 1,
+            WaitType::Join => 1 | 1 << 16,
+        };
         // The first worker to start searching from the idle loop also searches
         // for `SPIN_DURATION`.
-        let first = searching.fetch_add(1, Ordering::Relaxed) == 0;
+        let first =
+            searchers(searching.fetch_add(unit, Ordering::Relaxed)) == 0;
         let mut until = search_until;
         if latch.is_none() && first {
             until = until.max(now.wrapping_add(self.spin_ticks));
         }
         if now >= until {
-            searching.fetch_sub(1, Ordering::Relaxed);
+            searching.fetch_sub(unit, Ordering::Relaxed);
             return false;
         }
         let found = loop {
@@ -1734,14 +1754,14 @@ impl Worker {
             }
             if ticks() >= until {
                 self.search_until.set(0);
-                searching.fetch_sub(1, Ordering::Relaxed);
+                searching.fetch_sub(unit, Ordering::Relaxed);
                 return false;
             }
             core::hint::spin_loop();
         };
         // Stop searching before running the job, so another idle worker can
         // take over.
-        searching.fetch_sub(1, Ordering::Relaxed);
+        searching.fetch_sub(unit, Ordering::Relaxed);
         if let Some((job_ref, migrated)) = found {
             self.execute(job_ref, migrated);
         }
@@ -1763,17 +1783,37 @@ impl Worker {
     /// to escape their execution (see the panic convention on `JobRef`).
     #[inline(always)]
     pub fn wait_for(&self, latch: &Latch) -> bool {
-        self.wait_for_type(latch, WaitType::Any)
+        self.wait_for_type(latch, WaitType::Any, 0)
     }
 
-    /// Like [`Worker::wait_for`], but only runs the work that `wait` allows.
-    pub(crate) fn wait_for_type(&self, latch: &Latch, wait: WaitType) -> bool {
+    /// Whether fewer than half the pool's workers are searching. We limit
+    /// searching workers to at most half the pool because each one holds a
+    /// core, and a worker that is woken needs a free core to run on.
+    fn may_search(&self) -> bool {
+        let pool = self.thread_pool;
+        let half = (pool.num_members() as u32 / 2).max(1);
+        searchers(pool.searching.load(Ordering::Relaxed)) < half
+    }
+
+    /// Like [`Worker::wait_for`], but only runs the work that `wait` allows,
+    /// and searches for work for `search` ticks before it first parks.
+    pub(crate) fn wait_for_type(
+        &self,
+        latch: &Latch,
+        wait: WaitType,
+        mut search: u64,
+    ) -> bool {
         loop {
             match latch.check() {
                 Status::Pending => {
                     if self.yield_now_type(wait) == Yield::Idle
                         && !self.search_for_work(Some(latch), wait)
                     {
+                        if search != 0 && self.may_search() {
+                            self.search_until(ticks().wrapping_add(search));
+                            search = 0;
+                            continue;
+                        }
                         let member_bitmask = 1 << self.membership.member_index;
                         let waiting_bitmask =
                             &self.membership.thread_pool.waiting_bitmask;
@@ -2357,7 +2397,9 @@ impl Worker {
         // order we use when executing).
         self.promote();
 
-        // Run the second closure directly.
+        // Run the second closure directly, timing it to choose how `wait_join`
+        // waits.
+        let inline_start = ticks();
         let result_a;
         let result_b = unwind::halt_unwinding(|| self.run_inline(b));
 
@@ -2375,7 +2417,15 @@ impl Worker {
             result_a = unwind::halt_unwinding(|| self.run_inline(a));
         } else {
             // Wait for the job to complete.
-            if stack_job.wait_join(self) {
+            let inline_ticks = ticks().wrapping_sub(inline_start);
+            let search = if inline_ticks
+                <= Self::SHORT_JOIN_HEARTBEATS * self.heartbeat_ticks
+            {
+                time::duration_to_ticks(Self::SEARCH_DURATION)
+            } else {
+                0
+            };
+            if stack_job.wait_join(self, search) {
                 // SAFETY: `wait` returned `true`, so the job completed with an
                 // error.
                 let error = unsafe { stack_job.unwrap_error() };

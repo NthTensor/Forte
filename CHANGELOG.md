@@ -31,6 +31,7 @@ This project is currently in early [pre-release], and there may be arbitrary bre
 - Each heartbeat shares as many `join` subtrees as there are idle workers, capped by a limit that grows the longer the current tree has run, and spawned work is shared in up to 16 equal chunks.
 - `join` runs both closures inline once enough work is already queued locally.
 - One idle worker searches for work for up to 50µs before parking.
+- A worker waiting for the other half of a short `join` searches for work for up to 25µs before parking.
 - `Worker::spawn` and `Scope::spawn` poll the heartbeat after queuing work.
 - A worker waiting for the other half of a `join` no longer runs spawned work or work from the global queue, so a long spawned job cannot delay the `join`.
 

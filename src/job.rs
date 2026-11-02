@@ -350,10 +350,11 @@ where
     }
 
     /// Like [`StackJob::wait`], for a `join` waiting on its other half. Runs
-    /// only work that keeps the `join` short, not other spawned work.
+    /// only work that keeps the `join` short, not other spawned work, and
+    /// searches for work for `search` ticks before it parks.
     #[inline(always)]
-    pub(crate) fn wait_join(&self, worker: &Worker) -> bool {
-        worker.wait_for_type(&self.completed, WaitType::Join)
+    pub(crate) fn wait_join(&self, worker: &Worker, search: u64) -> bool {
+        worker.wait_for_type(&self.completed, WaitType::Join, search)
     }
 
     /// Unwraps the stack job back into a closure. This allows the closure to be
