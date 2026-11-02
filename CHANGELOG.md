@@ -28,7 +28,7 @@ This project is currently in early [pre-release], and there may be arbitrary bre
 ### Changed
 
 - The heartbeat interval is now a duration (`time::HEARTBEAT`, 10µs) rather than a fixed number of ticks.
-- Each heartbeat shares as many `join` subtrees as there are idle workers, capped by a limit that grows the longer the current tree has run, and spawned work is shared in up to 16 equal chunks.
+- Each heartbeat shares as many `join` subtrees as there are idle workers, capped by a limit that is zero in the tree's first heartbeat and grows the longer it runs, and spawned work is shared in up to 16 equal chunks.
 - `join` runs both closures inline once enough work is already queued locally.
 - One idle worker searches for work for up to 50µs before parking.
 - A worker waiting for the other half of a short `join` searches for work for up to 25µs before parking.

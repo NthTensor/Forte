@@ -1548,12 +1548,15 @@ impl Worker {
 
         // Share work from the lifo queue, with old (and therefore theoretically
         // "large") tasks shared first. We share no more tasks than there are
-        // idle siblings to take them, and no more than a limit that starts at
-        // one and doubles each heartbeat the current tree of joins has run, so
-        // short-lived work mostly stays local.
+        // idle siblings to take them, and no more than a limit that is zero in
+        // the current tree of joins' first heartbeat and then doubles each
+        // heartbeat, so short-lived work mostly stays local.
         let intervals = current_tick.wrapping_sub(self.join_start.get())
             / self.heartbeat_ticks.max(1);
-        let limit = 1u32 << intervals.min(31);
+        let limit = match intervals {
+            0 => 0,
+            _ => 1u32 << intervals.min(31),
+        };
         for _ in 0..idle.min(limit) {
             let Some(job_ref) = self.lifo_queue.pop_oldest() else {
                 break;
@@ -2320,8 +2323,14 @@ impl Worker {
         // the first panic is propagated, as on the parallel path below.
         let depth = self.lifo_queue.len();
         if depth == 0 {
-            // A new tree of joins starts here.
-            self.join_start.set(ticks());
+            // A new tree of joins starts here. A stolen tree is treated as a
+            // heartbeat old, so it can be shared again right away.
+            let now = ticks();
+            if self.migrated() {
+                self.join_start.set(now.wrapping_sub(self.heartbeat_ticks));
+            } else {
+                self.join_start.set(now);
+            }
         }
         if depth >= Self::INLINE_DEPTH {
             // Keep polling the heartbeat, so the subtrees already queued keep
